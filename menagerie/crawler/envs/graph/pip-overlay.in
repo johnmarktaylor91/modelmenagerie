@@ -1,0 +1,4 @@
+# Direct pip-overlay requirements for the graph intent.
+# pykeen is pip-only (no conda-forge package); it arrives through the
+# controlled offline overlay lane instead.
+pykeen

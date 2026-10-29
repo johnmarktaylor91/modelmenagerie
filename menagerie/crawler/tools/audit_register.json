@@ -1,0 +1,1155 @@
+{
+ "rows": [
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_operational_identity.py::test_operational_event_identity_registry_is_exhaustive_and_pinned"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_operational_identity.py::test_raw_operational_stable_hash_mints_are_interdicted"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_operational_identity.py::test_typed_constructor_fails_closed_on_unknown_or_wrong_class"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "identity missing a replay axis",
+   "row_id": "C-01"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_pd1_continuation_ruling.py::test_n8_the_v4_differential_is_exactly_the_marker_only_cell"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_waiver_disclosures.py::test_the_waiver_registry_is_closed_at_exactly_the_three_doctrine_instances"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_award_custody.py::test_close_time_custody_reconciles_every_raw_head_transition"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_fidelity_waiver_kernel.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "producer-steerable decision / self-waiving tripwire",
+   "row_id": "C-02"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_award_custody.py::test_a_remint_is_censused_not_refused"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_award_custody.py::test_close_time_custody_reconciles_every_raw_head_transition"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_award_restoration.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_rotation_transaction.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_misrouted_model_defers_and_is_not_destroyed.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "award-eating by machine conditions",
+   "row_id": "C-03"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_work_selection_policy.py::test_five_row_fixture_schedules_exactly_the_never_recorded_member"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_work_selection_policy.py::test_selection_predicate_is_pure_and_mode_invariant_to_invocation_origin"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_work_selection_policy.py::test_only_unsettled_cut_is_absolute_even_for_capability_reopens"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_warm_redrive_economics.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_subset_rung_requeue_grants.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "re-litigation / two work-selection policies",
+   "row_id": "C-04"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_v2_contract.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_rung_carried_tip_succession.py::test_composition_adding_nothing_beyond_the_tip_refuses"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_rung_carried_tip_succession.py::test_first_rung_carries_nothing_and_may_claim_nothing"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_contradiction_pins.py::test_an_in_window_head_with_a_live_in_window_quarantine_refuses_the_close"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_licenses_successor.py::test_close_licenses_its_own_successor_with_live_parks"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "close vacuity (existence over unbounded history)",
+   "row_id": "C-05"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_v2_contract.py::test_a_layout_may_not_change_presence_during_a_leg"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_read_authority_agreement.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_read_scale.py::test_held_derivation_refuses_a_shrunk_ledger"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_read_scale.py::test_close_ledger_corruption_refuses_on_every_call"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_object.py::test_a_close_for_another_campaign_or_digest_licenses_nothing"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "attested set != read set",
+   "row_id": "C-06"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_ledger_chain_content_address.py::test_no_added_field_can_pin_the_address_across_a_body_edit"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_ledger_chain_poison_refusal.py::test_an_unaddressable_line_refuses_typed_at_every_authority"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_torn_chain_resume.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_read_scale.py::test_held_derivation_refuses_a_rewritten_prefix"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_append_only_ledger_census.py::test_scanner_detects_a_new_hand_rolled_append"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "in-window ledger tamper",
+   "row_id": "C-07"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_backfill_close.py::test_backfill_refuses_the_exhibit_a_shape_per_member"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_pd1_continuation_ruling.py::test_attack_d_the_era_is_not_producer_choosable_at_the_door"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_migrate_legacy.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_rehydration_era_sweep.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_gate_citation_era_pin.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "era-unscoped mint path",
+   "row_id": "C-08"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_v2_contract.py::test_a_stale_park_row_cannot_corroborate_a_withholding"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_v2_contract.py::test_a_forged_in_window_head_recorded_under_an_ancestor_contradicts"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_v2_contract.py::test_a_layout_may_not_change_presence_during_a_leg"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "window measures position not provenance",
+   "row_id": "C-09"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_rung_staging.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_host_capability_terminal.py::test_a_tampered_claim_refuses_fail_closed"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_weight_format_suffix_poisons_even_when_absent"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_tensor_magic_payload_poisons"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_claim_vocabulary_and_absence.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "fail-open on absent/malformed authority",
+   "row_id": "C-10"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_read_scale.py::test_no_unsanctioned_whole_file_ledger_read_on_the_close_path"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_read_scale.py::test_staging_gate_cost_does_not_grow_with_the_number_of_prior_closes"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_read_scale.py::test_twenty_thousand_rung_projection_stays_under_its_derived_ceiling"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_append_only_ledger_census.py::test_append_site_inventory_matches_committed_closed_set"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_ledger_open_streaming.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "O(campaign-history) read paths",
+   "row_id": "C-11"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_scheduler_blast_radius.py::test_member_unroutable_refusal_leaves_the_leg_running"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_scheduler_blast_radius.py::test_no_progress_tripwire_quarantines_the_member_not_the_leg"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_scheduler_blast_radius.py::test_blast_radius_census_every_containment_site_is_wired"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_env_turn_effort_and_park_bounds.py::test_env_generation_blast_radius_is_bounded"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "one bad unit aborts the leg",
+   "row_id": "C-12"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_park_release.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_checker_park_release_predicate.py::test_row_holds_after_recidivism_cap_under_unchanged_identity"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_env_turn_effort_and_park_bounds.py::test_park_lifecycle_inventory_names_release_and_drain"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_env_turn_effort_and_park_bounds.py::test_clearance_recordable_while_leg_runs"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_clear_environment_quarantine_tool.py::test_clearance_receipt_is_honored_by_the_admission_predicate"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "refusal/park lifecycle holes",
+   "row_id": "C-13"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_launch_preflight.py::test_asserted_state_root_must_be_the_one_the_operator_will_resolve"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_launch_preflight.py::test_disk_floor_is_asserted_against_every_lane_write_destination"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_records_root_guard.py::test_a_foreign_last_writer_refuses_until_claimed"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_derived_constants_census.py::test_new_derivations_join_the_census"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_disk_floor_trigger.py::test_floor_probes_every_write_destination"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "one fact, multiple authorities",
+   "row_id": "C-14"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_usage_pause_wake_dry_run_rehearsal.py::test_usage_pause_wake_cycle_survives_the_real_subprocess_dry_run"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_usage_pause_wake_dry_run_rehearsal.py::test_injected_backoff_pauses_the_composed_dry_run_with_durable_wake_records"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_wakeup_os_scheduler.py::test_real_launchd_bootstrap_verify_and_bootout_roundtrip"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_deadman_watchdog.py::test_stale_heartbeat_pages"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_work_selection_policy.py::test_wake_callback_argv_carries_the_complete_launching_config"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "wake/quota-pause dead by construction",
+   "row_id": "C-15"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_terminal_owner_census.py::test_host_caused_reasons_can_never_read_as_model_terminals"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_terminal_owner_census.py::test_owner_vocabulary_is_closed"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_terminal_owner_census.py::test_every_minted_reason_names_a_closed_owner"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_backend_parity_classification.py::test_every_no_lane_framework_mints_the_parity_deferral"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_infra_terminal_grant_release.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "host-transient minted as model terminal",
+   "row_id": "C-16"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_failure_evidence_completeness.py::test_failure_evidence_completeness_census"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_failure_evidence_completeness.py::test_forward_mode_run_requires_worker_error_evidence"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_failure_evidence_completeness.py::test_systemexit_in_constructor_still_writes_receipt_with_evidence"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_failure_evidence_completeness.py::test_attestation_mismatch_is_published_typed_not_as_forward_failure"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_envelope_completeness.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "evidence-free failure",
+   "row_id": "C-17"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_cache_inventory.py::test_inventory_rows_are_complete_and_authority_bearing"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_cache_inventory.py::test_lru_census_matches_inventory_exactly"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_author_spend.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_w18_funnel.py::test_uninstrumented_spend_reads_width_as_unknown_never_zero"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_w9_cache_invalidation.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "accounting on wrong axis/unit",
+   "row_id": "C-18"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_bounded_wait_inventory.py::test_no_unbounded_waits_in_worker_area_owner_modules"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_bounded_wait_inventory.py::test_census_actually_detects_an_unbounded_wait"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_scheduler_blast_radius.py::test_wrapper_parent_deadline_group_kills_and_stays_typed"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "unbounded wait, no deadline",
+   "row_id": "C-19"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_w18_funnel.py::test_uninstrumented_spend_reads_width_as_unknown_never_zero"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_w18_funnel.py::test_not_instrumented_until_the_driver_emits"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_deadman_watchdog.py::test_stale_heartbeat_pages"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_notification_transport_truth.py::test_silent_exit_zero_transport_writes_unechoed_receipt"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_notification_transport_truth.py::test_critical_send_settles_only_on_echo"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "edge-triggered-only observability",
+   "row_id": "C-20"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_framework_dispatch_arm_census.py::test_adapter_dispatch_is_exhaustive_over_the_enum"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_framework_dispatch_arm_census.py::test_no_lane_frameworks_are_typed_not_defaulted_to_torch"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_framework_dispatch_arm_census.py::test_free_text_is_refused_not_silently_defaulted"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_backend_parity_classification.py::test_non_torch_award_requires_closed_vocabulary_dtypes"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_backend_parity_classification.py::test_every_no_lane_framework_mints_the_parity_deferral"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "torch-only logic on backend-neutral path",
+   "row_id": "C-21"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_producer_field_dispatch_census.py::test_the_inventory_is_complete_over_every_sink_call"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_producer_field_dispatch_census.py::test_every_inventory_row_names_a_validator_that_refuses_free_text"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_producer_field_dispatch_census.py::test_the_census_would_have_caught_the_b1_instance"
+     },
+     {
+      "exists": true,
+      "kind": "tool",
+      "ref": "menagerie/crawler/tests/producer_dispatch_inventory.json"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "free-text producer field as dispatch key",
+   "row_id": "C-22"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_leg_config_event.py::test_config_event_records_the_effective_leg_shape"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_checker_prompt_leg_pin.py::test_mid_leg_rotation_is_a_typed_refusal"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_checker_prompt_leg_pin.py::test_prompt_reads_census"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_explicit_wins_config.py::test_the_frozen_value_wins_only_absent_any_explicit_source"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_checker_identity_flip.py::test_checker_model_flip_does_not_brick_catalog_entry_points"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "authority read live not pinned",
+   "row_id": "C-23"
+  },
+  {
+   "disposition": {
+    "kind": "DEFERRED",
+    "partial_tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_work_selection_policy.py::test_five_row_fixture_schedules_exactly_the_never_recorded_member"
+     }
+    ],
+    "trigger": "next STRONGER-DRY audit round: every remaining source-string pin converts to a behavioural fixture (template: the five-row work-selection fixture) or the round fails; any NEW source-string pin fails review"
+   },
+   "kind": "finding",
+   "name": "source-string pins not behavioural",
+   "row_id": "C-24"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_unforeseen_benign_basename_refuses_without_poison"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_pilot_benign_shapes_do_not_poison"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_in_child_tripwire_never_stricter_than_parent_classifier"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_tensor_magic_payload_poisons"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "catch-all mislabeling / allowlist instead of category",
+   "row_id": "C-25"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_author_attempts.py::test_new_attempt_creates_durable_record_and_dirs"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_gate_verdicts.py::test_secret_redaction_in_stored_logs"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "tests/crawler/test_static_boundaries.py::test_git_tree_ships_no_runtime_solve_or_secret_artifacts"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_env_read_census.py::test_wake_required_secrets_are_classified_secrets"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_source_broker_forge_credential.py::test_the_credential_is_dropped_when_a_redirect_leaves_the_api"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "secret in durable records/argv",
+   "row_id": "C-26"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_membership_census_scope.py::test_foreign_record_holder_refuses_without_acknowledgment"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_membership_census_scope.py::test_durable_ledger_is_campaign_scoped_and_tamper_refusing"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_object.py::test_a_close_for_another_campaign_or_digest_licenses_nothing"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_merge_pilot_shards.py::test_real_pilot_unaccounted_model_still_refuses"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_valve_campaign_identity.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "shared-root cross-campaign mis-scope",
+   "row_id": "C-27"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_durable_fsync_census.py::test_the_darwin_barrier_command_is_the_real_kernel_constant"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_durable_fsync_census.py::test_durable_fsync_issues_the_platform_power_loss_barrier"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_durable_fsync_runtime.py::test_each_named_writer_issues_a_data_barrier_at_runtime"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_uncatchable_kill_durability_matrix.py::test_sigkill_between_publication_and_model_append_resumes_exactly_once"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_close_meta_ledger_torn_tail_recovery.py::test_a_torn_close_meta_ledger_read_recovers_with_evidence"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "acknowledged-then-vanished durability / torn tail",
+   "row_id": "C-28"
+  },
+  {
+   "disposition": {
+    "kind": "DEFERRED",
+    "partial_tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_disk_reaper.py::test_manifest_protects_every_load_bearing_class"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_environment_orphan_gc.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_custody_deadline_reaper.py::test_bound_dead_custody_force_settles_typed_at_admission_boundary"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_disk_floor_trigger.py::test_floor_probes_every_write_destination"
+     }
+    ],
+    "trigger": "a disk-floor breach attributable to the harness session store, or the W36/D-40 per-machine observability charter landing its reclaimer; the tiered disk reaper + every-destination floor probes bound the residual meanwhile"
+   },
+   "kind": "finding",
+   "name": "unbounded growth, no reclaimer",
+   "row_id": "C-29"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_committed_locks_as_inputs.py::test_runtime_probe_drift_cannot_write_a_sealed_generation"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_committed_locks_as_inputs.py::test_superseded_family_is_refused_not_silently_resolved"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_env_read_census.py::test_every_environment_write_is_isolation_classified"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_seal_churn_stability.py::test_semantic_member_change_and_forbidden_entries_never_retry"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "runtime write into sealed generation",
+   "row_id": "C-30"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_gate_verdicts.py::test_committed_manifest_covers_every_tracked_source_path"
+     },
+     {
+      "exists": true,
+      "kind": "tool",
+      "ref": "menagerie/crawler/tools/required_gate_set.json"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "sweep the class, never the instance",
+   "row_id": "P-01"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "exists": true,
+      "kind": "tool",
+      "ref": "tools/extract_untracked_tests.py"
+     },
+     {
+      "kind": "external-suite",
+      "ref": "tools/tests/test_extract_untracked_tests.py::test_check_exits_nonzero_only_when_untracked_sources_exist"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "extract untracked test files explicitly",
+   "row_id": "P-02"
+  },
+  {
+   "disposition": {
+    "kind": "DEFERRED",
+    "partial_tripwires": [],
+    "trigger": "the next documented -m entrypoint addition adds the runnable-census node; the original instance is closed (__main__ guard exists and cli.main is exercised with exit-code asserts)"
+   },
+   "kind": "finding",
+   "name": "verify the entrypoint actually runs",
+   "row_id": "P-03"
+  },
+  {
+   "disposition": {
+    "kind": "REJECTED",
+    "reason": "sprint-side process tooling, not a public-repo surface: audit-round ledgers and base-sha discipline live in the private sprint state machinery; the repo-side reconciliation analogue is P-10's landed merge-train tripwire"
+   },
+   "kind": "finding",
+   "name": "fix between audit rounds (mechanical base-sha check)",
+   "row_id": "P-04"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "exists": true,
+      "kind": "tool",
+      "ref": "tools/path_overlap_preflight.py"
+     },
+     {
+      "kind": "external-suite",
+      "ref": "tools/tests/test_path_overlap_preflight.py::test_shared_file_overlap_fails_and_names_both_candidates"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_constructor_keyword_collision_gate.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "merge-train shared-default collisions",
+   "row_id": "P-05"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "process",
+      "ref": "crawler-launch-sprint/CLOSE_CONTRACT.md"
+     },
+     {
+      "kind": "process",
+      "ref": "crawler-launch-sprint/AUDIT_LOOP_STATE.md"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "pre-commit the anti-flail tripwire, honor it",
+   "row_id": "P-06"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_audit_register.py::test_docket_guard_refuses_fill_markers"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_audit_register.py::test_docket_guard_requires_pasted_gate_output"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "no [FILL] deliverables; critics decide done",
+   "row_id": "P-07"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_records_root_guard.py::test_a_foreign_last_writer_refuses_until_claimed"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_records_root_guard.py::test_a_corrupt_stamp_refuses_rather_than_guessing"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_launch_preflight.py::test_state_root_binding_refuses_a_launch_end_to_end"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "verify root+scope before believing a blocker",
+   "row_id": "P-08"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_release_gate_seams.py::test_deliberate_unwaived_skip_fails_floor"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_release_conformance_composition.py::test_ci_attestations_cover_registry_without_skip"
+     },
+     {
+      "exists": true,
+      "kind": "tool",
+      "ref": "menagerie/crawler/tools/required_gate_set.json"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "assert the invariant, not the prose",
+   "row_id": "P-09"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "exists": true,
+      "kind": "tool",
+      "ref": "tools/crawler_merge_train.py"
+     },
+     {
+      "kind": "external-suite",
+      "ref": "tools/tests/test_crawler_merge_train.py::test_parse_collection_totals_matches_ci_summary"
+     },
+     {
+      "exists": true,
+      "kind": "tool",
+      "ref": "tools/extract_untracked_tests.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "worker DONE provisional until reconciled",
+   "row_id": "P-10"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "process",
+      "ref": "crawler-launch-sprint/AUDIT_LOOP_STATE.md"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "one lab clean is not clean",
+   "row_id": "P-11"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "866c3b7f8-pm6-w20-change",
+    "tripwires": [
+     {
+      "kind": "process",
+      "ref": "crawler-launch-sprint/AUDIT100_CLOSURE.md"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_waiver_disclosures.py::test_every_registered_waiver_has_a_production_disclosure"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_waiver_disclosures.py::test_the_waiver_registry_is_closed_at_exactly_the_three_doctrine_instances"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "every deferral has owner + firing trigger",
+   "row_id": "P-12"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "ladder-unblock-v2-shape4-change",
+    "tripwires": [
+     {
+      "kind": "tool",
+      "ref": "menagerie/crawler/tools/close_drift_probe.py"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_leg_purpose.py::test_close_drift_classifier_names_the_recurrence_classes"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_leg_purpose.py::test_close_drift_probe_cli_exit_codes"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "out-of-band operator append to a close-attested source between a leg close and the next boundary stage (R7 canary three-door deadlock; probe names the delta class before ops acts land; remedy = licensing_close purpose leg, never a gate carve-out)",
+   "row_id": "L-01"
+  },
+  {
+   "disposition": {
+    "kind": "FIXED",
+    "sha": "ladder-unblock-v2-shape4-change",
+    "tripwires": [
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_leg_purpose.py::test_retroactive_reclass_warning_fires_only_over_live_history"
+     },
+     {
+      "kind": "pytest-node",
+      "ref": "menagerie/crawler/tests/test_leg_purpose.py::test_no_bare_leg_class_flag_exists_anywhere"
+     },
+     {
+      "kind": "tool",
+      "ref": "menagerie/crawler/tools/close_drift_probe.py"
+     }
+    ]
+   },
+   "kind": "finding",
+   "name": "rung-class refinement retroactively re-classes a snapshot whose pre-launch legs must still run (door B: successor_rung overloaded as a gating policy; pre-launch legs ride the closed licensing_close purpose lane and the probe WARNs on retroactive classings; RC-3 retired door B's certificate-kind derivation outright, so the surviving tripwire pins that no leg-class flag regrows)",
+   "row_id": "L-02"
+  }
+ ],
+ "schema_version": "menagerie.crawler.audit-register.v1",
+ "staleness": {
+  "catalog_source": "FAILURE_PATTERN_CATALOG.md (2026-08-16, 42 rows, CATALOG_DONE 42 36) refreshed row-by-row against the current tree",
+  "note": "F ruling: this header is the register's staleness authority; FIXED rows' sha field carries the same verification basis. P-07's tripwire nodes and the pin registry land in the same reviewed change as this register.",
+  "refreshed_at": "2026-08-25",
+  "refreshed_tree": "866c3b7f8-pm6-w20-change"
+ }
+}

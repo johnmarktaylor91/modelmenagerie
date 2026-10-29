@@ -1,0 +1,25 @@
+{
+ "award_chain_anchor": {
+  "anchor_path": "menagerie/crawler/reconstruction/pr/m_prebatch/sha256:aeb544393112246d28401fbb275e0f809bbeb35fbe765616e3df727bc8d1cccc.json",
+  "anchor_sha256": "sha256:7fdcd52bd874176e6712f2f763c8120ab567a44183e4151f7ae9d49450c22821"
+ },
+ "captured_command": "python -m menagerie.crawler.tests.mixed_era.capture_prebatch_fixtures",
+ "entries": {
+  "award_chain/reconstruction_doc.json": "sha256:7fdcd52bd874176e6712f2f763c8120ab567a44183e4151f7ae9d49450c22821",
+  "award_chain/shard.jsonl": "sha256:8b4639a37dc5beeab05e3e42a01544530e8a6def9652887fefd873fcdaa6d715",
+  "release_exhaustion/attempts.jsonl": "sha256:a20889511ce708c7d9f81a7015706539aa7e50249785641ba5bdb28c45a2e187",
+  "release_exhaustion/models.jsonl": "sha256:1dbe52de40ce2746fbbc6c933b1d29107ee5f7dc4a0cda8a5d7bba05a6dec05f",
+  "release_exhaustion/requeue-grants.jsonl": "sha256:77c3966cc71650cb971af43596f2e0ce6a59c6a3e7b0b33494ddb7ed7b0556de",
+  "release_worker_crash/attempts.jsonl": "sha256:d2a0dab58c19f440d70291f56450b4721a997df37690c0dfff0924f21f0a1206",
+  "release_worker_crash/models.jsonl": "sha256:c7d787878393b03567ba5cee65e2a744587caed8194ede1799320e217c263a09",
+  "release_worker_crash/requeue-grants.jsonl": "sha256:976338cb94f6550108955c60f32cf01bdc4dfbf2e33670af722cf0884d069608",
+  "requeue_grant.json": "sha256:54affc44e5b0cec232f68d9888dd672d92a7165d18787fd139fb0a49ee6c7ef8",
+  "terminal_attempts.jsonl": "sha256:f1f6387d149f9a13b1da17cac66e3f6381aba23ef7fc337f99300dab3dd516db",
+  "terminal_gate_missing_block.json": "sha256:1ec8aafaf9a171c1f99cb90b70ce14b9bd7a5f7fa13e8c9e9012505f9b85815c",
+  "terminal_gate_rendered.json": "sha256:8231fb89397b0a5514d60a00248a14e4232e747460105473e49e7bc91f67cba1",
+  "terminal_gate_unrendered.json": "sha256:1a2a3382b61a1275a4cf6d12cfaff0c5bb44f608e9c660b86b11e24a4632864a",
+  "terminal_models.jsonl": "sha256:e1c8fe5f47d19748b8b43ffb08b21e532a7696b26ce859e63ac3e5662814a57b"
+ },
+ "schema_version": "menagerie.crawler.wave2-prebatch-fixture-manifest.v1",
+ "tree_sha": "4d85449599382b634ab7f44bb7b18a7e5303dd93"
+}

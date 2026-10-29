@@ -1,0 +1,14 @@
+{
+ "field": "output_type",
+ "source": "docs/metadata/SCHEMA_v2.md column 69 (output_type enum)",
+ "values": [
+  "logits",
+  "boxes",
+  "mask",
+  "waveform",
+  "token-logits",
+  "embedding",
+  "policy",
+  "reconstruction"
+ ]
+}

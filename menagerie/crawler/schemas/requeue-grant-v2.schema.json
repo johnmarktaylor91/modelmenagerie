@@ -1,0 +1,94 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://torchlens.org/schemas/menagerie/crawler/requeue-grant-v2.schema.json",
+ "title": "Menagerie crawler operator requeue grant v2",
+ "description": "One tool-minted operator requeue grant on the W31 schema rung: v2 = v1 + created_at + adjudication_key + effective_session_ceiling. The ladder is monotone -- v1 and pre-schema rows remain readable forever on their own terms -- and all three new fields ride OUTSIDE the grant_id preimage, exactly as schema_version always has, so no existing grant hash moved. adjudication_key is the recomputable identity of the adjudicated operator DECISION (member, stage, reason, and typed scopes; never attribution, allowance size, or row generation); effective_session_ceiling is the MC-Q4 keep-and-disclose figure stamped at issuance and never read back as authority.",
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "schema_version",
+  "grant_id",
+  "stable_id",
+  "stage",
+  "reason",
+  "attempts",
+  "granted_by",
+  "new_work_generation",
+  "created_at",
+  "adjudication_key",
+  "effective_session_ceiling"
+ ],
+ "properties": {
+  "schema_version": {
+   "const": "menagerie.crawler.requeue-grant.v2",
+   "description": "Closed grant payload version."
+  },
+  "grant_id": {
+   "$ref": "#/$defs/hash",
+   "description": "Canonical grant identity, the one preimage owned by menagerie.crawler.grant_identity.tool_grant_identity."
+  },
+  "stable_id": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Durable identifier of the granted model."
+  },
+  "stage": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Closed failure stage the grant re-authorizes, or the typed deferred-terminal sentinel for review-held null-stage deferrals (docket T2-05)."
+  },
+  "reason": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Operator attribution for the authorization."
+  },
+  "attempts": {
+   "type": "integer",
+   "minimum": 1,
+   "description": "Author-attempt extension the granted work generation may spend beyond the base allowance (docket T1-13). Stays the enforced unit under MC-Q4."
+  },
+  "granted_by": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Operator identity that issued the grant."
+  },
+  "new_work_generation": {
+   "type": "integer",
+   "minimum": 1,
+   "description": "One-based ledger append generation allocated at issue time; folded into grant_id."
+  },
+  "created_at": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Timezone-aware UTC issuance timestamp; outside the grant identity by design, and the grant-aging census's age evidence."
+  },
+  "adjudication_key": {
+   "$ref": "#/$defs/hash",
+   "description": "Recomputable identity of the adjudicated decision, owned by menagerie.crawler.grant_identity.requeue_adjudication_key. At most ONE live grant per key; readers recompute and refuse a mismatch, so the persisted field can never steer the decision identity."
+  },
+  "effective_session_ceiling": {
+   "type": "integer",
+   "minimum": 1,
+   "description": "MC-Q4 disclosure: the worst-case paid guard-session ceiling attempts:N implied at issuance (attempts x EFFECTIVE_SESSIONS_PER_GRANTED_ATTEMPT under that day's constants). Disclosure only; no consumer derives authority from it."
+  },
+  "blocked_award_revision": {
+   "$ref": "#/$defs/hash",
+   "description": "Optional exact runs record revision this grant authorizes superseding (AW-1). Folded into grant_id only when present; the single authority that releases the award-custody tripwire."
+  },
+  "target_intent": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Optional dependency-evidenced environment correction for the new work generation."
+  },
+  "capability": {
+   "enum": [
+    "host-capability-routing"
+   ],
+   "description": "Optional typed capability this grant authorizes. Only a grant NAMING host-capability-routing may re-open a deferred:needs-more-memory head; a generic requeue never does, because a new work id is not evidence that the host gained memory."
+  }
+ },
+ "$defs": {
+  "hash": {
+   "type": "string",
+   "pattern": "^sha256:[0-9a-f]{64}$"
+  },
+  "nonempty_string": {
+   "type": "string",
+   "minLength": 1
+  }
+ }
+}

@@ -1,0 +1,665 @@
+{
+ "schema_version": "menagerie.crawler.wave2-mixed-era-registry.v1",
+ "freeze": {
+  "tree_sha": "4d85449599382b634ab7f44bb7b18a7e5303dd93",
+  "boundary": "wave1-merged-main",
+  "batch_run_command": "MENAGERIE_WAVE2_ASSEMBLY=1 PYTHONPATH=. python -m pytest menagerie/crawler/tests/test_mixed_era_matrix_census.py $(ls menagerie/crawler/tests/test_mixed_era_*.py) menagerie/crawler/tests/test_wave2_deferred_rotations.py -q",
+  "ic9_live_root_command": "PYTHONPATH=. python -m menagerie.crawler.tools.schema_migration_census --artifact-shard <records>/artifacts/<shard>.jsonl --repository-root <campaign clone root> --gate"
+ },
+ "seams": [
+  {
+   "seam_id": "terminal-status-vocabulary",
+   "owner": "WS1/WS2",
+   "plan_items": [
+    "W13",
+    "W1",
+    "AL-6",
+    "W14-vocabulary-seam",
+    "W5"
+   ],
+   "design_note_source": "tl-ws1 lane report W13 note; tl-ws2 lane report W1/W14 notes; tl-ws3 W5 note",
+   "declared_change": "New closed terminal member blocked:disposition-review (W13); QUOTA deferral valve rows reserve effort-exhausted:author-sessions for true used==max (W1); the ONE terminal/prerequisite vocabulary schema consumed by AL-6/EN-6/AT-14 (WS2-owned); W5 containment terminal routes to a deferred-family park.",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_terminal_vocabulary.py",
+   "fixtures": [
+    "terminal_models.jsonl",
+    "terminal_attempts.jsonl",
+    "terminal_gate_rendered.json",
+    "terminal_gate_unrendered.json",
+    "terminal_gate_missing_block.json"
+   ],
+   "readers": [
+    {
+     "reader_id": "canonical-reducer-replay",
+     "post_batch_expectation": "parse-era-scoped",
+     "notes": "200a terminal heads must keep replaying byte-identically; PD-13 forward-only."
+    },
+    {
+     "reader_id": "model-v3-schema-closed-enum",
+     "post_batch_expectation": "flip-declared",
+     "expected_flip": "W13",
+     "notes": "blocked:disposition-review refuses on the status.code enum pre-batch and parses only once W13 extends the closed set in the sealed batch."
+    },
+    {
+     "reader_id": "derive-terminal-proof-rendered-verdict",
+     "post_batch_expectation": "parse-identical-verdict",
+     "notes": "A rendered adverse verdict must keep minting failed:accuracy-gate."
+    },
+    {
+     "reader_id": "derive-terminal-proof-unrendered-verdict",
+     "post_batch_expectation": "flip-declared",
+     "expected_flip": "W13",
+     "notes": "PRE-BATCH DEFECT PIN: proof derivation mints failed:accuracy-gate/terminal-disposition-unverifiable today when the disposition verdict is None (the 27-row 200a shape). W13 declares this refuses or reclassifies to blocked:disposition-review."
+    },
+    {
+     "reader_id": "derive-terminal-proof-missing-disposition-block",
+     "post_batch_expectation": "refuse-typed",
+     "notes": "A terminal_disposition gate whose item lacks the disposition block already refuses typed (AuthorityDerivationError); must stay armed."
+    },
+    {
+     "reader_id": "reducer-append-verdictless-accuracy-gate",
+     "post_batch_expectation": "refuse-typed",
+     "notes": "The append sink already refuses failed:accuracy-gate without exact rejected gate evidence; must stay armed."
+    }
+   ]
+  },
+  {
+   "seam_id": "requeue-grant-authority",
+   "owner": "WS2",
+   "plan_items": [
+    "W31",
+    "LC-17",
+    "MC-9",
+    "UU-22",
+    "D-49-join"
+   ],
+   "design_note_source": "tl-ws2 lane report W31 note; tl-ws7 D-49 row",
+   "declared_change": "Grant/authority schema v2: created_at on every authority row, monotone schema ladder, idempotent double-void refusal, unique adjudication key, provider.adapter_identity settlement stamp (v5).",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_grant_authority.py",
+   "fixtures": [
+    "requeue_grant.json"
+   ],
+   "readers": [
+    {
+     "reader_id": "grant-append-replay",
+     "post_batch_expectation": "parse-era-scoped",
+     "notes": "A pre-batch grant row (no created_at) must stay appendable/readable in every era (WS7: absent created_at tolerated forever)."
+    },
+    {
+     "reader_id": "grant-consumption-content-hash",
+     "post_batch_expectation": "parse-identical-verdict",
+     "notes": "grant_id binds content at consumption; a tampered row refuses typed in every era."
+    },
+    {
+     "reader_id": "grant-consumption-created-at-era-scope",
+     "post_batch_expectation": "parse-era-scoped",
+     "notes": "Mixed-era ledger: a W31-era duplicate differing only by created_at reads as ONE logical grant at consumption (the consume-side comparison already excludes created_at)."
+    },
+    {
+     "reader_id": "grant-append-created-at-divergence",
+     "post_batch_expectation": "flip-declared",
+     "expected_flip": "W31",
+     "notes": "Pre-batch asymmetry pin: the append authority refuses a created_at-divergent duplicate typed while consumption tolerates it; W31's ladder resolves the seam deliberately."
+    }
+   ]
+  },
+  {
+   "seam_id": "infra-release-classes",
+   "owner": "WS2",
+   "plan_items": [
+    "W14",
+    "AL-6",
+    "AT-14",
+    "AL-7"
+   ],
+   "design_note_source": "tl-ws2 lane report W14 + AL-7 notes; STATE.md JMT APPROVALS 2026-08-24 (all eight C.8 arms signed)",
+   "declared_change": "Four transient release classes widen four-part waiver instance #2 (each JMT-signed, four-part proof rides the change); AL-7 removes the bare AuthorEffortCapExceeded infra-waiver arm (signed narrowing).",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_release_classes.py",
+   "fixtures": [
+    "release_worker_crash/models.jsonl",
+    "release_worker_crash/attempts.jsonl",
+    "release_worker_crash/requeue-grants.jsonl",
+    "release_exhaustion/models.jsonl",
+    "release_exhaustion/attempts.jsonl",
+    "release_exhaustion/requeue-grants.jsonl"
+   ],
+   "readers": [
+    {
+     "reader_id": "consume-worker-crash-infra-waiver",
+     "post_batch_expectation": "parse-identical-verdict",
+     "notes": "All-infra worker-crash terminal releases via infra-waiver with exact witness bases; W14 widening is disposition-invariant so this verdict may never move."
+    },
+    {
+     "reader_id": "consume-bare-exhaustion-arm",
+     "post_batch_expectation": "flip-declared",
+     "expected_flip": "AL-7",
+     "notes": "PRE-BATCH GOLDEN: bare driver-effort-exhaustion:AuthorEffortCapExceeded releases via infra-waiver today; AL-7 (signed) removes this arm, flipping the shape to review-held."
+    },
+    {
+     "reader_id": "witness-basis-derivation",
+     "post_batch_expectation": "parse-identical-verdict",
+     "notes": "machine_infrastructure_witness_basis on frozen attempts is replay-derived with zero producer input; bases must stay byte-stable."
+    }
+   ],
+   "notes": "Batch assembly: the four signed W14 classes MERGED; AL-7's signed narrowing did NOT ride any Wave-2 lane, so the bare AuthorEffortCapExceeded flip cell stays on its pre-batch side (assembly mode tolerates the declared flip landing either way). AL-7 must ride a future sealed rotation batch."
+  },
+  {
+   "seam_id": "artifact-transaction-chain",
+   "owner": "WS6",
+   "plan_items": [
+    "AT-4",
+    "AT-5",
+    "AT-6",
+    "AT-7",
+    "AT-Q9-lane-field",
+    "DX-36-rider"
+   ],
+   "design_note_source": "tl-ws6 lane report AT-4/5/6 batch note",
+   "declared_change": "Award-tail reorder (authorization before spend), torn-chain resume class, shared award-seam classifier, publication_lane disclosure field on publication/refusal events; rotates award_closure_identity.",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_award_chain.py",
+   "fixtures": [
+    "award_chain/shard.jsonl",
+    "award_chain/reconstruction_doc.json"
+   ],
+   "readers": [
+    {
+     "reader_id": "artifact-event-ledger-load",
+     "post_batch_expectation": "parse-era-scoped",
+     "notes": "Every 200a 4-event chain must keep loading; the reorder shapes NEW chains only."
+    },
+    {
+     "reader_id": "artifact-event-kind-closed-enum",
+     "post_batch_expectation": "parse-era-scoped",
+     "notes": "The frozen chain's event kinds must remain members of the live closed enum; removal is a downgrade-ladder violation. Unknown kinds refuse typed in every era."
+    },
+    {
+     "reader_id": "artifact-event-content-hash",
+     "post_batch_expectation": "parse-identical-verdict",
+     "notes": "payload_sha256 tamper refuses typed in every era."
+    }
+   ]
+  },
+  {
+   "seam_id": "author-result-payload",
+   "owner": "WS6 (census) / WS4 (AL-14 coupling)",
+   "plan_items": [
+    "IC-9",
+    "AB-30-pairing",
+    "AL-14"
+   ],
+   "design_note_source": "PLAN_v6 IC-9 census half; tl-ws6 IC-9 row (14 schema-stale live pilot reading)",
+   "declared_change": "Any batch movement of the live author-result schema converts recorded author results into per-member paid re-author misses; the IC-9 census makes the storm a pre-launch count and its nonzero gate an explicit migration decision.",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_author_result.py",
+   "fixtures": [
+    "award_chain/shard.jsonl",
+    "award_chain/reconstruction_doc.json"
+   ],
+   "readers": [
+    {
+     "reader_id": "ic9-schema-migration-census-gate",
+     "post_batch_expectation": "parse-era-scoped",
+     "notes": "The frozen pre-batch recorded author result must stay schema-valid at the assembled tree, or the gate exits 2 and the batch owes an explicit migration decision (never an ambient re-author storm)."
+    },
+    {
+     "reader_id": "ic9-stale-schema-control",
+     "post_batch_expectation": "parse-identical-verdict",
+     "notes": "Control arm: validating the frozen result against the retired v3 schema must report schema-stale and gate-exit 2 in every era (proves the census can see staleness)."
+    }
+   ]
+  },
+  {
+   "seam_id": "corpus-index-row-replay",
+   "owner": "WS6",
+   "plan_items": [
+    "W10",
+    "AL-5"
+   ],
+   "design_note_source": "tl-ws6 lane report W10 note",
+   "declared_change": "Declared per-schema volatile-field list (retrieved_at, final_url, locator, custody_disposition join license_disposition): same corpus_row_id re-promotions retain the immutable first observation and report replayed instead of conflicting.",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "notes": "Prior-era artifact: a promoted corpus row; readers: promote_documents replay, ledger idempotent-replay rule. corpus_row_id must never widen.",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_corpus_index_replay.py",
+   "readers": [
+    {
+     "reader_id": "text_corpus.promote_author_root (replay over volatile moves)",
+     "post_batch_expectation": "parse-era-scoped"
+    },
+    {
+     "reader_id": "corpus-index ledger idempotent-replay retention (first observation)",
+     "post_batch_expectation": "parse-identical-verdict"
+    },
+    {
+     "reader_id": "moved-identity-field re-promotion (LedgerConflictError)",
+     "post_batch_expectation": "refuse-typed"
+    }
+   ]
+  },
+  {
+   "seam_id": "run-id-invocation-identity",
+   "owner": "WS3/WS7",
+   "plan_items": [
+    "DX-23",
+    "D-22"
+   ],
+   "design_note_source": "tl-ws3 lane report DX-23 note",
+   "declared_change": "run_id becomes a real per-invocation identity (all 43 200a starts reused run_id=crawler-run); append-only invocation ledger; close cites its legs.",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "notes": "Prior-era artifact: rows stamped run_id=crawler-run; readers must treat the constant-era rows era-scoped, never as one logical invocation.",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_run_id_identity.py",
+   "readers": [
+    {
+     "reader_id": "invocation_identity.close_leg_citations over legacy-constant runs",
+     "post_batch_expectation": "parse-era-scoped"
+    },
+    {
+     "reader_id": "invocation_identity.load_invocation_rows on a legacy-constant or unknown-schema row",
+     "post_batch_expectation": "refuse-typed"
+    },
+    {
+     "reader_id": "invocation_identity.leg_valid_single_invocation (pre-ledger era stays unattributable)",
+     "post_batch_expectation": "parse-era-scoped"
+    }
+   ]
+  },
+  {
+   "seam_id": "leg-config-digest-identity",
+   "owner": "WS10",
+   "plan_items": [
+    "D-63"
+   ],
+   "design_note_source": "tl-ws10 lane report D-63 note",
+   "declared_change": "config_digest becomes a close-consumed identity certifying effective-config homogeneity across a rung's legs; leg-config events gain repo_tree_sha and resolved effective values.",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "notes": "Prior-era artifact: LEG_CONFIG events without repo_tree_sha; rung certification must scope its homogeneity check to post-D-63 eras or refuse typed.",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_leg_config_digest.py",
+   "readers": [
+    {
+     "reader_id": "tools.rung_report certification over pre-D-63 leg-config events",
+     "post_batch_expectation": "parse-era-scoped"
+    },
+    {
+     "reader_id": "tools.rung_report certification surface over heterogeneous post-era rung digests (library census discloses homogeneous=false; the CLI exit-2 contract refuses)",
+     "post_batch_expectation": "refuse-typed"
+    }
+   ]
+  },
+  {
+   "seam_id": "runner-reason-vocabulary",
+   "owner": "WS5",
+   "plan_items": [
+    "DX-1",
+    "DX-2",
+    "DX-6",
+    "DX-7",
+    "DX-8",
+    "DX-9",
+    "DX-10",
+    "DX-11",
+    "DX-12"
+   ],
+   "design_note_source": "tl-ws5 lane report Wave-2 notes",
+   "declared_change": "New closed runner reason codes (worker-bootstrap-failed, worker-runtime-unavailable, ...), owner map extension, attestation conjunction gains teardown outcome + empty survivors (DX-11).",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "notes": "The unknown-reason-code typed refusal is already pinned by the terminal-status-vocabulary matrix's negative control; the runner lane owes the per-code era matrix plus the DX-15 cross-pin extension in the same change.",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_runner_attestation.py",
+   "readers": [
+    {
+     "reader_id": "authority.derive_attempt_projection over recorded parent-attestation.v2 rows",
+     "post_batch_expectation": "parse-identical-verdict"
+    },
+    {
+     "reader_id": "authority replay validation of parent-attestation.v3 teardown conjunction",
+     "post_batch_expectation": "parse-era-scoped"
+    },
+    {
+     "reader_id": "unknown parent-attestation version",
+     "post_batch_expectation": "refuse-typed"
+    },
+    {
+     "reader_id": "recordio.resolve_attempt_slot_state generation-zero identity (byte parity with the legacy resolver)",
+     "post_batch_expectation": "parse-identical-verdict"
+    }
+   ]
+  },
+  {
+   "seam_id": "env-prerequisite-token-grammar",
+   "owner": "WS8 (grammar) / WS2 (vocabulary seam)",
+   "plan_items": [
+    "EN-6",
+    "W14-vocabulary-seam"
+   ],
+   "design_note_source": "tl-ws8 lane report EN-6 note",
+   "declared_change": "Closed grammar runtime-dependency:<pep503>; bare runtime-dependency (the m4954 content-free token) becomes the RED arm; platform-class prerequisite sets route to needs-cuda-shaped deferral.",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "notes": "Prior-era artifact: the 19 pilot diagnostics (committed corpus per the design note); the replay-all-19 classifier fixture IS this seam's matrix.",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_prerequisite_grammar.py",
+   "readers": [
+    {
+     "reader_id": "environment_coverage.aggregate_prerequisite_tokens over the committed known-19 corpus",
+     "post_batch_expectation": "parse-era-scoped"
+    },
+    {
+     "reader_id": "content-free token dominance (m4954 class can never steer)",
+     "post_batch_expectation": "refuse-typed"
+    }
+   ]
+  },
+  {
+   "seam_id": "steering-identity",
+   "owner": "WS4",
+   "plan_items": [
+    "AL-22"
+   ],
+   "design_note_source": "tl-ws4 lane report AL-22 note",
+   "declared_change": "author_steering_identity composite hash stamped per attempt; registered as a DISCLOSED-NON-STALING rotation class; prior-era attempts carry only prompt_sha256.",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "notes": "Non-staling by design: prior-era attempts must never retro-stale; the matrix proves readers treat the absent field era-scoped.",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_steering_identity.py",
+   "readers": [
+    {
+     "reader_id": "author_attempts readers over digest-free prior-era attempts (never retro-stale)",
+     "post_batch_expectation": "parse-era-scoped"
+    },
+    {
+     "reader_id": "staling-consumer absence census (validate_currency / _REVIEW_HELD_RECORDED_AXES / _RECORD_TIME_PINNED_AXES / staleness graph)",
+     "post_batch_expectation": "parse-identical-verdict"
+    }
+   ]
+  },
+  {
+   "seam_id": "calibration-receipt-identity",
+   "owner": "WS1",
+   "plan_items": [
+    "W2",
+    "AG-4"
+   ],
+   "design_note_source": "tl-ws1 lane report W2 + AG-4 notes",
+   "declared_change": "Tool-minted calibration receipt (captured_at era rule already landed); AG-4 conflict ledger keyed on the full 4-tuple adjudication identity; duplicate-accept policy for TD.",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "notes": "Prior-era artifact: the existing calibration receipt shape consumed by require_checker_calibration.",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_calibration_receipt.py",
+   "readers": [
+    {
+     "reader_id": "checker_calibration.load_checker_calibration_receipt on a pre-batch-shaped receipt (new REQUIRED fields absent)",
+     "post_batch_expectation": "refuse-typed"
+    },
+    {
+     "reader_id": "require_checker_calibration at the committed-absent state (era boundary vacuous by proof)",
+     "post_batch_expectation": "refuse-typed"
+    },
+    {
+     "reader_id": "loader over a fully well-formed receipt (refusals are field-caused)",
+     "post_batch_expectation": "parse-era-scoped"
+    }
+   ]
+  },
+  {
+   "seam_id": "env-turn-ledger-recovery",
+   "owner": "WS8",
+   "plan_items": [
+    "D-60",
+    "W31-ladder-wave"
+   ],
+   "design_note_source": "tl-ws8 lane report D-60 note",
+   "declared_change": "environment-turn-effort.jsonl routes through recover_torn_tail with an evidence row; append-only-ledger census (writer lock XOR evidenced-tail recovery).",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "notes": "Prior-era artifact: the existing env-turn ledger without recovery evidence rows; old shards must read unchanged.",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_env_turn_ledger.py",
+   "readers": [
+    {
+     "reader_id": "env_lifecycle.replay_environment_turn_attempts over a clean pre-era shard (bytes unchanged)",
+     "post_batch_expectation": "parse-identical-verdict"
+    },
+    {
+     "reader_id": "evidenced torn-tail recovery (recover_environment_turn_effort_ledger)",
+     "post_batch_expectation": "parse-era-scoped"
+    },
+    {
+     "reader_id": "interior corruption (EnvironmentLifecycleError)",
+     "post_batch_expectation": "refuse-typed"
+    }
+   ]
+  },
+  {
+   "seam_id": "quota-deferral-valve-rows",
+   "owner": "WS2",
+   "plan_items": [
+    "W1",
+    "MC-5",
+    "SD-16"
+   ],
+   "design_note_source": "tl-ws2 lane report W1 note",
+   "declared_change": "NEW generation-scoped transient deferral valve row kind, PD-3 bounded (K=3); no prior-era rows of this class exist.",
+   "era_class": "no-prior-era",
+   "refusal_proof_nodes": [
+    "menagerie/crawler/tests/test_quota_deferral_valve.py::test_valve_row_validator_refuses_every_broken_shape"
+   ],
+   "notes": "First consumer must land with the row kind in one reviewed change; the assembly census refuses until the typed prior-artifact refusal proof node is registered here."
+  },
+  {
+   "seam_id": "leg-lifecycle-events",
+   "owner": "WS3",
+   "plan_items": [
+    "W6",
+    "FT-a-exit-classes"
+   ],
+   "design_note_source": "tl-ws3 lane report W6 note",
+   "declared_change": "NEW leg_started/leg_ended ledger rows with closed LegExitClass vocabulary, invocation_origin, restart ladder rows.",
+   "era_class": "no-prior-era",
+   "refusal_proof_nodes": [
+    "menagerie/crawler/tests/test_leg_lifecycle.py::test_the_exit_vocabulary_is_closed_at_exactly_the_nine_classes",
+    "menagerie/crawler/tests/test_mixed_era_batch_widenings.py::test_unknown_leg_event_kind_refuses_typed"
+   ]
+  },
+  {
+   "seam_id": "invocation-ledger",
+   "owner": "WS3",
+   "plan_items": [
+    "DX-23"
+   ],
+   "design_note_source": "tl-ws3 lane report DX-23 note",
+   "declared_change": "NEW append-only invocation ledger (one row per process invocation).",
+   "era_class": "no-prior-era",
+   "refusal_proof_nodes": [
+    "menagerie/crawler/tests/test_invocation_identity.py::test_new_invocation_rows_refuse_the_legacy_constant",
+    "menagerie/crawler/tests/test_invocation_identity.py::test_invocation_ledger_refuses_interior_corruption",
+    "menagerie/crawler/tests/test_mixed_era_run_id_identity.py::test_unknown_invocation_schema_version_refuses_typed"
+   ]
+  },
+  {
+   "seam_id": "cache-retirement-and-v2",
+   "owner": "WS6",
+   "plan_items": [
+    "W9",
+    "AT-10"
+   ],
+   "design_note_source": "tl-ws6 lane report W9 + AT-10 notes",
+   "declared_change": "NEW durable retirement rows + cache v2 on-disk schema with fail-closed generation binding; the era rule is EXPLICIT by design: null/legacy generation refuses authority-bearing reuse, diagnostic-only read allowed.",
+   "era_class": "no-prior-era",
+   "refusal_proof_nodes": [
+    "menagerie/crawler/tests/test_author_cache_v2_binding.py::test_legacy_v1_cache_fails_closed_for_authority_bearing_reuse",
+    "menagerie/crawler/tests/test_author_cache_v2_binding.py::test_v2_cache_without_a_generation_binding_refuses"
+   ],
+   "notes": "AT-10's RED matrix (generation null/old/future/exact x lifecycle x second-host x restart-after-retirement) IS this seam's refusal proof; m12646's surviving repair_generation:null cache is the archived fixture. Batch assembly era note: the pre-existing identity-stale operational event family flipped status HEALTHY -> DEGRADED (DX-36 honest-status rule); consumers counting HEALTHY identity-stale events must treat pre-batch rows as the old status era."
+  },
+  {
+   "seam_id": "shadow-rehearsal-marker",
+   "owner": "WS1/WS6",
+   "plan_items": [
+    "W3-shadow-half",
+    "W44"
+   ],
+   "design_note_source": "tl-ws1 W3 note; tl-ws6 W44 note",
+   "declared_change": "NEW structural shadow marker + dedicated generation namespace on every R6b record; exclusion at every reuse/authority seam and every IC-4 registered cache.",
+   "era_class": "no-prior-era",
+   "refusal_proof_nodes": [
+    "menagerie/crawler/tests/test_shadow_exclusion.py::test_shadow_marker_predicate_is_the_single_closed_authority",
+    "menagerie/crawler/tests/test_shadow_exclusion.py::test_shadow_marked_candidate_refuses_award_issuance_with_all_mode_flags_unset"
+   ],
+   "notes": "Batch assembly: only the W44 read/enforcement half rode this batch (marker field + exclusion at every reuse/authority seam + IC-4 shadow_exclusion columns). W3's writer half (the shadow generation namespace minting marked records) did NOT merge; no persisted record can carry the marker yet, so the exclusion is inert-by-construction on historical stores."
+  },
+  {
+   "seam_id": "checker-verdict-conflict-ledger",
+   "owner": "WS1",
+   "plan_items": [
+    "AG-4"
+   ],
+   "design_note_source": "tl-ws1 lane report AG-4 note",
+   "declared_change": "NEW intake-extensions conflict ledger (checker-verdict-conflicts.jsonl) keyed on the full adjudication identity.",
+   "era_class": "no-prior-era",
+   "refusal_proof_nodes": [
+    "menagerie/crawler/tests/test_checker_verdict_conflicts.py::test_conflict_row_vocabulary_is_closed",
+    "menagerie/crawler/tests/test_checker_verdict_conflicts.py::test_terminal_gate_verdict_fails_closed"
+   ]
+  },
+  {
+   "seam_id": "park-exit-release-lane",
+   "owner": "WS3",
+   "plan_items": [
+    "D-48",
+    "D-5"
+   ],
+   "design_note_source": "tl-ws3 lane report D-48 note; tl-ws2 D-5 row",
+   "declared_change": "Park/release vocabulary extension: machinery-fault-class park admits one fresh generation per tree_sha change and re-parks idempotently; D-5 author-lane park class.",
+   "era_class": "no-prior-era",
+   "refusal_proof_nodes": [
+    "menagerie/crawler/tests/test_park_release_lane.py::test_machinery_fault_class_is_closed",
+    "menagerie/crawler/tests/test_park_release_lane.py::test_repark_under_a_new_tree_appends_a_fresh_governing_row",
+    "menagerie/crawler/tests/test_park_release_lane.py::test_pre_era_park_member_machine_readmits_end_to_end"
+   ],
+   "notes": "The no-head-park RED fixture (release mechanically unreachable today) is the seam's pre-batch defect pin, owned by the D-48 lane."
+  },
+  {
+   "seam_id": "blocking-resolution-vocabulary",
+   "owner": "WS11 (W16)",
+   "plan_items": [
+    "W16"
+   ],
+   "design_note_source": "PLAN_v6 first-generation rule (four W16-owned surfaces)",
+   "declared_change": "First-generation blocking-item resolution vocabulary + canonical resolution envelope; legacy resolution artifacts refuse typed.",
+   "era_class": "first-generation",
+   "refusal_proof_nodes": [
+    "menagerie/crawler/tests/test_blocking_resolution.py::test_legacy_resolution_artifact_refuses_typed"
+   ]
+  },
+  {
+   "seam_id": "scheduler-quarantine-ladder",
+   "owner": "WS3",
+   "plan_items": [
+    "W12",
+    "PD-11",
+    "SD-7"
+   ],
+   "design_note_source": "w2-scheduler lane report W12 note (registry row added at batch assembly: the W12 ladder extension was absent from the pre-batch registry)",
+   "declared_change": "Two NEW scheduler-quarantine row families: scheduler-quarantine-void.v2 (remedied void; required remedy fixing_sha/test_node/canary; always budget-restoring) and scheduler-quarantine-drain.v1 (machine drain; required fixed_in_tree_sha; restores only when exhaustion held at its position). v1 park/void bytes stay readable unchanged with legacy requeue-every-run behavior; double release refuses typed; re-parks emit -reused and charge nothing.",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_scheduler_quarantine.py",
+   "readers": [
+    {
+     "reader_id": "scheduler_parks loaders/validators over v1 park+void rows (bytes unchanged, legacy release rule)",
+     "post_batch_expectation": "parse-identical-verdict"
+    },
+    {
+     "reader_id": "budget_restoring_boundaries over void.v2 / drain.v1 rows",
+     "post_batch_expectation": "parse-era-scoped"
+    },
+    {
+     "reader_id": "unknown family or future schema version; double release (SD-7)",
+     "post_batch_expectation": "refuse-typed"
+    }
+   ]
+  },
+  {
+   "seam_id": "fidelity-no-consumer-arm",
+   "owner": "WS7 (w2-ledger)",
+   "plan_items": [
+    "W8",
+    "PD-2"
+   ],
+   "design_note_source": "w2-ledger lane report W8 note (registry row added at batch assembly: the signed PD-2 arm widening was absent from the pre-batch registry)",
+   "declared_change": "Waiver instance #1 (fidelity gate no-consumer) widens per the signed PD-2 conjunction: a dispatched-dead bootstrap shape with ZERO execution evidence waives (already-negative terminal stands, disclosed segregated via funnel_counts.fidelity_no_consumer_pre_execution); ANY execution evidence disqualifies typed (fidelity-consumer-exists). Pre-batch the dispatched-dead shape refused reduction ('required fidelity is missing its gate').",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_fidelity_waiver.py",
+   "readers": [
+    {
+     "reader_id": "CanonicalReducer over the prior-era dispatched-dead shape",
+     "post_batch_expectation": "flip-declared",
+     "expected_flip": "W8"
+    },
+    {
+     "reader_id": "CanonicalReducer over execution-evidence shapes (receipt present / forward started / accepted_attempt_ids)",
+     "post_batch_expectation": "refuse-typed"
+    }
+   ]
+  },
+  {
+   "seam_id": "batch-closed-set-widenings",
+   "owner": "batch assembly (members: WS1/WS2/WS3/WS5/WS6/WS8)",
+   "plan_items": [
+    "W6",
+    "AL-22",
+    "AG-4",
+    "W9",
+    "AT-4",
+    "AT-5",
+    "W14",
+    "W1",
+    "AL-6",
+    "W2",
+    "EN-8",
+    "DX-23"
+   ],
+   "design_note_source": "the eight w2-* lane reports' DECLARED VOCABULARY/AXIS CHANGES sections (consolidated at batch assembly)",
+   "declared_change": "The batch's pure closed-set widenings, consolidated: OperationalEventKind+leg-outcome; InvocationOrigin+supervised-restart; ROTATION_CLASSES+disclosed-non-staling; CHECKER_LANE_FAILURE_CLASSES(+non-ladder)+checker-verdict-conflict; SCHEDULER_QUARANTINE_REASONS+3; GRANT_RELEASE_CENSUS_CLASSES+4 machine-released arms; MACHINE_DEFERRAL_DISPOSITIONS+2; ATTEMPT_REFUND_LOCAL_OUTCOMES+author-blocked-prerequisite; EXPECTED_PREFLIGHT_ARMS+checker-calibration-mode; leg-event vocabulary+leg_started/leg_ended; the EN-8 legacy-unbound-overlay exact-digest carve-out. Every pre-batch member and pre-batch row stays lawful.",
+   "era_class": "prior-era",
+   "matrix_disposition": "landed-here",
+   "matrix_module": "menagerie/crawler/tests/test_mixed_era_batch_widenings.py",
+   "readers": [
+    {
+     "reader_id": "closed-set membership censuses over the real production set objects",
+     "post_batch_expectation": "parse-identical-verdict"
+    },
+    {
+     "reader_id": "validate_leg_event_row on an unknown kind; _apply_pip_overlay on an unbound non-legacy manifest",
+     "post_batch_expectation": "refuse-typed"
+    }
+   ]
+  },
+  {
+   "seam_id": "blocked-prerequisite-seam-records",
+   "owner": "WS2",
+   "plan_items": [
+    "W14-vocabulary-seam",
+    "AL-6"
+   ],
+   "design_note_source": "w2-money-vocab lane report W14/AL-6 notes (registry row added at batch assembly)",
+   "declared_change": "NEW ledger family intake-extensions/blocked-prerequisites.jsonl (menagerie.crawler.blocked-prerequisite.v1): typed prerequisite seam records minted at the driver's accepted-BLOCKED routing with all-or-nothing id->token translation; named NON-VALVE in the valve-registry census.",
+   "era_class": "no-prior-era",
+   "refusal_proof_nodes": [
+    "menagerie/crawler/tests/test_machine_class_release.py::test_blocked_prerequisite_near_miss_matrix",
+    "menagerie/crawler/tests/test_machine_class_release.py::test_prerequisite_token_translation_is_closed_and_fail_closed",
+    "menagerie/crawler/tests/test_blocked_prerequisite_terminals.py::test_stage_suffixed_reason_vocabulary_is_closed_and_schema_representable"
+   ],
+   "notes": "Release class blocked-prerequisite-post-rotation stays fail-closed-inert until an EN-6-side emitter lands prerequisite-provision.v1 witnesses (disclosed batch remainder)."
+  }
+ ]
+}

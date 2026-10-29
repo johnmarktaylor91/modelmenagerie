@@ -1,0 +1,169 @@
+---
+/**
+ * Model search box with suggestions: the header's on every page but the listing, and the
+ * 404 page's. Typing lists the first matches from the compact index; Enter on a match opens
+ * it, Enter otherwise opens the listing with `?q=`. Works without JavaScript as a plain form.
+ */
+interface Props {
+  /** Unique per page: element ids derive from it. */
+  id: string;
+  label?: string;
+  placeholder?: string;
+  /** "header" is compact; "page" is a full-width box with a Search button. */
+  variant?: "header" | "page";
+}
+
+const { id, label = "Search models", placeholder = "Search", variant = "header" } = Astro.props;
+const inputId = `${id}-input`;
+const listId = `${id}-list`;
+const messageId = `${id}-message`;
+---
+
+<form class:list={["site-search", `site-search--${variant}`]} role="search" aria-label={label} action="/models/" method="get" data-site-search>
+  <label class="sr-only" for={inputId}>{label}</label>
+  <div class="site-search__box">
+    <input
+      id={inputId}
+      class="field site-search__input"
+      type="search"
+      name="q"
+      placeholder={placeholder}
+      autocomplete="off"
+      autocapitalize="off"
+      spellcheck="false"
+      enterkeyhint="search"
+      role="combobox"
+      aria-autocomplete="list"
+      aria-expanded="false"
+      aria-controls={listId}
+      aria-describedby={messageId}
+    />
+    {variant === "page" && <button class="button primary" type="submit">Search</button>}
+  </div>
+  <div class="site-search__popup" data-search-popup hidden>
+    <ul class="site-search__list" id={listId} role="listbox" aria-label="Suggested models" data-search-list></ul>
+    <div class="site-search__message" data-search-message-box>
+      <p id={messageId} class="site-search__message-text" role="status" aria-live="polite" data-search-message></p>
+      <button class="button site-search__retry" type="button" data-search-retry hidden>Retry</button>
+    </div>
+  </div>
+</form>
+
+<script>
+  import { initSiteSearch } from "@/scripts/SearchSuggest";
+
+  document.querySelectorAll<HTMLFormElement>("form[data-site-search]").forEach(initSiteSearch);
+</script>
+
+<style is:global>
+  .site-search {
+    position: relative;
+    min-width: 0;
+  }
+
+  .site-search__box {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  .site-search__input {
+    flex: 1;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .site-search__popup {
+    position: absolute;
+    z-index: 30;
+    top: calc(100% + 0.35rem);
+    right: 0;
+    width: min(26rem, calc(100vw - 2rem));
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    box-shadow: 0 10px 28px rgb(0 0 0 / 0.14);
+  }
+
+  .site-search--page .site-search__popup {
+    right: auto;
+    left: 0;
+    width: 100%;
+  }
+
+  .site-search__popup[hidden] {
+    display: none;
+  }
+
+  .site-search__list {
+    max-height: min(26rem, 60vh);
+    margin: 0;
+    padding: 0.25rem 0;
+    overflow-y: auto;
+    list-style: none;
+    text-align: left;
+  }
+
+  .site-search__list:empty {
+    display: none;
+  }
+
+  .site-search__option {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-height: 2.75rem;
+    justify-content: center;
+    padding: 0.4rem 0.85rem;
+    cursor: pointer;
+  }
+
+  .site-search__option[aria-selected="true"] {
+    background: var(--surface-2);
+    box-shadow: inset 3px 0 0 var(--text);
+  }
+
+  .site-search__option-name {
+    color: var(--text);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+
+  .site-search__option-meta {
+    color: var(--secondary);
+    font-size: 0.8rem;
+  }
+
+  .site-search__option--all .site-search__option-name {
+    font-weight: 400;
+  }
+
+  .site-search__message {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.5rem 0.85rem;
+    border-top: 1px solid var(--border);
+    color: var(--secondary);
+    font-size: 0.8rem;
+    text-align: left;
+  }
+
+  .site-search__list:empty + .site-search__message {
+    border-top: 0;
+  }
+
+  .site-search__message-text {
+    margin: 0;
+  }
+
+  .site-search__message-text:empty {
+    display: none;
+  }
+
+  .site-search__retry[hidden] {
+    display: none;
+  }
+</style>

@@ -1,0 +1,36 @@
+{
+ "gate_id": "gate-terminal-1",
+ "gate_kind": "terminal_disposition",
+ "gate_round": 1,
+ "items": [
+  {
+   "campaign_root_work_id": "campaign-1",
+   "integrity": {
+    "verdict": "accurate"
+   },
+   "rung_check": {
+    "selected_rung": "R5_SKIP",
+    "verdict": "accurate"
+   },
+   "stable_id": "m_example",
+   "terminal_disposition": {
+    "evidence_ids": [
+     "evidence-1"
+    ],
+    "findings": [
+     "every declared excerpt verifies but none supports the predicate"
+    ],
+    "kind": "BLOCKED",
+    "predicate": "blocked-prerequisite",
+    "source_ids": [
+     "source-1",
+     "source-2"
+    ],
+    "verdict": null
+   },
+   "verdict": "inaccurate",
+   "work_id": "work-1"
+  }
+ ],
+ "ledger_seq": 1
+}

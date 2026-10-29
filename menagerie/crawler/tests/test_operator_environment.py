@@ -1,0 +1,811 @@
+"""Targeted tests for the exact-lock environment operator."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+from urllib.parse import unquote, urlsplit
+
+import pytest
+import yaml
+
+from menagerie.crawler.driver_admission import CommandEnvironmentBackend
+from menagerie.crawler.cli import EXIT_ERROR, main as crawler_main
+from menagerie.crawler.env_lifecycle import (
+    installed_package_inventory_bytes,
+    parse_exact_lock,
+    parse_resolved_export,
+)
+from menagerie.crawler.identity import hash_bytes
+from menagerie.crawler.operator_environment import (
+    CommandObservation,
+    EnvironmentOperator,
+    PermanentEnvironmentOperatorError,
+    TransientEnvironmentOperatorError,
+)
+
+
+class FakeToolRunner:
+    """Inject deterministic conda-lock, conda-create, and probe observations."""
+
+    def __init__(
+        self,
+        package_rows: Sequence[Mapping[str, Any]],
+        *,
+        solve_observations: Sequence[CommandObservation] = (),
+    ) -> None:
+        """Store solved rows and optional faults returned before solve success."""
+
+        self.package_rows = tuple(package_rows)
+        self.solve_observations = list(solve_observations)
+        self.solve_calls = 0
+        self.create_calls = 0
+        self.probe_calls: list[tuple[str, ...]] = []
+        self.commands: list[tuple[str, ...]] = []
+        self.environments: list[Mapping[str, str]] = []
+
+    def __call__(
+        self,
+        command: Sequence[str],
+        environment: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> CommandObservation:
+        """Return the configured observation and materialize requested fake outputs."""
+
+        del timeout_seconds
+        argv = tuple(command)
+        self.commands.append(argv)
+        self.environments.append(dict(environment))
+        if "lock" in argv:
+            self.solve_calls += 1
+            if self.solve_observations:
+                observation = self.solve_observations.pop(0)
+                if observation.returncode != 0:
+                    return observation
+            lock_path = Path(argv[argv.index("--lockfile") + 1])
+            lock_path.write_text(
+                yaml.safe_dump({"package": list(self.package_rows)}),
+                encoding="utf-8",
+            )
+            return CommandObservation(0, "solved", "")
+        if "create" in argv:
+            self.create_calls += 1
+            prefix = Path(argv[argv.index("--prefix") + 1])
+            metadata_root = prefix / "conda-meta"
+            metadata_root.mkdir(parents=True)
+            for index, row in enumerate(self.package_rows):
+                filename = unquote(Path(urlsplit(str(row["url"])).path).name)
+                stem = (
+                    filename[: -len(".tar.bz2")]
+                    if filename.endswith(".tar.bz2")
+                    else filename[: -len(".conda")]
+                )
+                name = str(row["name"])
+                version = str(row["version"])
+                build = stem.removeprefix(f"{name}-{version}-")
+                digest = str(row["hash"]["sha256"])
+                (metadata_root / f"{index}.json").write_text(
+                    json.dumps(
+                        {
+                            "name": name,
+                            "version": version,
+                            "build": build,
+                            "url": row["url"],
+                            "sha256": digest,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            return CommandObservation(0, "created", "")
+        self.probe_calls.append(argv)
+        if "missing.module" in argv:
+            return CommandObservation(1, "", "ModuleNotFoundError: missing.module")
+        if "noisy.module" in argv:
+            return CommandObservation(
+                0,
+                "",
+                "OMP: Warning #179: Function Can't set size of /tmp file failed:",
+            )
+        return CommandObservation(0, "", "")
+
+
+def _write_environment(path: Path, *, pip: bool = False) -> Path:
+    """Write one minimal conda environment specification.
+
+    The declared dependency matches the fake solver's solved row so that the
+    solve-cache currency check sees a satisfied declaration, exactly as a real
+    solve satisfies every requested package by construction.
+    """
+
+    dependencies: list[Any] = ["demo-package=1.2.3"]
+    if pip:
+        dependencies.append({"pip": ["example==1"]})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "name": "test-environment",
+                "channels": ["conda-forge", "nodefaults"],
+                "dependencies": dependencies,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path.resolve()
+
+
+def _package_row(artifact: Path, content: bytes) -> dict[str, Any]:
+    """Return one conda-lock row bound to an exact local artifact."""
+
+    artifact.write_bytes(content)
+    return {
+        "name": "demo-package",
+        "version": "1.2.3",
+        "manager": "conda",
+        "platform": "osx-arm64",
+        "url": artifact.resolve().as_uri(),
+        "hash": {"sha256": hash_bytes(content).removeprefix("sha256:")},
+    }
+
+
+def _mamba_stub(tmp_path: Path) -> Path:
+    """Return a real executable file standing in for the installed mamba.
+
+    ``create`` requires its creation tool to exist before it touches any state, so
+    the fake-runner tests need a genuine executable rather than a bare path string.
+    """
+
+    stub = tmp_path / "tools" / "mamba"
+    stub.parent.mkdir(parents=True, exist_ok=True)
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+    return stub.resolve()
+
+
+def _operator(
+    tmp_path: Path,
+    runner: FakeToolRunner,
+    *,
+    sleeper: Any = lambda _seconds: None,
+    mamba_command: Sequence[str] | None = None,
+) -> EnvironmentOperator:
+    """Build one operator with fake argv-only tool boundaries."""
+
+    return EnvironmentOperator(
+        state_root=(tmp_path / "operator-state").resolve(),
+        conda_lock_command=("/fake/conda-lock",),
+        conda_command=("/fake/conda",),
+        mamba_command=mamba_command or (str(_mamba_stub(tmp_path)),),
+        runner=runner,
+        sleeper=sleeper,
+    )
+
+
+def test_solve_synthesizes_sha256_lock_export_receipts_and_hits_cache(
+    tmp_path: Path,
+) -> None:
+    """A second intent/target solve returns unchanged reverified cache artifacts."""
+
+    content = b"exact conda package bytes"
+    artifact = tmp_path / "demo-package-1.2.3-py311h123_0.conda"
+    runner = FakeToolRunner((_package_row(artifact, content),))
+    operator = _operator(tmp_path, runner)
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml")
+
+    first = operator.solve(environment, "osx-arm64")
+    second = operator.solve(environment, "osx-arm64")
+
+    assert runner.solve_calls == 1
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is True
+    assert second["artifact_bytes"] == 0
+    assert first["lock_path"] == second["lock_path"]
+    assert first["resolved_export_path"] == second["resolved_export_path"]
+    lock_bytes = Path(first["lock_path"]).read_bytes()
+    receipts = parse_exact_lock(lock_bytes)
+    assert len(receipts) == 1
+    assert len(receipts[0].sha256.removeprefix("sha256:")) == 64
+    assert b"@EXPLICIT" in lock_bytes
+    assert b"#sha256=" not in lock_bytes
+    export_bytes = Path(first["resolved_export_path"]).read_bytes()
+    assert parse_resolved_export(export_bytes) == export_bytes
+    package = json.loads(export_bytes)["packages"][0]
+    assert package["build"] == "py311h123_0"
+    assert first["artifacts"] == second["artifacts"]
+    receipt_path = Path(first["artifacts"][0]["path"])
+    assert receipt_path.read_bytes() == content
+    assert receipt_path.name == receipts[0].sha256.removeprefix("sha256:")
+    assert all("render" not in command for command in runner.commands)
+
+
+@pytest.mark.smoke
+def test_cold_cas_has_a_non_rotation_hydration_path(tmp_path: Path) -> None:
+    """Committed exact locks hydrate a cold CAS without solving or changing identity."""
+
+    content = b"committed exact artifact bytes"
+    artifact = tmp_path / "demo-package-1.2.3-py311h123_0.conda"
+    row = _package_row(artifact, content)
+    digest = str(row["hash"]["sha256"])
+    lock = tmp_path / "committed" / "osx-arm64.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(f"@EXPLICIT\n{artifact.resolve().as_uri()}#{digest}\n", encoding="utf-8")
+    before = lock.read_bytes()
+    runner = FakeToolRunner((row,))
+    operator = _operator(tmp_path, runner)
+
+    first = operator.materialize(lock.resolve())
+    second = operator.materialize(lock.resolve())
+
+    assert runner.solve_calls == 0
+    assert runner.commands == []
+    assert lock.read_bytes() == before
+    assert first["lock_sha256"] == hash_bytes(before)
+    assert first["artifacts_materialized"] == 1
+    assert first["downloaded_bytes"] == len(content)
+    assert second["artifacts_materialized"] == 1
+    assert second["downloaded_bytes"] == 0
+    cas_path = Path(first["artifacts"][0]["path"])
+    assert cas_path.read_bytes() == content
+    assert cas_path.name == digest
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("command", ("run", "resume"))
+def test_run_and_resume_refuse_without_current_readiness_receipt(
+    command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Production entry points have no unreceipted environment override."""
+
+    assert crawler_main([command]) == EXIT_ERROR
+    assert "environment-readiness-required" in capsys.readouterr().err
+
+
+def test_version_drift_keeps_solve_cache_until_operator_force_is_explicit(
+    tmp_path: Path,
+) -> None:
+    """Version-only specification drift remains generation-stable without force.
+
+    A version bound is a solver outcome, not part of the cache-currency
+    question, so editing one never supersedes the cached solve; only an
+    explicit operator force replaces it.
+    """
+
+    content = b"stable artifact"
+    artifact = tmp_path / "demo-package-1.2.3-build_0.conda"
+    runner = FakeToolRunner((_package_row(artifact, content),))
+    operator = _operator(tmp_path, runner)
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml")
+
+    first = operator.solve(environment, "osx-arm64")
+    environment.write_text(
+        environment.read_text(encoding="utf-8").replace("demo-package=1.2.3", "demo-package=1.2.4"),
+        encoding="utf-8",
+    )
+    cached = operator.solve(environment, "osx-arm64")
+    forced = operator.solve(environment, "osx-arm64", force_resolve=True)
+
+    assert runner.solve_calls == 2
+    assert cached["cache_hit"] is True
+    assert forced["cache_hit"] is False
+    assert Path(first["lock_path"]).read_bytes() == Path(forced["lock_path"]).read_bytes()
+
+
+def test_dependency_declared_after_solve_supersedes_cache(tmp_path: Path) -> None:
+    """A cached solve omitting a newly declared dependency re-solves without force.
+
+    Regression for the 2026-08-04 pilot rung: ``segmentation-models-pytorch``
+    was declared in the core intent after the operator's cached solve, the
+    cache kept winning on the intent/target key, and every model needing the
+    package failed its environment probes against a prefix the current
+    declaration never described.
+    """
+
+    content = b"exact conda package bytes"
+    artifact = tmp_path / "demo-package-1.2.3-py311h123_0.conda"
+    runner = FakeToolRunner((_package_row(artifact, content),))
+    operator = _operator(tmp_path, runner)
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml")
+
+    first = operator.solve(environment, "osx-arm64")
+    specification = json.loads(environment.read_text(encoding="utf-8"))
+    specification["dependencies"].append("segmentation-models-pytorch")
+    environment.write_text(json.dumps(specification), encoding="utf-8")
+    second = operator.solve(environment, "osx-arm64")
+
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is False
+    assert runner.solve_calls == 2
+
+
+def test_satisfied_declaration_under_renamed_package_keeps_cache(tmp_path: Path) -> None:
+    """A declared name provided under the inventory's spelling is not superseded.
+
+    The cached export spells the row ``demo-package``; declaring it as
+    ``demo_package>=1`` (canonical-name variance plus a version bound) still
+    counts as provided, so the cache holds.
+    """
+
+    content = b"exact conda package bytes"
+    artifact = tmp_path / "demo-package-1.2.3-py311h123_0.conda"
+    runner = FakeToolRunner((_package_row(artifact, content),))
+    operator = _operator(tmp_path, runner)
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml")
+
+    first = operator.solve(environment, "osx-arm64")
+    specification = json.loads(environment.read_text(encoding="utf-8"))
+    specification["dependencies"].append("demo_package>=1")
+    environment.write_text(json.dumps(specification), encoding="utf-8")
+    second = operator.solve(environment, "osx-arm64")
+
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is True
+    assert runner.solve_calls == 1
+
+
+def test_driver_gate_a_accepts_operator_lock_and_artifact_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production adapter re-hashes and accepts the wrapper's exact solve payload."""
+
+    content = b"driver-admitted artifact"
+    artifact = tmp_path / "demo-package-1.2.3-build_0.conda"
+    runner = FakeToolRunner((_package_row(artifact, content),))
+    operator = _operator(tmp_path, runner)
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml")
+    payload = operator.solve(environment, "osx-arm64")
+    backend = CommandEnvironmentBackend(("unused",))
+
+    def return_payload(action: str, *arguments: str) -> dict[str, Any]:
+        """Return the already-produced operator payload to the production verifier."""
+
+        assert action == "solve"
+        assert arguments == (str(environment), "osx-arm64")
+        return payload
+
+    monkeypatch.setattr(backend, "_json_action", return_payload)
+    solved = backend.solve(environment, "osx-arm64")
+
+    assert solved.lock_bytes == Path(payload["lock_path"]).read_bytes()
+    assert solved.resolved_export_bytes == Path(payload["resolved_export_path"]).read_bytes()
+    assert tuple(solved.artifact_receipts) == parse_exact_lock(solved.lock_bytes)
+
+
+def test_transient_solve_fault_retries_without_becoming_permanent(
+    tmp_path: Path,
+) -> None:
+    """An injected transient subprocess failure is retried and then succeeds."""
+
+    content = b"eventual artifact"
+    artifact = tmp_path / "demo-package-1.2.3-build_0.conda"
+    runner = FakeToolRunner(
+        (_package_row(artifact, content),),
+        solve_observations=(
+            CommandObservation(1, "", "HTTP 503: service temporarily unavailable"),
+        ),
+    )
+    backoffs: list[float] = []
+    operator = _operator(tmp_path, runner, sleeper=backoffs.append)
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml")
+
+    result = operator.solve(environment, "osx-arm64")
+
+    assert result["cache_hit"] is False
+    assert runner.solve_calls == 2
+    assert backoffs == [1.0]
+
+
+def test_permanent_and_exhausted_transient_faults_remain_distinct(
+    tmp_path: Path,
+) -> None:
+    """Permanent solve rejection is not retried while exhausted transport is retryable."""
+
+    content = b"unused artifact"
+    artifact = tmp_path / "demo-package-1.2.3-build_0.conda"
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml")
+    permanent_runner = FakeToolRunner(
+        (_package_row(artifact, content),),
+        solve_observations=(CommandObservation(1, "", "package specifications are incompatible"),),
+    )
+    with pytest.raises(PermanentEnvironmentOperatorError, match="failed permanently"):
+        _operator(tmp_path, permanent_runner).solve(environment, "osx-arm64")
+    assert permanent_runner.solve_calls == 1
+
+    transient_runner = FakeToolRunner(
+        (_package_row(artifact, content),),
+        solve_observations=tuple(CommandObservation(75, "", "temporary failure") for _ in range(3)),
+    )
+    backoffs: list[float] = []
+    with pytest.raises(TransientEnvironmentOperatorError, match="3 attempts"):
+        _operator(tmp_path, transient_runner, sleeper=backoffs.append).solve(
+            environment, "osx-arm64"
+        )
+    assert transient_runner.solve_calls == 3
+    assert backoffs == [1.0, 2.0]
+
+
+def test_solve_refuses_pip_before_invoking_conda_lock(tmp_path: Path) -> None:
+    """A pip section cannot silently bypass the conda-meta inventory contract."""
+
+    runner = FakeToolRunner(())
+    operator = _operator(tmp_path, runner)
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml", pip=True)
+
+    with pytest.raises(PermanentEnvironmentOperatorError, match="pip sections"):
+        operator.solve(environment, "osx-arm64")
+    assert runner.solve_calls == 0
+
+
+def test_create_stages_verified_cas_offline_and_remove_retains_cas(
+    tmp_path: Path,
+) -> None:
+    """Create uses a generation-local cache; exact removal leaves shared CAS bytes."""
+
+    content = b"offline package"
+    artifact = tmp_path / "demo-package-1.2.3-build_0.tar.bz2"
+    runner = FakeToolRunner((_package_row(artifact, content),))
+    operator = _operator(tmp_path, runner)
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml")
+    solved = operator.solve(environment, "osx-arm64")
+    prefix = (tmp_path / "runtime" / "prefix").resolve()
+
+    created = operator.create(Path(solved["lock_path"]), prefix)
+
+    package_cache = Path(created["package_cache_path"])
+    staged = package_cache / artifact.name
+    assert staged.read_bytes() == content
+    assert runner.create_calls == 1
+    create_environment = runner.environments[-1]
+    assert create_environment["CONDA_OFFLINE"] == "true"
+    assert create_environment["CONDA_PKGS_DIRS"] == str(package_cache)
+    assert "HTTP_PROXY" not in create_environment
+    assert "--offline" in runner.commands[-1]
+    assert installed_package_inventory_bytes(prefix) == parse_resolved_export(
+        Path(solved["resolved_export_path"]).read_bytes()
+    )
+    cas_path = Path(solved["artifacts"][0]["path"])
+    removed = operator.remove(prefix)
+    assert removed["cas_retained"] is True
+    assert not prefix.exists()
+    assert not package_cache.exists()
+    assert cas_path.read_bytes() == content
+    with pytest.raises(PermanentEnvironmentOperatorError, match="not an exact registered"):
+        operator.remove(prefix)
+
+
+@pytest.mark.smoke
+def test_offline_create_runs_mamba_and_never_conda(tmp_path: Path) -> None:
+    """The creation command is the configured mamba, not the conda tool.
+
+    ``conda create --offline`` against conda 26.3.2 nondeterministically
+    re-downloads packages that are already staged and verified in the
+    generation-local cache, leaving ``.partial`` files and failing with an
+    OfflineError naming a different package each run. Only mamba installs the
+    staged bytes, so the creation argv must never reach conda.
+    """
+
+    content = b"offline package"
+    artifact = tmp_path / "demo-package-1.2.3-build_0.tar.bz2"
+    runner = FakeToolRunner((_package_row(artifact, content),))
+    mamba = _mamba_stub(tmp_path)
+    operator = _operator(tmp_path, runner, mamba_command=(str(mamba),))
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml")
+    solved = operator.solve(environment, "osx-arm64")
+    prefix = (tmp_path / "runtime" / "prefix").resolve()
+
+    operator.create(Path(solved["lock_path"]), prefix)
+
+    create_commands = [command for command in runner.commands if "create" in command]
+    assert len(create_commands) == 1
+    assert create_commands[0][0] == str(mamba)
+    assert create_commands[0][1] == "create"
+    assert "--offline" in create_commands[0]
+    assert "/fake/conda" not in create_commands[0]
+    # The creation child still resolves helpers from the shared tool directory.
+    assert str(mamba.parent) in runner.environments[-1]["PATH"].split(":")
+
+
+@pytest.mark.smoke
+def test_missing_mamba_refuses_create_loudly_instead_of_falling_back_to_conda(
+    tmp_path: Path,
+) -> None:
+    """An absent mamba is a typed refusal, not a silent conda offline create.
+
+    A fallback would be worse than a failure: conda's broken offline create exits
+    zero often enough to publish a prefix whose installed inventory disagrees with
+    the verified lock. The refusal must also come before any state is written, so
+    no registration, package cache, or partial prefix survives it.
+    """
+
+    content = b"offline package"
+    artifact = tmp_path / "demo-package-1.2.3-build_0.tar.bz2"
+    runner = FakeToolRunner((_package_row(artifact, content),))
+    operator = _operator(tmp_path, runner, mamba_command=(str(tmp_path / "absent" / "mamba"),))
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml")
+    solved = operator.solve(environment, "osx-arm64")
+    prefix = (tmp_path / "runtime" / "prefix").resolve()
+
+    with pytest.raises(PermanentEnvironmentOperatorError, match="requires the mamba"):
+        operator.create(Path(solved["lock_path"]), prefix)
+
+    assert runner.create_calls == 0
+    assert not any("create" in command for command in runner.commands)
+    assert not prefix.exists()
+    state_root = (tmp_path / "operator-state").resolve()
+    assert not (state_root / "package-caches").exists()
+    assert not list((state_root / "prefix-registrations").glob("*.json"))
+
+
+@pytest.mark.smoke
+def test_a_nonexecutable_mamba_is_refused_before_any_creation_state(
+    tmp_path: Path,
+) -> None:
+    """A present-but-unrunnable creation tool is refused with the same typed error.
+
+    The one unavoidable environment guard in this module: root bypasses the
+    execute bit, so the mode-based half of the check cannot be observed as root.
+    """
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses the execute permission bit")
+    content = b"offline package"
+    artifact = tmp_path / "demo-package-1.2.3-build_0.tar.bz2"
+    runner = FakeToolRunner((_package_row(artifact, content),))
+    unrunnable = tmp_path / "tools" / "not-executable-mamba"
+    unrunnable.parent.mkdir(parents=True, exist_ok=True)
+    unrunnable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    unrunnable.chmod(0o644)
+    operator = _operator(tmp_path, runner, mamba_command=(str(unrunnable),))
+    environment = _write_environment(tmp_path / "envs" / "core" / "environment.yml")
+    solved = operator.solve(environment, "osx-arm64")
+
+    with pytest.raises(PermanentEnvironmentOperatorError, match="requires the mamba"):
+        operator.create(Path(solved["lock_path"]), (tmp_path / "runtime" / "prefix").resolve())
+
+    assert runner.create_calls == 0
+
+
+def test_probe_returns_exact_declared_order_and_bounded_failure_detail(
+    tmp_path: Path,
+) -> None:
+    """Import, export, and source-build receipts preserve declaration order exactly."""
+
+    runner = FakeToolRunner(())
+    operator = _operator(tmp_path, runner)
+    prefix = (tmp_path / "runtime" / "prefix").resolve()
+    interpreter = prefix / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
+    probes = {
+        "imports": ["present.module", "missing.module"],
+        "export_checks": [{"module": "present.module", "attribute": "Model"}],
+        "source_build": [
+            {
+                "name": "compiled-extension",
+                "packages": ["present"],
+                "command": ["python", "-c", "import present._C"],
+                "max_attempts": 2,
+            }
+        ],
+    }
+
+    result = operator.probe(prefix, json.dumps(probes))
+
+    assert [row["name"] for row in result["results"]] == [
+        "import:present.module",
+        "import:missing.module",
+        "export:present.module:Model",
+        "source-build:compiled-extension",
+    ]
+    assert [row["passed"] for row in result["results"]] == [True, False, True, True]
+    assert result["results"][1]["detail"] == "ModuleNotFoundError: missing.module"
+    assert all(len(row["detail"]) <= 1_000 for row in result["results"])
+    assert runner.probe_calls[-1][0] == str(interpreter)
+    assert "PYTHONPATH" not in runner.environments[-1]
+    assert runner.environments[-1]["HF_HUB_OFFLINE"] == "1"
+    assert runner.environments[-1]["PIP_NO_INDEX"] == "1"
+
+
+@pytest.mark.smoke
+def test_a_passed_probe_with_stderr_noise_records_detail_ok(tmp_path: Path) -> None:
+    """Host stderr noise on a PASSED probe never enters the durable receipt.
+
+    The probe receipt is a committed setup-artifact identity member: the lane
+    re-attests it after every launch's probe pass, so any transient host noise
+    a passing child writes to stderr (an OpenMP tmp warning, a library
+    deprecation banner) used to re-attest the committed family with junk and
+    move the setup-artifact identity on a perfectly healthy launch (X4
+    rehearsal, 2026-08-12: every core probe receipt detail became "OMP:
+    Warning #179" under a confined session). A passed canary's streams are
+    diagnostic noise by definition -- the receipt records exactly "ok".
+    Failures keep their bounded combined detail: that text is the diagnosis.
+    """
+
+    runner = FakeToolRunner(())
+    operator = _operator(tmp_path, runner)
+    prefix = (tmp_path / "runtime" / "prefix").resolve()
+    interpreter = prefix / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
+    probes = {
+        "imports": ["noisy.module", "missing.module"],
+        "export_checks": [{"module": "noisy.module", "attribute": "Model"}],
+        "source_build": [],
+    }
+
+    result = operator.probe(prefix, json.dumps(probes))
+
+    by_name = {row["name"]: row for row in result["results"]}
+    assert by_name["import:noisy.module"]["passed"] is True
+    assert by_name["import:noisy.module"]["detail"] == "ok"
+    assert by_name["export:noisy.module:Model"]["passed"] is True
+    assert by_name["export:noisy.module:Model"]["detail"] == "ok"
+    assert by_name["import:missing.module"]["passed"] is False
+    assert by_name["import:missing.module"]["detail"] == "ModuleNotFoundError: missing.module"
+
+
+def test_owned_paths_enumerates_generation_owned_roots(tmp_path: Path) -> None:
+    """The owned-path receipt names the prefix, registration, and package cache."""
+
+    runner = FakeToolRunner(())
+    operator = _operator(tmp_path, runner)
+    prefix = (tmp_path / "envs" / "core-abc123def456").resolve()
+
+    unregistered = operator.owned_paths(prefix)
+    assert unregistered["prefix"] == str(prefix)
+    unregistered_paths = [Path(value) for value in unregistered["paths"]]
+    assert unregistered_paths[0] == prefix
+    registration_path = unregistered_paths[1]
+    assert registration_path.parent.name == "prefix-registrations"
+    assert len(unregistered_paths) == 2
+
+    package_cache = tmp_path / "operator-state" / "package-caches" / "core-abc123def456-x"
+    registration_path.parent.mkdir(parents=True, exist_ok=True)
+    registration_path.write_text(
+        json.dumps({"package_cache": str(package_cache)}), encoding="utf-8"
+    )
+    registered = operator.owned_paths(prefix)
+    registered_paths = [Path(value) for value in registered["paths"]]
+    assert registered_paths == [prefix, registration_path, package_cache]
+
+
+def test_owned_paths_cli_action_round_trips(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The argv wrapper exposes the same receipt the lifecycle consumes."""
+
+    from menagerie.crawler.operator_environment import EXIT_SUCCESS, main
+
+    prefix = (tmp_path / "envs" / "core-abc123def456").resolve()
+    state_root = (tmp_path / "operator-state").resolve()
+    exit_code = main(["--state-root", str(state_root), "owned-paths", str(prefix)])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == EXIT_SUCCESS
+    assert payload["prefix"] == str(prefix)
+    assert [Path(value) for value in payload["paths"]][0] == prefix
+    assert len(payload["paths"]) == 2
+
+
+@pytest.mark.smoke
+def test_operator_state_root_is_anchor_derived_not_cwd_derived(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every operator action resolves one root from its repository-owned input."""
+
+    repository = tmp_path / "repository"
+    (repository / "menagerie" / "crawler" / "envs" / "demo" / "locks").mkdir(parents=True)
+    (repository / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    anchor = repository / "menagerie" / "crawler" / "envs" / "demo" / "locks" / "osx-arm64.lock"
+    anchor.write_text("fixture")
+    foreign_cwd = tmp_path / "foreign"
+    foreign_cwd.mkdir()
+    monkeypatch.chdir(foreign_cwd)
+    monkeypatch.delenv("MENAGERIE_ENVIRONMENT_STATE_ROOT", raising=False)
+
+    receipt = EnvironmentOperator().state_root(anchor.resolve())
+
+    assert Path(receipt["state_root"]) == (repository / ".crawl-local" / "environment-operator")
+
+
+def test_command_backend_owned_paths_parses_the_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The driver-side backend consumes the receipt and always includes the prefix."""
+
+    from menagerie.crawler.driver_admission import DriverIntegrationError
+
+    backend = CommandEnvironmentBackend(("unused",))
+    prefix = (tmp_path / "envs" / "core-abc123def456").resolve()
+    cache = tmp_path / "operator-state" / "package-caches" / "core-x"
+
+    monkeypatch.setattr(
+        backend,
+        "_json_action",
+        lambda action, *arguments: {"paths": [str(prefix), str(cache)]},
+    )
+    assert backend.owned_paths(prefix) == (prefix, cache)
+
+    monkeypatch.setattr(
+        backend,
+        "_json_action",
+        lambda action, *arguments: {"paths": [str(cache)]},
+    )
+    assert backend.owned_paths(prefix) == (prefix, cache)
+
+    monkeypatch.setattr(backend, "_json_action", lambda action, *arguments: {"paths": "not-a-list"})
+    with pytest.raises(DriverIntegrationError, match="malformed"):
+        backend.owned_paths(prefix)
+
+
+def test_command_backend_owned_paths_fails_closed_except_identified_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a positively identified legacy wrapper may degrade to prefix-only.
+
+    Sol round-2 review finding 3: catching every enumeration failure and
+    returning prefix-only re-opened the finding-4 counterexample -- a CURRENT
+    wrapper crash took the fail-open legacy path and dedicated residue read as
+    ambient again. A generic failure cannot prove no auxiliary roots exist, so
+    everything except the argparse unknown-action signature fails CLOSED.
+    """
+
+    from menagerie.crawler.driver_admission import DriverIntegrationError
+
+    backend = CommandEnvironmentBackend(("unused",))
+    prefix = (tmp_path / "envs" / "core-abc123def456").resolve()
+
+    def legacy(action: str, *arguments: str) -> dict:
+        raise DriverIntegrationError(
+            "environment owned-paths failed: usage: operator_environment.py ... "
+            "argument action: invalid choice: 'owned-paths' "
+            "(choose from 'solve', 'create', 'probe', 'remove')"
+        )
+
+    monkeypatch.setattr(backend, "_json_action", legacy)
+    assert backend.owned_paths(prefix) == (prefix,)
+
+    def current_wrapper_crash(action: str, *arguments: str) -> dict:
+        raise DriverIntegrationError(
+            "environment owned-paths failed: Traceback (most recent call last): boom"
+        )
+
+    monkeypatch.setattr(backend, "_json_action", current_wrapper_crash)
+    with pytest.raises(DriverIntegrationError, match="refuses to proceed"):
+        backend.owned_paths(prefix)
+
+    def malformed_json(action: str, *arguments: str) -> dict:
+        raise DriverIntegrationError(
+            "environment owned-paths returned invalid JSON: Expecting value"
+        )
+
+    monkeypatch.setattr(backend, "_json_action", malformed_json)
+    with pytest.raises(DriverIntegrationError, match="refuses to proceed"):
+        backend.owned_paths(prefix)
+
+
+def test_legacy_owned_paths_signature_matches_real_argparse_output() -> None:
+    """The positive legacy identification matches what argparse actually emits.
+
+    An old wrapper is exactly the current parser minus the ``owned-paths``
+    subcommand; its refusal is argparse's unknown-choice error on stderr,
+    which the checked-action error carries verbatim.
+    """
+
+    import argparse
+    import contextlib
+    import io
+
+    from menagerie.crawler.driver_admission import CommandEnvironmentBackend
+
+    legacy_parser = argparse.ArgumentParser(prog="operator_environment.py")
+    subparsers = legacy_parser.add_subparsers(dest="action", required=True)
+    for name in ("solve", "create", "probe", "remove"):
+        subparsers.add_parser(name)
+    stderr = io.StringIO()
+    with pytest.raises(SystemExit) as exit_info:
+        with contextlib.redirect_stderr(stderr):
+            legacy_parser.parse_args(["owned-paths", "/x"])
+    assert exit_info.value.code == 2
+    assert CommandEnvironmentBackend._LEGACY_OWNED_PATHS_SIGNATURE in stderr.getvalue()

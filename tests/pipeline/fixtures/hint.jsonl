@@ -1,0 +1,2 @@
+{"schema":"hint/1","id":"m1873","candidate":"https://github.com/example/nin","kind":"code","verdict":"yes","role":"model-judgment","at":"2026-10-09T13:10:00Z","via":"github-search","evidence":["r1","r2"]}
+{"schema":"hint/1","id":"m1835","candidate":"arXiv:1312.4400","kind":"paper","verdict":"unsure","role":"model-judgment","at":"2026-10-09T13:11:00Z","evidence":[]}

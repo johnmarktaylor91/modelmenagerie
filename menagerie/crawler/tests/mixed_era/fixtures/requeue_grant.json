@@ -1,0 +1,10 @@
+{
+ "attempts": 1,
+ "grant_id": "sha256:eefabac4d255ebba4121948d6d890509d4c1078b13b1a9863061dffa250ba6e8",
+ "granted_by": "operator",
+ "new_work_generation": 1,
+ "reason": "operator approved infra re-drive",
+ "schema_version": "menagerie.crawler.requeue-grant.v1",
+ "stable_id": "m_infra",
+ "stage": "runner"
+}

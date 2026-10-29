@@ -1,0 +1,192 @@
+{
+  "schema_version": "menagerie.crawler.producer-dispatch-inventory.v1",
+  "comment": "Derived DISCLOSURE of menagerie.crawler.backend.PRODUCER_DISPATCH_INVENTORY: every producer-written string that reaches a machine dispatch or an identity preimage, bound to the closed vocabulary that refuses free text. Catalog C-22. The Python tuple is the authority; this file exists so the inventory -- especially the two code-only closures -- is reviewable as data and cannot grow silently. Regenerate with python -m menagerie.crawler.tools.producer_dispatch_inventory write.",
+  "sinks": [
+    "_convert_array",
+    "_seed_frameworks",
+    "adapt_native_model",
+    "canonical_dtype",
+    "compute_execution_identity",
+    "derive_execution_identity",
+    "framework_capability",
+    "normalize_framework",
+    "normalize_origin_framework",
+    "parse_device_policy",
+    "route_model"
+  ],
+  "code_only_closure": [
+    "device_policy",
+    "dtype"
+  ],
+  "fields": [
+    {
+      "field": "run_framework",
+      "schema_paths": [
+        {
+          "schema_version": "menagerie.crawler.model.v3",
+          "path": "$.implementation.run_framework"
+        },
+        {
+          "schema_version": "menagerie.crawler.author-proposal.v3",
+          "path": "$.proposed_facts.implementation.run_framework"
+        }
+      ],
+      "schema_closure": "closed",
+      "closure_note": "",
+      "sinks": [
+        "derive_execution_identity",
+        "route_model",
+        "adapt_native_model",
+        "_convert_array",
+        "_seed_frameworks"
+      ],
+      "validator": "menagerie.crawler.backend.normalize_framework",
+      "refusal": "menagerie.crawler.backend.FrameworkVocabularyError",
+      "canonical_sample": "pytorch",
+      "free_text_sample": "PyTorch/2.x",
+      "finding": "AREA_BACKENDS_opus B1 / catalog C-22"
+    },
+    {
+      "field": "original_framework",
+      "schema_paths": [
+        {
+          "schema_version": "menagerie.crawler.model.v3",
+          "path": "$.implementation.original_framework"
+        },
+        {
+          "schema_version": "menagerie.crawler.author-proposal.v3",
+          "path": "$.proposed_facts.implementation.original_framework"
+        }
+      ],
+      "schema_closure": "closed",
+      "closure_note": "",
+      "sinks": [
+        "adapt_native_model",
+        "normalize_origin_framework"
+      ],
+      "validator": "menagerie.crawler.backend.origin_framework_token",
+      "refusal": "menagerie.crawler.backend.FrameworkVocabularyError",
+      "canonical_sample": "tensorflow",
+      "free_text_sample": "originally TF1, ported",
+      "finding": "AREA_BACKENDS_opus B6 (native-lane disclosure)"
+    },
+    {
+      "field": "recipe_type",
+      "schema_paths": [
+        {
+          "schema_version": "menagerie.crawler.model.v3",
+          "path": "$.implementation.recipe_type"
+        },
+        {
+          "schema_version": "menagerie.crawler.author-proposal.v3",
+          "path": "$.proposed_facts.implementation.recipe_type"
+        }
+      ],
+      "schema_closure": "closed",
+      "closure_note": "",
+      "sinks": [
+        "derive_execution_identity"
+      ],
+      "validator": "menagerie.crawler.constants.normalize_recipe_type",
+      "refusal": "menagerie.crawler.constants.ProducerVocabularyError",
+      "canonical_sample": "declarative-library",
+      "free_text_sample": "declarative library recipe",
+      "finding": "found by this census (C-22 sweep)"
+    },
+    {
+      "field": "recipe_revision",
+      "schema_paths": [
+        {
+          "schema_version": "menagerie.crawler.model.v3",
+          "path": "$.implementation.recipe_revision"
+        },
+        {
+          "schema_version": "menagerie.crawler.author-proposal.v3",
+          "path": "$.proposed_facts.implementation.recipe_revision"
+        }
+      ],
+      "schema_closure": "closed",
+      "closure_note": "",
+      "sinks": [
+        "derive_execution_identity"
+      ],
+      "validator": "menagerie.crawler.constants.normalize_recipe_revision",
+      "refusal": "menagerie.crawler.constants.ProducerVocabularyError",
+      "canonical_sample": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "free_text_sample": "revision 2",
+      "finding": "found by this census (C-22 sweep)"
+    },
+    {
+      "field": "device_policy",
+      "schema_paths": [
+        {
+          "schema_version": "menagerie.crawler.model.v3",
+          "path": "$.implementation.device_policy"
+        },
+        {
+          "schema_version": "menagerie.crawler.model.v3",
+          "path": "$.input_contract.args[].device_policy"
+        },
+        {
+          "schema_version": "menagerie.crawler.model.v3",
+          "path": "$.input_contract.kwargs[].device_policy"
+        },
+        {
+          "schema_version": "menagerie.crawler.author-proposal.v3",
+          "path": "$.proposed_facts.implementation.device_policy"
+        },
+        {
+          "schema_version": "menagerie.crawler.author-proposal.v3",
+          "path": "$.proposed_facts.input_contract.args[].device_policy"
+        },
+        {
+          "schema_version": "menagerie.crawler.author-proposal.v3",
+          "path": "$.proposed_facts.input_contract.kwargs[].device_policy"
+        }
+      ],
+      "schema_closure": "code-only",
+      "closure_note": "Immutable canonical records and the golden refusal transcripts predate the runtime refusal and carry authored prose here ('moved to the device argument of make_dummy_call(seed, device)', 'cuda recommended: ...'). A schema enum would make that history unloadable without making the pipeline safer, so the closure is proposal.parse_device_policy at the acceptance gate and again at the driver's own consumption. Narrowing the schema belongs to the proposal-gate owner together with a records migration.",
+      "sinks": [
+        "derive_execution_identity",
+        "parse_device_policy"
+      ],
+      "validator": "menagerie.crawler.proposal.parse_device_policy",
+      "refusal": "menagerie.crawler.proposal.ProposalValidationError",
+      "canonical_sample": "cpu",
+      "free_text_sample": "constructed on cpu; caller moves the module with .to(device)",
+      "finding": "step-100 DEVICE-POLICY-PROSE, rank 3 (4 of the first 22 terminals)"
+    },
+    {
+      "field": "dtype",
+      "schema_paths": [
+        {
+          "schema_version": "menagerie.crawler.model.v3",
+          "path": "$.input_contract.args[].dtype"
+        },
+        {
+          "schema_version": "menagerie.crawler.model.v3",
+          "path": "$.input_contract.kwargs[].dtype"
+        },
+        {
+          "schema_version": "menagerie.crawler.author-proposal.v3",
+          "path": "$.proposed_facts.input_contract.args[].dtype"
+        },
+        {
+          "schema_version": "menagerie.crawler.author-proposal.v3",
+          "path": "$.proposed_facts.input_contract.kwargs[].dtype"
+        }
+      ],
+      "schema_closure": "code-only",
+      "closure_note": "The same field carries a NON-dispatch placeholder for kind='constructed' leaves, which materialize no tensor at all: live records spell those 'object' and 'not-applicable' (the m538 graph-object shape). An enum of real dtypes would refuse the honest placeholder, so the closure is payload_codec.canonical_dtype at the tensor-materialization dispatch, where a dtype actually steers behaviour.",
+      "sinks": [
+        "_convert_array",
+        "canonical_dtype"
+      ],
+      "validator": "menagerie.crawler.payload_codec.canonical_dtype",
+      "refusal": "menagerie.crawler.payload_codec.DtypeVocabularyError",
+      "canonical_sample": "float32",
+      "free_text_sample": "a standard float image tensor",
+      "finding": "AREA_BACKENDS_fable BK-1"
+    }
+  ]
+}

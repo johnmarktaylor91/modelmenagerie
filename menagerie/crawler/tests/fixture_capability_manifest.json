@@ -1,0 +1,132 @@
+{
+  "comment": "AB-14 fixture-fidelity capability census. contract_fields + compositions are DERIVED (regenerate via `python -m menagerie.crawler.tools.fixture_capability_census write` in the same change); plain_leg classifies every contract capability's behavior when mutation-deleted (poisoned) in a plain unit fake leg, enforced at runtime by test_fixture_capability_census.py. fires-loudly: the poison escapes as a raise. fires-classified: the capability is consulted and its failure is absorbed by production classification into a non-complete leg outcome. dormant: a plain leg never consults it; the named fired_by rehearsals are the ONLY evidence the capability works, so each must stay collectable. Never reclassify a row to make a run pass; root-cause the behavior change.",
+  "compositions": {
+    "acceptance-dry-run": {
+      "author": "author",
+      "boundary_hook": "<dataclass-default>",
+      "checker": "checker",
+      "clock": "dry_run_clock_now",
+      "environments": "environments",
+      "forward": "SupervisedForwardLane(timeout_seconds=30, cwd=repo_root)",
+      "monotonic": "<dataclass-default>",
+      "notifier": "RecordingNotifier(campaign_root / 'notifications.jsonl')",
+      "provider_reconciler": "_dry_run_provider_reconciliation",
+      "sleeper": "<dataclass-default>",
+      "usage_pause_scheduler": "<dataclass-default>",
+      "wakeup_deactivator": "wake_scheduler.deactivate",
+      "wakeup_installer": "wake_scheduler.install",
+      "wakeup_verifier": "wake_scheduler.verify"
+    },
+    "rehearsal-fixture": {
+      "author": "<unit-fake-driver:author or FakeAuthor()>",
+      "boundary_hook": "<unit-fake-driver:boundary>",
+      "checker": "<unit-fake-driver:checker or FakeChecker()>",
+      "clock": "<unit-fake-driver:lambda: NOW>",
+      "environments": "CommittedFakeEnvironments(repo_root / '.crawl-local' / 'fake-envs')",
+      "forward": "<unit-fake-driver:forward or FakeForward()>",
+      "monotonic": "<unit-fake-driver:<dataclass-default>>",
+      "notifier": "<unit-fake-driver:notifier or FakeNotifier()>",
+      "provider_reconciler": "<unit-fake-driver:provider_reconciler or (lambda _provider_idempotency_key: ProviderReconciliation(True, 0.0, 'sha256:fake-provider-accepted'))>",
+      "sleeper": "<unit-fake-driver:sleeper if sleeper is not None else lambda _seconds: None>",
+      "usage_pause_scheduler": "<unit-fake-driver:pause_scheduler>",
+      "wakeup_deactivator": "<unit-fake-driver:lambda _definition: None>",
+      "wakeup_installer": "<unit-fake-driver:lambda _definition: None>",
+      "wakeup_verifier": "<unit-fake-driver:lambda _definition: True>"
+    },
+    "unit-fake-driver": {
+      "author": "author or FakeAuthor()",
+      "boundary_hook": "boundary",
+      "checker": "checker or FakeChecker()",
+      "clock": "lambda: NOW",
+      "environments": "environments or FakeEnvironments(tmp_path / 'fake-envs')",
+      "forward": "forward or FakeForward()",
+      "monotonic": "<dataclass-default>",
+      "notifier": "notifier or FakeNotifier()",
+      "provider_reconciler": "provider_reconciler or (lambda _provider_idempotency_key: ProviderReconciliation(True, 0.0, 'sha256:fake-provider-accepted'))",
+      "sleeper": "sleeper if sleeper is not None else lambda _seconds: None",
+      "usage_pause_scheduler": "pause_scheduler",
+      "wakeup_deactivator": "lambda _definition: None",
+      "wakeup_installer": "lambda _definition: None",
+      "wakeup_verifier": "lambda _definition: True"
+    }
+  },
+  "contract_fields": [
+    "author",
+    "checker",
+    "forward",
+    "environments",
+    "notifier",
+    "clock",
+    "boundary_hook",
+    "usage_pause_scheduler",
+    "wakeup_installer",
+    "wakeup_verifier",
+    "wakeup_deactivator",
+    "sleeper",
+    "provider_reconciler",
+    "monotonic"
+  ],
+  "plain_leg": {
+    "author": {
+      "class": "fires-classified"
+    },
+    "boundary_hook": {
+      "class": "fires-classified"
+    },
+    "checker": {
+      "class": "fires-loudly"
+    },
+    "clock": {
+      "class": "fires-loudly"
+    },
+    "environments": {
+      "class": "fires-loudly"
+    },
+    "forward": {
+      "class": "fires-classified"
+    },
+    "monotonic": {
+      "class": "fires-classified"
+    },
+    "notifier": {
+      "class": "dormant",
+      "fired_by": [
+        "menagerie/crawler/tests/test_slice_f_driver.py::test_progress_milestones_fire_once_without_pausing"
+      ]
+    },
+    "provider_reconciler": {
+      "class": "fires-classified"
+    },
+    "sleeper": {
+      "class": "dormant",
+      "fired_by": [
+        "menagerie/crawler/tests/test_driver_abort_boundary.py::test_transient_author_death_recovers_through_backoff"
+      ]
+    },
+    "usage_pause_scheduler": {
+      "class": "dormant",
+      "fired_by": [
+        "menagerie/crawler/tests/test_slice_f_driver.py::test_quota_pause_awards_pending_runs_then_metadata_supersedes"
+      ]
+    },
+    "wakeup_deactivator": {
+      "class": "dormant",
+      "fired_by": [
+        "menagerie/crawler/tests/test_usage_pause_wake_dry_run_rehearsal.py::test_wake_before_reset_does_no_work_and_after_reset_completes_the_campaign"
+      ]
+    },
+    "wakeup_installer": {
+      "class": "dormant",
+      "fired_by": [
+        "menagerie/crawler/tests/test_usage_pause_wake_dry_run_rehearsal.py::test_injected_backoff_pauses_the_composed_dry_run_with_durable_wake_records"
+      ]
+    },
+    "wakeup_verifier": {
+      "class": "dormant",
+      "fired_by": [
+        "menagerie/crawler/tests/test_usage_pause_wake_dry_run_rehearsal.py::test_injected_backoff_pauses_the_composed_dry_run_with_durable_wake_records"
+      ]
+    }
+  },
+  "schema_version": "menagerie.crawler.fixture-capability-manifest.v1"
+}

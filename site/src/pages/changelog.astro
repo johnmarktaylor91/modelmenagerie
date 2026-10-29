@@ -1,0 +1,74 @@
+---
+import BaseLayout from "@/layouts/BaseLayout.astro";
+import { SITE_CHANGES } from "@/lib/changelog";
+import { formatDate } from "@/lib/dataset";
+---
+
+<BaseLayout title="Changes" description="What has changed on the Model Menagerie site and in its dataset, newest first.">
+  <article class="shell changes py-10">
+    <h1 class="text-3xl font-semibold sm:text-4xl">Changes</h1>
+    <p class="lead mt-4 text-secondary">What has changed on the site and in its dataset, newest first.</p>
+    <ol class="change-list" reversed>
+      {
+        SITE_CHANGES.map((change) => (
+          <li>
+            <h2>
+              <time datetime={change.date}>{formatDate(change.date)}</time>
+              <span class="change-title">{change.title}</span>
+            </h2>
+            <ul>
+              {change.items.map((item) => (
+                <li>{item}</li>
+              ))}
+            </ul>
+          </li>
+        ))
+      }
+    </ol>
+  </article>
+</BaseLayout>
+
+<style>
+  .changes {
+    max-width: 46rem;
+  }
+
+  .changes .lead {
+    font-size: 1.125rem;
+    line-height: 1.7;
+  }
+
+  .change-list {
+    margin: 2rem 0 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .change-list > li {
+    padding-block: 1.5rem;
+    border-top: 1px solid var(--border);
+  }
+
+  .change-list h2 {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 1rem;
+    align-items: baseline;
+    font-size: 1.25rem;
+    font-weight: 600;
+  }
+
+  .change-list time {
+    color: var(--secondary);
+    font-family: var(--font-body);
+    font-size: 0.95rem;
+    font-weight: 400;
+  }
+
+  .change-list ul {
+    margin-top: 0.6rem;
+    padding-left: 1.4rem;
+    list-style: disc;
+    line-height: 1.7;
+  }
+</style>

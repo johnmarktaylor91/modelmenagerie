@@ -1,0 +1,56 @@
+{
+  "schema_version": "menagerie.crawler.rehearsal-stage-inventory.v1",
+  "comment": "PM-22/B2-X-V41 closed inventory of post-reserve paid-session death stages. Every stage at which production can lose a PAID session after reserving must be FIRED by a named rehearsal test through the real classified transport path (reserve -> custody -> die -> classify -> settle -> retry). test_post_reserve_failability.py derives the required stage set from the production vocabulary (GateKind + the author attempt's two guard sessions), so adding a paid stage without a rehearsal fails CI. Never delete a row to make a run pass; root-cause what removed the rehearsal.",
+  "stages": [
+    {
+      "stage": "author:source-request-guard",
+      "lane": "author",
+      "dispatch_kind": "author_source",
+      "guard": "source-request",
+      "injection": "MENAGERIE_DRY_RUN_INJECT_SESSION_DEATH + MENAGERIE_DRY_RUN_INJECT_SESSION_DEATH_STAGE=source-request",
+      "fired_by": [
+        "menagerie/crawler/tests/test_post_reserve_failability.py::test_source_guard_session_death_fires_post_reserve"
+      ]
+    },
+    {
+      "stage": "author:author-guard",
+      "lane": "author",
+      "dispatch_kind": "author_source",
+      "guard": "author",
+      "injection": "MENAGERIE_DRY_RUN_INJECT_SESSION_DEATH",
+      "fired_by": [
+        "menagerie/crawler/tests/test_session_death_dry_run_rehearsal.py::test_session_death_injection_dies_on_the_classified_transport_path"
+      ]
+    },
+    {
+      "stage": "checker:metadata_batch",
+      "lane": "checker",
+      "dispatch_kind": "metadata_batch",
+      "guard": "checker",
+      "injection": "MENAGERIE_DRY_RUN_INJECT_CHECKER_SESSION_DEATH",
+      "fired_by": [
+        "menagerie/crawler/tests/test_post_reserve_failability.py::test_checker_session_death_fires_post_reserve[metadata_batch]"
+      ]
+    },
+    {
+      "stage": "checker:fidelity",
+      "lane": "checker",
+      "dispatch_kind": "fidelity",
+      "guard": "checker",
+      "injection": "MENAGERIE_DRY_RUN_INJECT_CHECKER_SESSION_DEATH",
+      "fired_by": [
+        "menagerie/crawler/tests/test_post_reserve_failability.py::test_checker_session_death_fires_post_reserve[fidelity]"
+      ]
+    },
+    {
+      "stage": "checker:terminal_disposition",
+      "lane": "checker",
+      "dispatch_kind": "terminal_disposition",
+      "guard": "checker",
+      "injection": "MENAGERIE_DRY_RUN_INJECT_CHECKER_SESSION_DEATH",
+      "fired_by": [
+        "menagerie/crawler/tests/test_post_reserve_failability.py::test_checker_session_death_fires_post_reserve[terminal_disposition]"
+      ]
+    }
+  ]
+}

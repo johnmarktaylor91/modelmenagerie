@@ -1,0 +1,412 @@
+{
+  "archive": {
+    "bytes": 5402868,
+    "path": "pilot-records.tar.gz",
+    "sha256": "sha256:75eafc687769d29c24fdce26639c63439d49c5213a89c27fe1847fdc3f6aba5f"
+  },
+  "files": {
+    "menagerie/crawler/envs/audio/environment.yml": {
+      "bytes": 247,
+      "sha256": "sha256:72246f37c67aac7202f36bece5e17363a0ed4cd910e2f0fcdc5f4cacb6034736"
+    },
+    "menagerie/crawler/envs/audio/locks/osx-arm64.probes.json": {
+      "bytes": 435,
+      "sha256": "sha256:c4a9f18a3fc30caaf295b98c05a29e4817e501d529a97d077218452f5b2846eb"
+    },
+    "menagerie/crawler/envs/audio/locks/osx-arm64.provenance.json": {
+      "bytes": 1260,
+      "sha256": "sha256:a5c9194fca0be0749bf628218c117d68cce0ae8e63a48d13cc01b1ec8be9c497"
+    },
+    "menagerie/crawler/envs/audio/locks/osx-arm64.resolved.json": {
+      "bytes": 55636,
+      "sha256": "sha256:1c724ca64e333515b4ec8aa2eba82f7c2aa2a9b6ace2e92ddc03caa74921dd50"
+    },
+    "menagerie/crawler/envs/audio/locks/osx-arm64.resolved.sha256": {
+      "bytes": 72,
+      "sha256": "sha256:258e7947e45f89d97c0cf9d75b4301894eb675e94dca4e3bc334ad8fae463345"
+    },
+    "menagerie/crawler/envs/core/environment.yml": {
+      "bytes": 313,
+      "sha256": "sha256:335c976e331043ca1b0f9884e04a0ad8237c98d3c1b296f4a8aa8957963fa613"
+    },
+    "menagerie/crawler/envs/core/locks/osx-arm64.probes.json": {
+      "bytes": 683,
+      "sha256": "sha256:a8dbd7eb7270e3b953234bfbc46f3aae5e15b3e3d27e1870d6f2ddc2cae49790"
+    },
+    "menagerie/crawler/envs/core/locks/osx-arm64.provenance.json": {
+      "bytes": 1255,
+      "sha256": "sha256:87444234f177cf1e3b3c559445a32df76ecc612ca8cd3382268b55364258a58e"
+    },
+    "menagerie/crawler/envs/core/locks/osx-arm64.resolved.json": {
+      "bytes": 29901,
+      "sha256": "sha256:3a3534568f2c9d6affd0f7c458dc19610c2e67df4db8e1789b0d47de72bad25c"
+    },
+    "menagerie/crawler/envs/core/locks/osx-arm64.resolved.sha256": {
+      "bytes": 72,
+      "sha256": "sha256:61fbb1c582956ef7da6e0a23192fdfd253da5b83e7af047eb52499e801228575"
+    },
+    "menagerie/crawler/envs/detect-misc/environment.yml": {
+      "bytes": 310,
+      "sha256": "sha256:27f8e063d15136dd02ed53da77a210f44b7dd50afcec238cf6b049ef0a8e5fa9"
+    },
+    "menagerie/crawler/envs/detect-misc/locks/osx-arm64.probes.json": {
+      "bytes": 514,
+      "sha256": "sha256:d4fbaa87cc3bb61793ec06ea4cf2205cbc254f07a0178bdb14c25df751a57b95"
+    },
+    "menagerie/crawler/envs/detect-misc/locks/osx-arm64.provenance.json": {
+      "bytes": 1290,
+      "sha256": "sha256:1e1f84e80dd9a7170941f1fcbe5a2477d9535b04a184566ae3edc03ace1e6d57"
+    },
+    "menagerie/crawler/envs/detect-misc/locks/osx-arm64.resolved.json": {
+      "bytes": 61141,
+      "sha256": "sha256:d7305ce368901cb896b16595f40e3d61e4695cc78871d257200d0f4a482b528e"
+    },
+    "menagerie/crawler/envs/detect-misc/locks/osx-arm64.resolved.sha256": {
+      "bytes": 72,
+      "sha256": "sha256:37b0fda1662d5d68a50f85f1f961d86d13b93a55b42b17ab02fffbe9d1d95588"
+    },
+    "menagerie/crawler/envs/graph/environment.yml": {
+      "bytes": 279,
+      "sha256": "sha256:9b0b5a07b71d3b87031cee01ae09e57a3c1fcdab339d28d0ff5dd5fd703510df"
+    },
+    "menagerie/crawler/envs/graph/locks/osx-arm64.pip-overlay.txt": {
+      "bytes": 2102,
+      "sha256": "sha256:570ae5eea1eb6fe3c605ae3a783514b3e1aeb7bfca539a027435e2e78d8edc83"
+    },
+    "menagerie/crawler/envs/graph/locks/osx-arm64.probes.json": {
+      "bytes": 481,
+      "sha256": "sha256:13d6796d3f32c93f21b65d852946727c4779ad72410efeecd7c4a08323622eb5"
+    },
+    "menagerie/crawler/envs/graph/locks/osx-arm64.provenance.json": {
+      "bytes": 1702,
+      "sha256": "sha256:9bc8835b1125f38542be44d152a000a38c7e84d63669c12d75e210b44593490c"
+    },
+    "menagerie/crawler/envs/graph/locks/osx-arm64.resolved.json": {
+      "bytes": 50994,
+      "sha256": "sha256:8a1db611abb203830a4451761d235371c7ddeac13b323ff04162e2b3a5549dc1"
+    },
+    "menagerie/crawler/envs/graph/locks/osx-arm64.resolved.sha256": {
+      "bytes": 72,
+      "sha256": "sha256:788eaf0f72c676d5703809663e351d1ec5225b1d976a4e15973b8993782da961"
+    },
+    "menagerie/crawler/envs/graph/pip-overlay.in": {
+      "bytes": 176,
+      "sha256": "sha256:832b29a3ee21ecffa6b3e8c60e16410ae0e443d2e17d7614dce7ebb6e8bec742"
+    },
+    "menagerie/crawler/envs/jax-flax-arm64/environment.yml": {
+      "bytes": 218,
+      "sha256": "sha256:fb4ff824813d27769b19695f88bb849c8df7e8e333ff64f9dda691e9f19d1e0e"
+    },
+    "menagerie/crawler/envs/legacy-torch/environment.yml": {
+      "bytes": 297,
+      "sha256": "sha256:609acdfea23f45526304c3e2a4d4f5e3f5ba363118fdbafd3793e78a08b44355"
+    },
+    "menagerie/crawler/envs/legacy-torch/locks/osx-arm64.probes.json": {
+      "bytes": 466,
+      "sha256": "sha256:692b08425433d985a12a7ca4ab826b17af84da7899d98e9eb71973ece065ecd8"
+    },
+    "menagerie/crawler/envs/legacy-torch/locks/osx-arm64.provenance.json": {
+      "bytes": 1295,
+      "sha256": "sha256:7bc876876d2ab3e3f8b77d8a3d3d943b66655ef52a610b4cb5f83ea1c3fadaaf"
+    },
+    "menagerie/crawler/envs/legacy-torch/locks/osx-arm64.resolved.json": {
+      "bytes": 36401,
+      "sha256": "sha256:69bca1dffd9d00449164c813139c8ffa5cfbfe6dcb21c4f23891239ad2137274"
+    },
+    "menagerie/crawler/envs/legacy-torch/locks/osx-arm64.resolved.sha256": {
+      "bytes": 72,
+      "sha256": "sha256:7d2780171f281caf0d74e7238a714ef2d567094ef5e4bfdb4dd1d2132fa2f416"
+    },
+    "menagerie/crawler/envs/locks/README.md": {
+      "bytes": 2979,
+      "sha256": "sha256:b31f17d5e6f7d5aa6eda605d665dd67d5a306841fc3458155c1815dcf5db1e3c"
+    },
+    "menagerie/crawler/envs/locks/round19-linux-64.probes.json": {
+      "bytes": 538,
+      "sha256": "sha256:1de80f6a7a54065ff1e801bdb448dab983be2503b1a374fe998021ab72783073"
+    },
+    "menagerie/crawler/envs/locks/round19-linux-64.provenance.json": {
+      "bytes": 2968,
+      "sha256": "sha256:ca16b6fedc14461de3815ebdfafbceecc23e7a533886e2abd9664c0c40b8520c"
+    },
+    "menagerie/crawler/envs/locks/round19-linux-64.resolved.json": {
+      "bytes": 17013,
+      "sha256": "sha256:e5f51e5bf652d7019757f0f8f4c591bc83704804e91c34894acbbd7e9bd84b57"
+    },
+    "menagerie/crawler/envs/locks/round19-linux-64.resolved.sha256": {
+      "bytes": 72,
+      "sha256": "sha256:b4ca02468baa6967c76a0067fad547581be2e1387646cc56abce83e8df07b835"
+    },
+    "menagerie/crawler/envs/locks/round19-osx-arm64.probes.json": {
+      "bytes": 420,
+      "sha256": "sha256:c988bca5af64f4a4fdae70524565907d39956a3cb8ddcf5eae02d84aacfb193e"
+    },
+    "menagerie/crawler/envs/locks/round19-osx-arm64.provenance.json": {
+      "bytes": 3129,
+      "sha256": "sha256:a6890285e8619fb48427bcff6c2dd711b11e7c84d42bd664c9b9d0fd416f4246"
+    },
+    "menagerie/crawler/envs/locks/round19-osx-arm64.resolved.json": {
+      "bytes": 14913,
+      "sha256": "sha256:9462ad9617ba4b79b008e22ca23ed96a5ff7fcaf4e29ff1922db2617e0faa321"
+    },
+    "menagerie/crawler/envs/locks/round19-osx-arm64.resolved.sha256": {
+      "bytes": 72,
+      "sha256": "sha256:e9b1a86746e5dda660ab9e3d993fb58582fdd9a94a9618a3badb3d0800888de2"
+    },
+    "menagerie/crawler/envs/mmlab/environment.yml": {
+      "bytes": 264,
+      "sha256": "sha256:90d5411d81c18a0c8b454747ba78a1e4e269c4b16b2fc11773797bb0cda62b43"
+    },
+    "menagerie/crawler/envs/oddballs/environment.yml": {
+      "bytes": 234,
+      "sha256": "sha256:3f4670c437a8e934b9f37a446194925c249f96ff38881ac9858b4da4e23b58e6"
+    },
+    "menagerie/crawler/envs/paddle-arm64/environment.yml": {
+      "bytes": 217,
+      "sha256": "sha256:3c9d3f53eb6124f577199b2104b10c4a84477951842b20454ab0048d5087e3e7"
+    },
+    "menagerie/crawler/envs/paddle-arm64/locks/osx-arm64.probes.json": {
+      "bytes": 289,
+      "sha256": "sha256:a1b6389141b7d16a5a9a725932fb8381b5fc36f75f4e77c9766e4eb058792dc5"
+    },
+    "menagerie/crawler/envs/paddle-arm64/locks/osx-arm64.provenance.json": {
+      "bytes": 1295,
+      "sha256": "sha256:bfd8d34e1bab8756e72700c67a00f35d10b1205009a81ada7ac15b96f43b90b5"
+    },
+    "menagerie/crawler/envs/paddle-arm64/locks/osx-arm64.resolved.json": {
+      "bytes": 39088,
+      "sha256": "sha256:e15ce88734eebbb18f0a096445abd12f09f0e90b2a1a084e9fa2cd5e8982ad8b"
+    },
+    "menagerie/crawler/envs/paddle-arm64/locks/osx-arm64.resolved.sha256": {
+      "bytes": 72,
+      "sha256": "sha256:4de96730182884f72ac5e6946070c6ac6049845547b7c5c5bb264361d4e550be"
+    },
+    "menagerie/crawler/envs/probes.yml": {
+      "bytes": 3103,
+      "sha256": "sha256:340cdff2499ec577e8f8c380a9d19d08de76226ac04d26fce24887db77b62aba"
+    },
+    "menagerie/crawler/envs/recsys/environment.yml": {
+      "bytes": 260,
+      "sha256": "sha256:c088970afb22f9201d44e96bddbfb71a3ed2aa67564fc968ce13ad40f0bf1d23"
+    },
+    "menagerie/crawler/envs/recsys/locks/osx-arm64.probes.json": {
+      "bytes": 358,
+      "sha256": "sha256:a17ff3b70275d54e80308ae2ec08beeb4594764728244d399c7c9f9458076800"
+    },
+    "menagerie/crawler/envs/recsys/locks/osx-arm64.provenance.json": {
+      "bytes": 1265,
+      "sha256": "sha256:6f185b062ef614005678a86354a2d006ff0a816d83049303e3e70ed0d7123c69"
+    },
+    "menagerie/crawler/envs/recsys/locks/osx-arm64.resolved.json": {
+      "bytes": 82589,
+      "sha256": "sha256:0710bafa72df3618895f63c3ef8a596e1c8cea0e09041a18065ee8e9e2f15fed"
+    },
+    "menagerie/crawler/envs/recsys/locks/osx-arm64.resolved.sha256": {
+      "bytes": 72,
+      "sha256": "sha256:88a18968be620b91b9c3a73fb33c9b6470338999e9fd73493b8564c23c049be8"
+    },
+    "menagerie/crawler/envs/registry.yml": {
+      "bytes": 7856,
+      "sha256": "sha256:281708df6bb5777fcbc8fc9d9714addac2fa8f8b5c65ef9973227328ebbd096f"
+    },
+    "menagerie/crawler/envs/specs/round21-release.probes.json": {
+      "bytes": 326,
+      "sha256": "sha256:095e6004ec48253a2b03bd7e2d251775cc57ee5105a05fe188528d5546df63cf"
+    },
+    "menagerie/crawler/envs/specs/round21-release.virtual-packages.yml": {
+      "bytes": 104,
+      "sha256": "sha256:45dd80cade098c31ef7088a9530c55f94dc399cabfbccc6d5372f0eec857139f"
+    },
+    "menagerie/crawler/envs/specs/round21-release.yml": {
+      "bytes": 231,
+      "sha256": "sha256:8df6d5699932e2d78757a0d095337640c0b1b85ae6c1edc80e01a331fdd8e8ff"
+    },
+    "menagerie/crawler/envs/speech/environment.yml": {
+      "bytes": 266,
+      "sha256": "sha256:4437f9078b349d26555259caa41d4083d639c268f113631c4a91b87e42b26984"
+    },
+    "menagerie/crawler/envs/speech/locks/osx-arm64.pip-overlay.txt": {
+      "bytes": 561,
+      "sha256": "sha256:e0d8fcd895a00a784b2cfa8db15926993de397f48a286e708a3d97591eddbc0d"
+    },
+    "menagerie/crawler/envs/speech/locks/osx-arm64.probes.json": {
+      "bytes": 369,
+      "sha256": "sha256:19ba7338826ef9282d2de9ca3431329d982884f8d1f9091456bc414f35f65db6"
+    },
+    "menagerie/crawler/envs/speech/locks/osx-arm64.provenance.json": {
+      "bytes": 1709,
+      "sha256": "sha256:e4a6b3c295d2990886affb61d4cd152bf9afca9ce71498bf72d92d4f321b66bc"
+    },
+    "menagerie/crawler/envs/speech/locks/osx-arm64.resolved.json": {
+      "bytes": 39411,
+      "sha256": "sha256:503975b0d16e8659482c94df44f17578196b05eb405e0180e6326f1bd631e0cc"
+    },
+    "menagerie/crawler/envs/speech/locks/osx-arm64.resolved.sha256": {
+      "bytes": 72,
+      "sha256": "sha256:bd69a4b511b19176fbf9c3bbdcfbaa18daf4b540326b1bfaf6a7e8579ae9a8cd"
+    },
+    "menagerie/crawler/envs/speech/pip-overlay.in": {
+      "bytes": 581,
+      "sha256": "sha256:44a47a166c7603d6b7905fbe60cbe36894e797fecdcead554a6b996ac441e891"
+    },
+    "menagerie/crawler/envs/tabular-ts/environment.yml": {
+      "bytes": 248,
+      "sha256": "sha256:98b1db4224f3eb5a6c8942eaa330362b16f5f3357b9e0400585ec2e4eb50bafb"
+    },
+    "menagerie/crawler/envs/tabular-ts/locks/osx-arm64.probes.json": {
+      "bytes": 331,
+      "sha256": "sha256:108329f57ec277e7ff12d1865cad2a67634eb7d805a14ff529df5ec05d0795f6"
+    },
+    "menagerie/crawler/envs/tabular-ts/locks/osx-arm64.provenance.json": {
+      "bytes": 1285,
+      "sha256": "sha256:ce98dbf9ee6065cd7c528c29f66cdde721be1de410304f98cacb34a4b997c858"
+    },
+    "menagerie/crawler/envs/tabular-ts/locks/osx-arm64.resolved.json": {
+      "bytes": 18661,
+      "sha256": "sha256:8dd0a12d82848468709ef07b27327337c95dbb5c48788c5c2d09180c40a5ca26"
+    },
+    "menagerie/crawler/envs/tabular-ts/locks/osx-arm64.resolved.sha256": {
+      "bytes": 72,
+      "sha256": "sha256:29e58a63773d259fa3efb064bfa30c54ca83056986fc694e660e0820bf7f1004"
+    },
+    "menagerie/crawler/envs/tf-keras-arm64/environment.yml": {
+      "bytes": 249,
+      "sha256": "sha256:5159a1acd2bdbfd396a57e46b26816740aa2ab4df0793f04b84938531ad16783"
+    },
+    "menagerie/crawler/records/artifacts/current-shard.jsonl": {
+      "bytes": 17731798,
+      "sha256": "sha256:8189c698adf6088189731a92ea9617a15457a3a9f0980aef432c431418af02c7"
+    },
+    "menagerie/crawler/records/attempts/local.jsonl": {
+      "bytes": 1310061,
+      "sha256": "sha256:bb3497edd9c09c78b31a237b6ff02efabefab3932438225a3b89343262091149"
+    },
+    "menagerie/crawler/records/campaigns.json": {
+      "bytes": 2797,
+      "sha256": "sha256:10d149b25a0844ea5b05ca36bb57b002fb3496b21125d948572daf21aa3b6894"
+    },
+    "menagerie/crawler/records/gates/current-shard.jsonl": {
+      "bytes": 4404313,
+      "sha256": "sha256:7b9f739da93bf1976f7bfb30b732abbe87a9fba4a4f189d9cb203604488c4aaf"
+    },
+    "menagerie/crawler/records/intake-extensions/checker-lane-deferrals.jsonl": {
+      "bytes": 5893,
+      "sha256": "sha256:8e9d00c872fb3ad4676827db3f14035e7c8ef483cc7d2e8cfc2c338f2605478b"
+    },
+    "menagerie/crawler/records/intake-extensions/environment-coverage-deferrals.jsonl": {
+      "bytes": 7090,
+      "sha256": "sha256:fda0a444da74711f4b3e9e2c6231392b846cef39408b329f908d3faa04c3a803"
+    },
+    "menagerie/crawler/records/intake-extensions/environment-rebuild-deferrals.jsonl": {
+      "bytes": 103531,
+      "sha256": "sha256:c951845cd0690e42cf0e20c0ce2cb8d690148d93635eceab2b18560f02bf456d"
+    },
+    "menagerie/crawler/records/intake-extensions/grant-pending-supersessions.jsonl": {
+      "bytes": 1425,
+      "sha256": "sha256:9c5c81093af2ba28c66f66d5bef7afc370fb7312945066efa1201fc1a4560e6a"
+    },
+    "menagerie/crawler/records/intake-extensions/host-capacity-deferrals.jsonl": {
+      "bytes": 10394,
+      "sha256": "sha256:2774e21b9872d8132a0aa561d863d263cb0deb19a87514129504925b94887865"
+    },
+    "menagerie/crawler/records/intake-extensions/terminal-refusal-parks.jsonl": {
+      "bytes": 1529,
+      "sha256": "sha256:09c9bc1e8bfbdcb411841235f18734cd581d33d78ed7d5e7ab1a5319fda6ee2c"
+    },
+    "menagerie/crawler/records/intake/intake-61d2ae3aed9ea0cbb3f3/items.jsonl": {
+      "bytes": 2343067,
+      "sha256": "sha256:5da1b5f0f9c7e4de7586bb68ce0cf2325ce9e9d5262d88a9da516025c510c8fb"
+    },
+    "menagerie/crawler/records/intake/intake-61d2ae3aed9ea0cbb3f3/manifest.json": {
+      "bytes": 2343559,
+      "sha256": "sha256:cc6771a3418ad0cca2d8a32686be5b3b0a866476ff9d7fe7676264327b40d6d3"
+    },
+    "menagerie/crawler/records/intake/intake-61d2ae3aed9ea0cbb3f3/sources/deferred.jsonl": {
+      "bytes": 1,
+      "sha256": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    "menagerie/crawler/records/intake/intake-61d2ae3aed9ea0cbb3f3/sources/master_catalog.jsonl": {
+      "bytes": 969461,
+      "sha256": "sha256:a191a06583c01c6ab0c6d68a198eae1aaba90aa6dd17966c14eb56cf09a38ff5"
+    },
+    "menagerie/crawler/records/intake/intake-6b706db620bf170dbe48/items.jsonl": {
+      "bytes": 324,
+      "sha256": "sha256:24eff8107495e1be9c86eff5c2157e5fa3b89a39a48748e3750e3fe3a9f1cd75"
+    },
+    "menagerie/crawler/records/intake/intake-6b706db620bf170dbe48/manifest.json": {
+      "bytes": 813,
+      "sha256": "sha256:ec5f7418d022bcce4f57a7cb541841da6d267c29253ffef30c7deb0953095d6c"
+    },
+    "menagerie/crawler/records/intake/intake-6b706db620bf170dbe48/sources/deferred.jsonl": {
+      "bytes": 1,
+      "sha256": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    "menagerie/crawler/records/intake/intake-6b706db620bf170dbe48/sources/master_catalog.jsonl": {
+      "bytes": 969461,
+      "sha256": "sha256:a191a06583c01c6ab0c6d68a198eae1aaba90aa6dd17966c14eb56cf09a38ff5"
+    },
+    "menagerie/crawler/records/intake/intake-b72d4f2ff0db9705d336/items.jsonl": {
+      "bytes": 24042,
+      "sha256": "sha256:2b8228401ef92dc9f24b3846046d96d34b4d2b363cee5f4812b9a2ee1c3a24ad"
+    },
+    "menagerie/crawler/records/intake/intake-b72d4f2ff0db9705d336/manifest.json": {
+      "bytes": 24532,
+      "sha256": "sha256:69a7864c2462c71eaf2bd53459a1a3a9916d1a209387b0674029ac6b5234c20c"
+    },
+    "menagerie/crawler/records/intake/intake-b72d4f2ff0db9705d336/sources/deferred.jsonl": {
+      "bytes": 1,
+      "sha256": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    "menagerie/crawler/records/intake/intake-b72d4f2ff0db9705d336/sources/master_catalog.jsonl": {
+      "bytes": 969461,
+      "sha256": "sha256:a191a06583c01c6ab0c6d68a198eae1aaba90aa6dd17966c14eb56cf09a38ff5"
+    },
+    "menagerie/crawler/records/intake/intake-d8887295ce869c1b6dce/items.jsonl": {
+      "bytes": 3383,
+      "sha256": "sha256:410bc18a3a79bd6c092cf4e1c2d6ba6051ac45760fa29d56d48d2f79200c9fa2"
+    },
+    "menagerie/crawler/records/intake/intake-d8887295ce869c1b6dce/manifest.json": {
+      "bytes": 3873,
+      "sha256": "sha256:236eca42f120efc834a5d99bf7025508a9433ef14d296c6906aa305078e35029"
+    },
+    "menagerie/crawler/records/intake/intake-d8887295ce869c1b6dce/sources/deferred.jsonl": {
+      "bytes": 1,
+      "sha256": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    "menagerie/crawler/records/intake/intake-d8887295ce869c1b6dce/sources/master_catalog.jsonl": {
+      "bytes": 969461,
+      "sha256": "sha256:a191a06583c01c6ab0c6d68a198eae1aaba90aa6dd17966c14eb56cf09a38ff5"
+    },
+    "menagerie/crawler/records/intake/registered-rungs.jsonl": {
+      "bytes": 1537,
+      "sha256": "sha256:d7513bc705ee0f09873d6bd030ad19547ec32c2e2e2aa14e93f6d943c0c78eba"
+    },
+    "menagerie/crawler/records/models/current-shard.jsonl": {
+      "bytes": 5613929,
+      "sha256": "sha256:61d4945e8605a6ca7bb0f1e9bae356afca367bc111092c0d16a412467b660a28"
+    },
+    "menagerie/crawler/records/operational/events.jsonl": {
+      "bytes": 1084964,
+      "sha256": "sha256:01e25904ac638fa6c2473705d6c2cd52760d27e7b4db8c77910cff1718ac36db"
+    },
+    "menagerie/crawler/records/operational/requeue-grants.jsonl": {
+      "bytes": 42829,
+      "sha256": "sha256:d7e3b544aba24b2e68ceccbcdb531bd8e459fbd818c5d8bde1cc241384a26095"
+    },
+    "rehearsal/scenario.json": {
+      "bytes": 1153,
+      "sha256": "sha256:9c6a139f876454ab1040494c9c615756ffb309e1724dca071a72ff18b6c34cc5"
+    },
+    "rehearsal/torn-events.jsonl": {
+      "bytes": 894,
+      "sha256": "sha256:7c44029e8028da1594c8ad07d8688bf8e86e14f0bc28653c4873dc060f56d962"
+    }
+  },
+  "scenario_sha256": "sha256:9c6a139f876454ab1040494c9c615756ffb309e1724dca071a72ff18b6c34cc5",
+  "schema_version": "torchlens.crawler-rehearsal-fixture.v1",
+  "source": {
+    "code_revision": "7522cb68-composed",
+    "kind": "pilot-canonical-record-snapshot",
+    "live_runtime_excluded": true
+  }
+}

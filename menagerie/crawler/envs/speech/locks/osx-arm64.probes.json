@@ -1,0 +1,1 @@
+{"probes":[{"detail":"ok","name":"import:torch","passed":true},{"detail":"ok","name":"import:torchaudio","passed":true},{"detail":"ok","name":"import:soundfile","passed":true},{"detail":"ok","name":"import:speechbrain","passed":true},{"detail":"ok","name":"export:torchaudio:__version__","passed":true},{"detail":"ok","name":"export:speechbrain:Brain","passed":true}]}

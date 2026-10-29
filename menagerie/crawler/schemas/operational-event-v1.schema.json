@@ -1,0 +1,839 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://torchlens.org/schemas/menagerie/crawler/operational-event-v1.schema.json",
+  "title": "Menagerie crawler operational event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "ledger_seq",
+    "payload_sha256",
+    "created_at",
+    "event_kind",
+    "status",
+    "provider",
+    "observed_response",
+    "reset_at",
+    "queued_work_counts",
+    "current_environment",
+    "run_id",
+    "machine_id",
+    "details"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "menagerie.crawler.operational-event.v1",
+      "description": "Mandatory versioned schema identifier."
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Mandatory immutable operational-event identifier."
+    },
+    "ledger_seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Mandatory monotonic ledger sequence."
+    },
+    "payload_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Mandatory hash of the complete ledger payload."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$",
+      "description": "Mandatory UTC creation timestamp."
+    },
+    "event_kind": {
+      "enum": [
+        "usage-pause",
+        "usage-pause-observation.v1",
+        "usage-resume",
+        "wakeup",
+        "checkpoint",
+        "campaign-health",
+        "wake-noop-already-running",
+        "checkpoint-review",
+        "review-signoff",
+        "progress-notification",
+        "notification-delivery",
+        "requeue-grant-consumed",
+        "worker-lease-opened",
+        "worker-lease-started",
+        "worker-lease-closed",
+        "worker-lease-reaped",
+        "orphan-worker-recovered",
+        "wakeup-installed",
+        "wakeup-repaired",
+        "wakeup-fired",
+        "wakeup-deactivated",
+        "wakeup-health-degraded",
+        "wakeup-failed",
+        "campaign-completed",
+        "operator-cancelled",
+        "worker-shutdown-interrupted",
+        "terminal-unrecordable",
+        "model-lane-failed",
+        "scheduler-cutover",
+        "scheduler-rollback",
+        "work-selection-census",
+        "projection-staleness",
+        "requeue-generation-discharged",
+        "leg-config",
+        "leg-outcome",
+        "close-preview",
+        "invocation-refused",
+        "configuration-canary",
+        "crawl-limit"
+      ],
+      "description": "Mandatory operational event kind."
+    },
+    "status": {
+      "enum": [
+        "paused:usage-limit",
+        "resumed:usage-limit",
+        "wakeup-scheduled",
+        "wakeup-fired",
+        "wake-noop-already-running",
+        "checkpoint-complete",
+        "checkpoint-failed",
+        "healthy",
+        "degraded",
+        "failed:runner",
+        "retryable:infrastructure",
+        "paused:checkpoint-review",
+        "resumed:checkpoint-review",
+        "progress-notified",
+        "progress-recorded",
+        "notification-delivered",
+        "notification-failed",
+        "requeue-grant-consumed",
+        "worker-lease-open",
+        "worker-lease-active",
+        "worker-lease-closed",
+        "worker-lease-reaped",
+        "orphan-worker-recovered",
+        "wakeup-installed",
+        "wakeup-repaired",
+        "wakeup-deactivated",
+        "wakeup-health-degraded",
+        "wakeup-failed",
+        "campaign-completed",
+        "operator-cancelled",
+        "paused:terminated",
+        "interrupted:shutdown",
+        "failed:model-lane",
+        "scheduler-mode-changed",
+        "refused:host-capability-leg",
+        "refused:invocation"
+      ],
+      "description": "Mandatory closed current disposition."
+    },
+    "provider": {
+      "oneOf": [
+        {
+          "enum": [
+            "anthropic",
+            "openai",
+            "research-tools",
+            "forge"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Best-effort provider associated with the event."
+    },
+    "observed_response": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Best-effort observed provider response."
+    },
+    "error_summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional top-level 'ExcType: message' for the failure this event reports. Present on terminal-unrecordable and model-lane-failed events so the original exception is legible without opening the nested details report: a model whose terminal could not be written presents downstream as a partition hole, and a model whose terminal WAS written carries a redacted status.detail with the cause only in a gitignored diagnostics sidecar. The exception type is what identifies both."
+    },
+    "reset_at": {
+      "oneOf": [
+        {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Best-effort scheduled provider reset time."
+    },
+    "queued_work_counts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "description": "Mandatory queued work counts."
+    },
+    "current_environment": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Mandatory current environment."
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Mandatory run id."
+    },
+    "machine_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Mandatory machine id."
+    },
+    "details": {
+      "type": "object",
+      "description": "Mandatory structured event details."
+    },
+    "models_completed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Terminal-model count reached at a review or progress event."
+    },
+    "funnel_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runs",
+        "deferred",
+        "skipped",
+        "failed"
+      ],
+      "properties": {
+        "runs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Current runs count."
+        },
+        "deferred": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Current deferred count."
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Current skipped count."
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Current failed count."
+        }
+      },
+      "description": "Exact four-bucket terminal funnel snapshot."
+    },
+    "report_path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Review report path presented for human sign-off."
+    },
+    "approved_by_note": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-supplied note identifying the review approval."
+    },
+    "resume_after": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Completed-model review checkpoint cleared by the sign-off."
+    },
+    "milestone": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Non-blocking completed-model milestone being reported."
+    },
+    "shadow_rehearsal": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional W3 shadow-rehearsal marker: the declared rehearsal generation namespace stamped by the write-side producer while MENAGERIE_SHADOW_REHEARSAL_RUN is set. Presence excludes the record from every reuse/authority seam (W44); it grants nothing."
+    }
+  },
+  "$defs": {
+    "shutdown_interruption_details": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "invocation_id",
+        "admission_boundary",
+        "stable_id",
+        "work_id",
+        "execution_identity",
+        "request_identity",
+        "lease_id",
+        "child_pid",
+        "child_start_token",
+        "child_pgid",
+        "signal",
+        "parent_observation",
+        "partial_receipt"
+      ],
+      "properties": {
+        "invocation_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact idempotency identity of the interrupted invocation."
+        },
+        "admission_boundary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Named admission boundary at which shutdown was observed."
+        },
+        "stable_id": {
+          "type": ["string", "null"],
+          "description": "Model identity when work had been selected, otherwise null."
+        },
+        "work_id": {
+          "type": ["string", "null"],
+          "description": "Work identity when work had been selected, otherwise null."
+        },
+        "execution_identity": {
+          "oneOf": [
+            {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            {"type": "null"}
+          ],
+          "description": "Execution identity when compilation reached that boundary."
+        },
+        "request_identity": {
+          "oneOf": [
+            {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            {"type": "null"}
+          ],
+          "description": "Exact worker-request digest when request bytes existed."
+        },
+        "lease_id": {
+          "type": ["string", "null"],
+          "description": "Exact worker lease identity when a lease had opened."
+        },
+        "child_pid": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Parent-observed child process id when a child existed."
+        },
+        "child_start_token": {
+          "type": ["string", "null"],
+          "description": "Kernel child-start identity when a child existed."
+        },
+        "child_pgid": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Parent-observed child process-group id when available."
+        },
+        "signal": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Signal number observed for a drained child, otherwise null."
+        },
+        "parent_observation": {
+          "type": ["object", "null"],
+          "description": "Complete parent supervisor observation when a child was drained."
+        },
+        "partial_receipt": {
+          "type": ["object", "null"],
+          "description": "Non-awarding partial worker receipt retained only for diagnostics."
+        }
+      },
+      "description": "Exact operational-only shutdown interruption fact."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "const": "checkpoint-review",
+            "description": "Select the checkpoint-review event contract."
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "models_completed",
+          "funnel_snapshot",
+          "report_path"
+        ],
+        "properties": {
+          "status": {
+            "const": "paused:checkpoint-review",
+            "description": "Checkpoint review always blocks pending sign-off."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "const": "review-signoff",
+            "description": "Select the review-signoff event contract."
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "approved_by_note",
+          "resume_after"
+        ],
+        "properties": {
+          "status": {
+            "const": "resumed:checkpoint-review",
+            "description": "Review sign-off clears a blocking review checkpoint."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "const": "progress-notification",
+            "description": "Select the progress-notification event contract."
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "models_completed",
+          "milestone",
+          "funnel_snapshot"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "progress-notified",
+              "progress-recorded"
+            ],
+            "description": "Progress milestone identity is informational and non-blocking."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "const": "notification-delivery",
+            "description": "Select the best-effort notification delivery contract."
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "enum": [
+              "notification-delivered",
+              "notification-failed"
+            ],
+            "description": "Delivery is recorded separately from notification identity."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "enum": [
+              "scheduler-cutover",
+              "scheduler-rollback"
+            ],
+            "description": "Select the scheduler mode-transition contract."
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "scheduler-mode-changed",
+            "description": "A mode transition is provenance, never a blocking state."
+          },
+          "details": {
+            "type": "object",
+            "required": [
+              "from_scheduler",
+              "to_scheduler",
+              "occurrence",
+              "ledger_tails"
+            ],
+            "properties": {
+              "from_scheduler": {
+                "enum": ["waves", "pipelined"],
+                "description": "Effective scheduler mode before this leg."
+              },
+              "to_scheduler": {
+                "enum": ["waves", "pipelined"],
+                "description": "Scheduler mode this leg starts under."
+              },
+              "occurrence": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Ledger-derived ordinal of this transition."
+              },
+              "ledger_tails": {
+                "type": "object",
+                "required": ["models", "attempts", "gates"],
+                "additionalProperties": false,
+                "patternProperties": {
+                  "^(models|attempts|gates)$": {
+                    "type": "object",
+                    "required": ["count", "last_payload_sha256"],
+                    "properties": {
+                      "count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Record count at transition time."
+                      },
+                      "last_payload_sha256": {
+                        "oneOf": [
+                          {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                          {"type": "null"}
+                        ],
+                        "description": "Digest of the last record, null when empty."
+                      }
+                    }
+                  }
+                },
+                "description": "Canonical tail counts/digests attested at the transition."
+              }
+            },
+            "description": "Exact mode-transition provenance."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "const": "leg-config",
+            "description": "Select the B-09 leg-start effective-config contract."
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "healthy",
+            "description": "A config attestation is provenance, never a blocking state."
+          },
+          "details": {
+            "type": "object",
+            "required": [
+              "scheduler",
+              "author_concurrency",
+              "checker_concurrency",
+              "author_model",
+              "author_version",
+              "claude_cli_version",
+              "checker_model",
+              "checker_version",
+              "campaign_id",
+              "phase",
+              "review_checkpoint_at",
+              "only_unsettled",
+              "only_status",
+              "redrive_targets",
+              "gate_catchup_targets",
+              "config_digest"
+            ],
+            "properties": {
+              "scheduler": {
+                "enum": ["waves", "pipelined"],
+                "description": "Leg-level scheduling shape this leg ran under."
+              },
+              "author_concurrency": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Author lane width."
+              },
+              "checker_concurrency": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Checker lane width."
+              },
+              "author_model": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Effective author model."
+              },
+              "author_version": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Effective author version, so the adjudicating author identity is recoverable from the leg and not from a mutable in-code spec (BL-3)."
+              },
+              "claude_cli_version": {
+                "type": "string",
+                "enum": ["2.1.220", "2.1.239", "2.1.257"],
+                "description": "Pinned Claude CLI release whose JSON internals and confinement behavior this leg classified against (BL-11)."
+              },
+              "checker_model": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Effective checker model."
+              },
+              "checker_version": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Effective checker version. Required because the manifest's own copy is a mutable echo: after a rotation only the leg can say which checker adjudicated this rung (BL-3)."
+              },
+              "campaign_id": {
+                "oneOf": [
+                  {"type": "string", "minLength": 1},
+                  {"type": "null"}
+                ],
+                "description": "Tier campaign this leg served; recovers workload_class exactly."
+              },
+              "phase": {
+                "oneOf": [
+                  {"type": "string", "minLength": 1},
+                  {"type": "null"}
+                ],
+                "description": "Framework phase projection in force for this leg; null only when the leg is bound to no campaign, which has no projection to attest."
+              },
+              "review_checkpoint_at": {
+                "oneOf": [
+                  {"type": "integer", "minimum": 0},
+                  {"type": "null"}
+                ],
+                "description": "Review-checkpoint projection in force for this leg; null only when the leg is bound to no campaign."
+              },
+              "only_unsettled": {
+                "type": "boolean",
+                "description": "Whether the leg ran the never-recorded scope cut."
+              },
+              "only_status": {
+                "oneOf": [
+                  {"type": "string", "minLength": 1},
+                  {"type": "null"}
+                ],
+                "description": "Deferred-handoff scope, null when unscoped."
+              },
+              "redrive_targets": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "description": "Named re-drive lane, empty for an ordinary leg."
+              },
+              "gate_catchup_targets": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "description": "Named gate catch-up lane, empty for an ordinary leg."
+              },
+              "checker_calibration": {
+                "type": "object",
+                "required": [
+                  "calibration_run_active",
+                  "calibration_receipt_override",
+                  "golden_corpus_override"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "calibration_run_active": {
+                    "type": "boolean",
+                    "description": "Whether this leg ran as the sanctioned calibration capture run (W3: awards are structurally withheld while true)."
+                  },
+                  "shadow_rehearsal_run": {
+                    "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+                    "description": "MENAGERIE_SHADOW_REHEARSAL_RUN declared rehearsal generation namespace (W3 third mode: awards are structurally withheld and every written record carries the marker), null when unset. Optional only for pre-fix history; every new leg emits it."
+                  },
+                  "calibration_receipt_override": {
+                    "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+                    "description": "MENAGERIE_CHECKER_CALIBRATION_RECEIPT override path, null when the committed receipt is in effect."
+                  },
+                  "golden_corpus_override": {
+                    "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+                    "description": "MENAGERIE_CHECKER_GOLDEN_CORPUS override path, null when the committed corpus is in effect."
+                  }
+                },
+                "description": "W3/TE-3 verdict-steering env-read attestation: the complete calibration env inventory this leg ran under. Optional only for pre-fix history; every new leg emits it."
+              },
+              "config_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "description": "Content address of the attested effective config."
+              },
+              "author_concurrency_source": {
+                "enum": ["explicit-flag", "explicit-env", "frozen-config", "default"],
+                "description": "D-63: which channel decided the author width. Optional only for pre-fix history; every new leg emits it."
+              },
+              "checker_concurrency_source": {
+                "enum": ["explicit-flag", "explicit-env", "frozen-config", "default"],
+                "description": "D-63: which channel decided the checker width. Optional only for pre-fix history; every new leg emits it."
+              },
+              "repo_tree_sha": {
+                "oneOf": [{"type": "string", "pattern": "^[0-9a-f]{40}$"}, {"type": "null"}],
+                "description": "D-63: HEAD^{tree} of the running repository, null when the observation failed. Disclosure, never enforcement (the launch certificate owns the enforcing tree binding)."
+              },
+              "repo_tree_dirty": {
+                "oneOf": [{"type": "boolean"}, {"type": "null"}],
+                "description": "D-63: whether anything outside .crawl-local/ was modified at leg open, null when unobservable."
+              },
+              "rung_config_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "description": "D-63: content address of exactly the rung-invariant config axes (RUNG_INVARIANT_CONFIG_FIELDS). Rung certification refuses a rung whose legs disagree on this field. Optional only for pre-fix history; every new leg emits it."
+              }
+            },
+            "description": "Exact effective run configuration for this leg."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "const": "leg-outcome",
+            "description": "Select the W6/OB-M12 leg-outcome contract."
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "healthy",
+            "description": "The outcome mirror is provenance, never a blocking state."
+          },
+          "details": {
+            "type": "object",
+            "required": [
+              "generation_id",
+              "exit_class",
+              "cause_fingerprint",
+              "terminal_delta",
+              "invocation_origin",
+              "synthesized",
+              "leg_ended_sha256"
+            ],
+            "properties": {
+              "generation_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Durable leg generation this outcome closes an invocation of."
+              },
+              "exit_class": {
+                "enum": [
+                  "close_minted",
+                  "paused_typed",
+                  "operator_stop",
+                  "shutdown_typed",
+                  "fault_machinery",
+                  "fault_host",
+                  "fault_uncontained",
+                  "orphaned_uncontained",
+                  "work_exhausted"
+                ],
+                "description": "Closed LegExitClass (PD-11/FT-a): exactly one per exit; fault_uncontained must census ZERO in a healthy rung."
+              },
+              "cause_fingerprint": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "description": "PM-5's stable cause identity: exit class + typed exception chain + stable evidence, never message text."
+              },
+              "terminal_delta": {
+                "oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}],
+                "description": "Terminals minted this leg (models-ledger rows past the leg baseline); null when unobservable."
+              },
+              "invocation_origin": {
+                "enum": [
+                  "ordinary-run",
+                  "manual-resume",
+                  "wake-callback",
+                  "supervised-restart",
+                  "unknown"
+                ],
+                "description": "Which continuation authority started the leg this outcome closes."
+              },
+              "synthesized": {
+                "type": "boolean",
+                "description": "True ONLY for the boot reconciler's orphan closes."
+              },
+              "leg_ended_sha256": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "description": "Content address of the authoritative leg_ended row this event mirrors."
+              }
+            },
+            "description": "OB-M12: count(leg-config) == count(leg-outcome) + running."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "const": "close-preview",
+            "description": "Select the D-20 leg-start close-preview contract."
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": ["verdict", "generation_id"],
+            "properties": {
+              "verdict": {
+                "enum": ["would-close", "would-refuse", "preview-error"],
+                "description": "D-20: the read-only boundary predicate's leg-start verdict. Report-only disclosure; never authority, never a licence input."
+              },
+              "generation_id": {
+                "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+                "description": "Durable leg generation the preview ran for; null only when the preview raised before the generation was known."
+              }
+            },
+            "description": "D-20: would-refuse members/axes made legible at leg START instead of leg end."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_kind": {
+            "const": "worker-shutdown-interrupted",
+            "description": "Select the operational-only worker shutdown contract."
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "interrupted:shutdown",
+            "description": "A completed interruption remains ordinarily resumable."
+          },
+          "details": {
+            "$ref": "#/$defs/shutdown_interruption_details",
+            "description": "Exact operational-only shutdown interruption fact."
+          }
+        }
+      }
+    }
+  ]
+}

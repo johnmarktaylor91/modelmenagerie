@@ -1,0 +1,215 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "menagerie"
+version = "0.1.0"
+description = "Find DNN models, work out how to run them, trace them with TorchLens and harvest their data and metadata for the Model Menagerie site"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    {name = "JohnMark Taylor"},
+]
+keywords = ["torch", "torchlens", "model zoo", "architecture", "catalog"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+# TorchLens is the upstream tracing library; pin a released PyPI version.
+# Bump the pin deliberately (see docs/torchlens-boundary.md for the private calls to recheck).
+dependencies = [
+    "torchlens==2.36.0",
+    "torch>=2.1",
+    "numpy",
+    "packaging",
+    "tqdm",
+    "psutil>=5.9",
+    "pydantic>=2.0",
+    "PyYAML>=6.0",
+    "jsonschema>=4.18",
+    "referencing>=0.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff==0.15.4",
+    "pytest",
+    "pytest-cov",
+    "mypy==2.1.0",
+    "pip-audit==2.10.1",
+    "pre-commit",
+    "detect-secrets==1.5.0",
+]
+io = ["pyarrow"]
+test = [
+    "pytest",
+    "pytest-xdist>=3.6",
+    "pytest-timeout",
+    "lightning",
+    "pydot",
+    "pillow",
+    "requests",
+    "soxr",
+    "timm",
+    "torchaudio",
+    "torch_geometric",
+    "torchvision",
+    "transformers",
+    "visualpriors",
+]
+
+[project.scripts]
+# The rebuilt pipeline; the bare `menagerie` name stays with the old tree until rung 2.
+menagerie-pipeline = "menagerie.pipeline.cli:main"
+
+[project.urls]
+Homepage = "https://modelmenagerie.ai"
+Repository = "https://github.com/johnmarktaylor91/menagerie"
+
+[tool.setuptools.packages.find]
+include = ["menagerie*"]
+
+[tool.setuptools.package-data]
+menagerie = [
+    "crawler/prompts/pool/*",
+    "crawler/prompts/executor/*",
+    "data/*.json",
+    "data/*.jsonl",
+    "data/*.tsv",
+    "data/*.yml",
+    "data/atlas_prose/*.json",
+    "data/adapters/*.py",
+    "pipeline/assets/*",
+    "locks/*.lock",
+    "locks/*.toml",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "heavy: marks mid-cost tests excluded from the fast per-step gate (select/deselect with '-m heavy' / '-m \"not heavy\"')",
+    "smoke: marks tests as smoke tests for quick critical-path validation (select with '-m smoke')",
+    "serial: marks load-sensitive tests that should run away from parallel worker load",
+    "rig: marks the crawler corpus rigs (multi-minute scheduler, shard-merge, and tree-hygiene instruments) that run under their own closure-keyed gate (select with '-m rig'; the smoke and full tiers deselect them)",
+    "rare: marks tests that are always excluded unless explicitly requested (select with '-m rare')",
+    "optional: marks tests that require optional dependencies",
+    "backend_parity: marks active backend substrate parity gates",
+    "backend_jax: marks tests that require the optional JAX backend runtime",
+    "backend_tinygrad: marks tests that require the optional tinygrad backend runtime",
+    "backend_paddle: marks tests that require the optional paddle backend runtime",
+    "tf_backend: marks tests that require the optional TensorFlow backend runtime",
+    "round21_linux_real: exact committed-lock Linux release proof inventory",
+    "round21_macos_real: exact committed-lock macOS release proof inventory",
+]
+# --strict-markers: a typo'd marker (e.g. @pytest.mark.smok) must be a hard
+# error, not a warning — a misspelled smoke mark silently drops the test from
+# the mandatory tier and only shifts a count.
+# Default collection is the Menagerie suite in tests/. The crawler package's own suite
+# (menagerie/crawler/tests, ~530 files, some still expecting TorchLens CI files) runs only
+# when named explicitly, until the crawler redesign consolidates it into tests/crawler/.
+testpaths = ["tests"]
+addopts = "-m 'not rare' --strict-markers"
+xfail_strict = true
+filterwarnings = [
+    # TorchLens-originated warnings should be deliberate and locally asserted.
+    # NOTE: pytest applies filterwarnings bottom-to-top priority (later entries win),
+    # so the broad error rules go FIRST and the message-specific "default" exceptions
+    # below them take precedence for their exact messages. Public compatibility aliases
+    # (layers_to_save=, etc.) and older-bundle-version loads are intentionally exercised
+    # across legacy tests and stay visible-not-fatal; deprecation-specific tests assert
+    # them locally.
+    "error::DeprecationWarning:torchlens(\\.|$)",
+    "error::UserWarning:torchlens(\\.|$)",
+    # Expected graceful torch-capability degradations (e.g. functorch level API absent on
+    # torch 2.1) flip a HAS_* flag and warn once; visible-not-fatal across the torch matrix.
+    "default:TorchLens torch capability .* is unavailable;.*:UserWarning:torchlens(\\.|$)",
+    # Informational opt-in caveat (reference save-mode shares tensors); visible once, not
+    # fatal -- like the capability-degradation warning above. Fires whenever save_mode=
+    # 'reference' is used, so it is not per-test assertable.
+    "default:save_mode='reference' stores source tensors by reference.*:UserWarning:torchlens(\\.|$)",
+    "default:`.*` is deprecated; use `.*` instead\\..*:DeprecationWarning",
+    "default:Bundle tlspec_version=.* is older than runtime tlspec_version=.*:DeprecationWarning",
+    # Environment advisory: TorchLens cannot probe free memory on some hosts (seen on macOS
+    # workers) and disables automatic save budgeting; visible, not fatal.
+    "default:TorchLens cannot measure available memory for device .*:UserWarning",
+    # External: torchvision model init deprecations
+    "ignore:The default weight initialization of.*:FutureWarning",
+    # External: torch.meshgrid indexing argument
+    "ignore:torch.meshgrid.*:UserWarning",
+    # External: timm deprecated model name mappings
+    "ignore:Mapping deprecated model name.*:UserWarning",
+    # External: torch.nn.utils.weight_norm deprecation
+    "ignore:`torch.nn.utils.weight_norm` is deprecated.*:FutureWarning",
+    # External: complex-to-real casting warning
+    "ignore:Casting complex values to real.*:UserWarning",
+    # External (torch>=2.13): sparse-invariant and quantized-factory advisories emitted through the
+    # torchlens wrapper frame, so the torchlens-scoped error rule would otherwise catch them.
+    "ignore:Sparse invariant checks are implicitly disabled.*:UserWarning",
+    # External: torch's grid_sample/affine_grid align_corners advisory, raised from inside a
+    # captured model's forward through the torchlens wrapper frame (menagerie sample traces).
+    "ignore:Default grid_sample and affine_grid behavior has changed.*:UserWarning",
+    "ignore:torch.quantize_per_tensor, torch.quantize_per_channel and other quantized tensor creation functions.*:UserWarning",
+    # External: transformer nested_tensor batch_first warning
+    "ignore:enable_nested_tensor is True.*:UserWarning",
+]
+
+[tool.coverage.run]
+source = ["menagerie"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+
+[tool.coverage.html]
+directory = "tests/generated_outputs/reports/coverage_html"
+
+[tool.coverage.lcov]
+output = "tests/generated_outputs/coverage.lcov"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = false
+warn_unused_configs = true
+ignore_missing_imports = true
+# Check bodies of unannotated functions so the package ratchet catches local drift.
+check_untyped_defs = true
+disallow_untyped_defs = false
+
+# numpy's bundled stubs use 3.12+ `type` statements, which are a syntax error under the
+# `python_version = "3.11"` target above. mypy reports that as
+# "errors prevented further checking" and exits BEFORE reading any project code -- so the
+# type gate silently passed on everything while checking nothing. Skipping the stubs
+# restores real checking and leaves the 3.11 target intact (verified: identical findings
+# with and without, once mypy actually runs). Do not "fix" this by raising
+# `python_version`; that would quietly change which Python the project is checked against.
+[[tool.mypy.overrides]]
+module = "numpy.*"
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# menagerie/classics/ holds faithful random-init architecture reconstructions AND vendored/
+# ported REAL repo code (the model atlas). They are compact recipes / verbatim vendored source,
+# not first-party library code: dense one-line block definitions (E702), conventional math/ML
+# single-letter names like l/I/O for layers/identity (E741), unused imports kept verbatim from
+# the real source (F401), intentional dead scaffolding vars kept for readability of the
+# reconstructed forward (F841), and lambda-assignment factory idioms common in vendored source,
+# e.g. lucidrains repos (E731). Vendored source also keeps its original `type(x) == T`
+# comparisons (E721). Enforcing these would mean editing generated/vendored forwards
+# and perturbing already-rendered architecture graphs or diverging from the real source.
+# Real-bug lints (F821/F811/etc.) stay enforced.
+"menagerie/classics/*.py" = ["E702", "E741", "F401", "F841", "E731", "E712", "E721", "E402", "E711"]

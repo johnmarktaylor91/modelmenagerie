@@ -1,0 +1,105 @@
+---
+import EmailLink from "@/components/EmailLink.astro";
+import BaseLayout from "@/layouts/BaseLayout.astro";
+import { CONTACT, CONTENT_LICENCE, GRAPHVIZ_URL, SITE_NAME, TORCHLENS } from "@/lib/site";
+
+const ANALYTICS_PRIVACY = "https://www.cloudflare.com/web-analytics/";
+const CLOUDFLARE_PRIVACY = "https://www.cloudflare.com/privacypolicy/";
+---
+
+<BaseLayout
+  title="Privacy and licences"
+  description="What the Model Menagerie records about visits (a cookieless page count), what your browser keeps, the licences of the site and of each model, and how to ask for a correction or removal."
+>
+  <article class="shell legal py-10">
+    <h1 class="text-3xl font-semibold sm:text-4xl">Privacy and licences</h1>
+    <p class="lead mt-4 text-secondary">
+      No accounts, no cookies, no advertising: one cookieless page counter, and a few settings your browser keeps for you.
+    </p>
+
+    <section aria-labelledby="privacy">
+      <h2 id="privacy">Visits</h2>
+      <p>
+        The site counts visits with <a class="textlink" href={ANALYTICS_PRIVACY}>Cloudflare Web Analytics</a>. It sets no
+        cookies and uses no local storage, and Cloudflare says it does not fingerprint visitors by IP address or browser. It
+        records which page was opened, the page that linked to it, the country, the browser, operating system and device
+        type, and how fast the page loaded. The site sees only these totals, never who you are, and nothing is shared with
+        advertisers. There is no other tracking script on the site.
+      </p>
+      <p>
+        The site is served by Cloudflare, which handles every request on its network as described in its
+        <a class="textlink" href={CLOUDFLARE_PRIVACY}>privacy policy</a>. Diagram files come from the same network.
+      </p>
+    </section>
+
+    <section aria-labelledby="storage">
+      <h2 id="storage">What your browser keeps</h2>
+      <ul>
+        <li>Your choice of light or dark theme, if you pick one.</li>
+        <li>Whether you browse models as pictures or as a list.</li>
+        <li>For this tab only, the last list of models you opened, so the back link returns to it.</li>
+      </ul>
+      <p>These stay in your browser and are never sent anywhere. Clearing the site's data in your browser removes them.</p>
+    </section>
+
+    <section aria-labelledby="licences">
+      <h2 id="licences">Licences</h2>
+      <p>
+        The site's text, its diagrams and the dataset are licensed under
+        <a class="textlink" href={CONTENT_LICENCE.url} rel="license">{CONTENT_LICENCE.name} ({CONTENT_LICENCE.short})</a>.
+        You may share and adapt them for any purpose, with credit to the {SITE_NAME} and a link to the licence; the
+        <a class="textlink" href="/about/#cite">About page</a> has a citation.
+      </p>
+      <p>
+        Each diagram is this site's drawing of a trace of a model's code. It is not the model's code or weights, which keep
+        the licence their authors chose. A model page names that licence and links the source where it is recorded; check
+        it before you reuse the model itself.
+      </p>
+      <p>
+        <a class="textlink" href={TORCHLENS.repo}>TorchLens</a>, which traces and draws every diagram, is open source under
+        the <a class="textlink" href={TORCHLENS.licence.url}>{TORCHLENS.licence.name}</a>. Graph layout is by
+        <a class="textlink" href={GRAPHVIZ_URL}>Graphviz</a>.
+      </p>
+    </section>
+
+    <section aria-labelledby="contact">
+      <h2 id="contact">Corrections and removal</h2>
+      <p>
+        To report a wrong diagram or fact, open an issue on the <a class="textlink" href={CONTACT.issues}>TorchLens issues
+        page</a>. To ask for a model, its diagram or its record to be removed, or for anything else you would rather not
+        post in public, email <EmailLink email={CONTACT.email} />.
+      </p>
+    </section>
+  </article>
+</BaseLayout>
+
+<style>
+  .legal {
+    max-width: 46rem;
+  }
+
+  .legal .lead {
+    font-size: 1.125rem;
+    line-height: 1.7;
+  }
+
+  .legal section {
+    margin-top: 2.5rem;
+  }
+
+  .legal h2 {
+    font-size: 1.375rem;
+    font-weight: 600;
+  }
+
+  .legal p,
+  .legal ul {
+    margin-top: 0.75rem;
+    line-height: 1.7;
+  }
+
+  .legal ul {
+    padding-left: 1.4rem;
+    list-style: disc;
+  }
+</style>

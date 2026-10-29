@@ -1,0 +1,47 @@
+# CPU Detectron2 binary, pinned to the matching PyTorch ABI.
+[workspace]
+name = "menagerie-detectron2-canary"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.11.*"
+pyvips = "==3.2.0"
+detectron2 = {version = "==0.6", build = "cpu_py311h38f08d7_13"}
+pytorch = {version = "==2.6.0", build = "cpu*"}
+torchvision = {version = "==0.21.0", build = "cpu*"}
+python-build = "*"
+setuptools = "*"
+wheel = "*"
+ninja = "*"
+fvcore = ">=0.1.5,<0.1.6"
+iopath = ">=0.1.7,<0.1.10"
+omegaconf = ">=2.1,<2.4"
+hydra-core = ">=1.1"
+pycocotools = ">=2.0.2"
+pillow = ">=7.1"
+matplotlib-base = "*"
+termcolor = ">=1.1"
+yacs = ">=0.1.8"
+tabulate = "*"
+cloudpickle = "*"
+tqdm = ">4.29"
+tensorboard = "*"
+black = "*"
+packaging = "*"
+numpy = "<2"
+
+[pypi-options]
+no-build = true
+
+[pypi-dependencies]
+torchlens = "==2.36.0"
+pydantic = ">=2.0"
+PyYAML = ">=6.0"
+jsonschema = ">=4.18"
+referencing = ">=0.28"
+psutil = ">=5.9"
+pyvips-binary = "==8.18.7"
+
+[tasks]
+canary = "python canary.py"

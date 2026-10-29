@@ -1,0 +1,1 @@
+{"probes":[{"detail":"ok","name":"import:paddle","passed":true},{"detail":"ok","name":"import:numpy","passed":true},{"detail":"ok","name":"import:cv2","passed":true},{"detail":"ok","name":"export:paddle:__version__","passed":true},{"detail":"ok","name":"export:paddle:nn","passed":true}]}

@@ -1,0 +1,10 @@
+# Pinned pip overlay compiled by tools/rotate_setup_artifacts.py.
+# Consumed verbatim by pip with --no-index --no-deps --require-hashes.
+HyperPyYAML==1.2.3 \
+    --hash=sha256:0088c8ce97dc7c7d3460112b6ccc92dca46fade4d0320bc39f58b1fdda60f7f1
+ruamel.yaml==0.18.17 \
+    --hash=sha256:9c8ba9eb3e793efdf924b60d521820869d5bf0cb9c6f1b82d82de8295e290b9d
+ruamel.yaml.clib==0.2.15 \
+    --hash=sha256:64da03cbe93c1e91af133f5bec37fd24d0d4ba2418eaf970d7166b0a26a148a2
+speechbrain==1.0.3 \
+    --hash=sha256:9859d4c1b1fb3af3b85523c0c89f52e45a04f305622ed55f31aa32dd2fba19e9

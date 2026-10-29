@@ -1,0 +1,16 @@
+{
+ "field": "paradigm",
+ "source": "docs/metadata/SCHEMA_v2.md column 9 (architecture_paradigm)",
+ "values": [
+  "CNN",
+  "Transformer",
+  "RNN",
+  "GNN",
+  "Diffusion",
+  "GAN",
+  "MLP",
+  "SSM",
+  "Hybrid",
+  "Other"
+ ]
+}

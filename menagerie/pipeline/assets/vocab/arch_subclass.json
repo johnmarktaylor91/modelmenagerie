@@ -1,0 +1,18 @@
+{
+ "field": "arch_subclass",
+ "source": "docs/metadata/SCHEMA_v2.md column 18 (architecture_subclass), closed for describe (2026-10-08)",
+ "values": [
+  "encoder-only",
+  "decoder-only",
+  "encoder-decoder",
+  "two-stream",
+  "u-net",
+  "detector-head",
+  "backbone",
+  "autoencoder",
+  "deformable",
+  "sparse",
+  "recurrent-cell",
+  "other"
+ ]
+}

@@ -1,0 +1,29 @@
+{
+ "field": "domain",
+ "source": "menagerie/catalog.py macro_domain: the 23 live categories (2026-10-08)",
+ "values": [
+  "3D/geometry/NeRF/point-cloud",
+  "NLP/LLM/text",
+  "OCR/document",
+  "RL/robotics/control",
+  "audio/speech",
+  "exotic/other",
+  "generative/diffusion-GAN-flow",
+  "graph/geometric",
+  "history",
+  "medical-imaging",
+  "multimodal",
+  "neuro/scientific-signals",
+  "recsys/tabular",
+  "scientific/molecular/protein/genomics",
+  "scientific/physics/weather/PDE",
+  "spiking/neuromorphic",
+  "time-series/dynamics",
+  "video/action",
+  "vision/classification-backbone",
+  "vision/depth-geometry",
+  "vision/detection-tracking",
+  "vision/pose",
+  "vision/segmentation"
+ ]
+}

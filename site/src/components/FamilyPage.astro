@@ -1,0 +1,96 @@
+---
+/**
+ * A family's grouping page: its summary when the export has one, the paper its members share,
+ * and every member as a card, smallest first. Used by /families/<slug>/ and the fixture pages.
+ */
+import ModelCard from "@/components/ModelCard.astro";
+import type { Family } from "@/lib/families";
+import { categoryLabel, formatNumber } from "@/lib/labels";
+
+interface Props {
+  family: Family;
+}
+
+const { family } = Astro.props;
+const tasks = [...new Set(family.members.map((member) => categoryLabel(member.category)))];
+const count = family.members.length;
+const lede = `${formatNumber(count)} ${count === 1 ? "model" : "models"}${tasks.length === 1 ? `, ${tasks[0].toLowerCase()}` : ""}. Smallest first.`;
+---
+
+<section class="shell family-page py-8">
+  <header class="family-head">
+    <a class="family-back" href="/families/">All families</a>
+    <h1 class="family-title">{family.name}</h1>
+    <p class="family-lede">{lede}</p>
+    {family.summary && <p class="family-summary">{family.summary}</p>}
+    {
+      family.paper && (
+        <p class="family-paper">
+          Paper:{" "}
+          <a class="textlink" href={family.paper.url} rel="noopener">
+            {family.paper.title ?? "read the paper"}
+          </a>
+        </p>
+      )
+    }
+    <p class="family-browse">
+      <a class="textlink" href={`/models/?family=${encodeURIComponent(family.name)}`}>Filter and sort these in the model list</a>
+    </p>
+  </header>
+
+  {
+    count > 0 ? (
+      <div class="family-grid">
+        {family.members.map((member) => (
+          <ModelCard model={member} />
+        ))}
+      </div>
+    ) : (
+      <p class="panel family-empty">No models in this family yet.</p>
+    )
+  }
+</section>
+
+<style>
+  .family-head {
+    max-width: 46rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .family-back,
+  .family-lede,
+  .family-browse {
+    color: var(--secondary);
+    font-size: 0.9rem;
+  }
+
+  .family-title {
+    margin: 0.4rem 0 0;
+    font-size: clamp(1.6rem, 4.5vw, 2.25rem);
+    font-weight: 600;
+    line-height: 1.15;
+    overflow-wrap: anywhere;
+  }
+
+  .family-lede,
+  .family-summary,
+  .family-paper,
+  .family-browse {
+    margin: 0.5rem 0 0;
+  }
+
+  .family-summary {
+    line-height: 1.6;
+  }
+
+  .family-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 15.5rem), 1fr));
+    align-items: start;
+    gap: 1rem;
+  }
+
+  .family-empty {
+    padding: 1rem;
+  }
+</style>

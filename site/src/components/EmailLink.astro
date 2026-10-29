@@ -1,0 +1,14 @@
+---
+/**
+ * A mailto link that Cloudflare's email obfuscation leaves alone. Without the `email_off` markers the edge
+ * rewrites the link to /cdn-cgi/l/email-protection and adds a decoding script to the page.
+ */
+interface Props {
+  email: string;
+}
+
+const { email } = Astro.props;
+const safe = email.replace(/[<>&"]/g, "");
+---
+
+<Fragment set:html={`<!--email_off--><a class="textlink" href="mailto:${safe}">${safe}</a><!--/email_off-->`} />

@@ -1,0 +1,45 @@
+---
+import SiteSearch from "@/components/SiteSearch.astro";
+import BaseLayout from "@/layouts/BaseLayout.astro";
+---
+
+<BaseLayout title="Page not found" description="There is no page at this address." noindex>
+  <section class="shell grid min-h-[60vh] place-items-center py-10 text-center">
+    <div class="w-full max-w-md">
+      <p class="text-sm font-semibold text-secondary">404</p>
+      <h1 class="mt-2 text-3xl font-semibold sm:text-4xl">Page not found</h1>
+      <p class="mt-3 text-secondary" data-notfound-text>There is no page at this address. Search for a model, or browse them all.</p>
+      <div class="mt-6">
+        <SiteSearch id="notfound-search" variant="page" label="Find a model" placeholder="Model name, e.g. resnet18" />
+      </div>
+      <p class="mt-6 flex flex-wrap justify-center gap-x-6 gap-y-2">
+        <a class="textlink" href="/models/">Browse all models</a>
+        <a class="textlink" href="/">Home page</a>
+      </p>
+    </div>
+  </section>
+</BaseLayout>
+
+<script>
+  // A listing page past the last one, or a model address that does not exist, gets a specific line
+  // and the search box filled in with what the address names.
+  const text = document.querySelector<HTMLElement>("[data-notfound-text]");
+  const input = document.querySelector<HTMLInputElement>("#notfound-search-input");
+  const listing = /^\/models\/(\d+)\/?$/.exec(location.pathname);
+  const model = /^\/(?:models|families)\/([^/]+)\/?$/.exec(location.pathname);
+  if (text && listing) {
+    text.textContent = `The model list has no page ${listing[1]}. Start again from the first page, or search.`;
+  } else if (text && input && model) {
+    let name = model[1];
+    try {
+      name = decodeURIComponent(name);
+    } catch {
+      // A malformed escape: search for the raw text.
+    }
+    const words = name.replace(/[-_]+/g, " ").trim().slice(0, 80);
+    text.textContent = "There is no page for that name. Here are the closest matches.";
+    input.value = words;
+    // After the search box's own script has wired its listeners.
+    window.setTimeout(() => input.dispatchEvent(new Event("input")), 0);
+  }
+</script>

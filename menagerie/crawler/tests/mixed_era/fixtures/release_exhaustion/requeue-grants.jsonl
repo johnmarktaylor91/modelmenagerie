@@ -1,0 +1,1 @@
+{"attempts":1,"grant_id":"sha256:e02a4de8b43130eb90700fb2769db0b695b84eb9497036fd5718fdf0fc485763","granted_by":"operator","new_work_generation":1,"reason":"operator approved exhaustion re-drive","schema_version":"menagerie.crawler.requeue-grant.v1","stable_id":"m_infra","stage":"author"}

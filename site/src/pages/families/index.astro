@@ -1,0 +1,65 @@
+---
+import BaseLayout from "@/layouts/BaseLayout.astro";
+import { FAMILY_PAGE_MIN_MEMBERS, listFamilyPages } from "@/lib/families";
+import { formatNumber } from "@/lib/labels";
+
+const families = listFamilyPages();
+---
+
+<BaseLayout title="Families" description={`${formatNumber(families.length)} families of related neural network architectures, each with its members' diagrams.`}>
+  <section class="shell families py-8">
+    <h1 class="families-title">Families</h1>
+    <p class="families-lede">
+      Groups of related models, largest first. Families with fewer than {FAMILY_PAGE_MIN_MEMBERS} members are in the
+      <a class="textlink" href="/models/">model list</a>.
+    </p>
+    <ul class="families-list">
+      {
+        families.map((family) => (
+          <li>
+            <a class="textlink" href={`/families/${family.slug}/`}>{family.name}</a>
+            <span class="families-count">{formatNumber(family.members.length)}</span>
+          </li>
+        ))
+      }
+    </ul>
+  </section>
+</BaseLayout>
+
+<style>
+  .families-title {
+    margin: 0;
+    font-size: 2.25rem;
+    font-weight: 600;
+  }
+
+  .families-lede {
+    max-width: 40rem;
+    margin: 0.5rem 0 1.5rem;
+    color: var(--secondary);
+  }
+
+  .families-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr));
+    gap: 0.35rem 2rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .families-list li {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.75rem;
+    min-height: 2.75rem;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    overflow-wrap: anywhere;
+  }
+
+  .families-count {
+    color: var(--secondary);
+    font-variant-numeric: tabular-nums;
+  }
+</style>

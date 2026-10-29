@@ -1,0 +1,23 @@
+{
+  "_doc": "Gates the QA verdict checks (verdict.mjs). Source: the site plan's launch checklist (section 2) and the common landing gate. Edit a number here, not in the scripts.",
+  "astro_check_errors": 0,
+  "file_cap": 20000,
+  "file_headroom": 0.2,
+  "max_file_bytes": 26214400,
+  "build_seconds": 90,
+  "broken_links": 0,
+  "internal_redirects": 0,
+  "overflow_pages": 0,
+  "console_errors": 0,
+  "axe_violations": 0,
+  "axe_allow": [],
+  "copy_hits": 0,
+  "lighthouse": {
+    "performance": 90,
+    "total_blocking_time_ms": 200,
+    "cumulative_layout_shift": 0.05,
+    "accessibility": 95,
+    "seo": 95
+  },
+  "share_image": { "width": 1200, "height": 630, "max_bytes": 300000 }
+}

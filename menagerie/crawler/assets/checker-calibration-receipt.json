@@ -1,0 +1,98 @@
+{
+ "blind_replay": {
+  "acceptance_witness": {
+   "confirmation_disagreements": 0,
+   "contested_census_arm": "checker-verdict-conflict",
+   "disagreement_outcome": "checker-verdict-conflict-park",
+   "fidelity_accept_witnesses": 3,
+   "metadata_accept_witnesses": 0,
+   "missing_confirmations": 0,
+   "required_witnesses_per_accept": 2,
+   "terminal_accept_witnesses": 3,
+   "unfunded_confirmation_outcome": "checker-accept-unconfirmed"
+  },
+  "disagreement_diagnosis": [],
+  "goldens": 10,
+  "locator_attestation": {
+   "attested_by": "machine",
+   "basis": "one-based-inclusive-universal-newline-v1",
+   "checks": 179,
+   "failures": 0,
+   "keyset_sha256": "sha256:30665d249fbb3eedd2e235a1c45b5d43869ec86e1a6605a57fc5b81d97730dec",
+   "unattestable": 10
+  },
+  "mechanical_claims": {
+   "coverage_gaps": 0,
+   "discharged": 30,
+   "refuted": 0,
+   "required": 30
+  },
+  "p99_at_production_width_seconds": 690.2339571249904,
+  "replays_per_golden": 3,
+  "report_sha256": "sha256:4208663ca48d9e131f3917bce3550e369f6452848675dc205d95529d04ca801f",
+  "rotation_disagreements": 0,
+  "rotation_replay_ran": true,
+  "same_epoch_disagreements": 0,
+  "width_invariance": {
+   "degenerate_at_production_width": true,
+   "disagreements": 0,
+   "folded_into_same_epoch": true,
+   "widths": [
+    1
+   ]
+  }
+ },
+ "capacity": {
+  "dollar_budget": 0.0,
+  "next_rung_models": 200.0,
+  "projected_dollars": 0.0,
+  "projected_sessions": 385.0,
+  "projected_wall_hours": 41.7,
+  "session_budget": 2000.0,
+  "wall_budget_hours": 70.0
+ },
+ "captured_at": "2026-08-31T19:17:15Z",
+ "checker_model": "gpt-5.6-sol",
+ "checker_prompt_identity": "sha256:a19c07d62f350aac9ec4fea5495304b47e89d63fd9e3aa8c2b4fb72c6d8d7557",
+ "lanes": {
+  "fidelity": {
+   "attempt_censoring_rate": 0.02040816326530612,
+   "attempt_latency_p99_seconds": 595.663,
+   "attempt_samples": 48,
+   "latency_p95_seconds": 454.47840309143066,
+   "latency_p99_seconds": 454.47840309143066,
+   "output_tokens_p99": 22562.0,
+   "pre_genesis_rendered": 0,
+   "refusal_rate": 0.14285714285714285,
+   "sessions": 6,
+   "sessions_bought": 7
+  },
+  "metadata_batch": {
+   "attempt_censoring_rate": 0.0,
+   "attempt_latency_p99_seconds": 456.732,
+   "attempt_samples": 156,
+   "latency_p95_seconds": 446.3549008369446,
+   "latency_p99_seconds": 509.83102893829346,
+   "output_tokens_p99": 20254.0,
+   "pre_genesis_rendered": 0,
+   "refusal_rate": 0.0,
+   "sessions": 26,
+   "sessions_bought": 26
+  },
+  "terminal_disposition": {
+   "attempt_censoring_rate": 0.0,
+   "attempt_latency_p99_seconds": 249.873,
+   "attempt_samples": 434,
+   "latency_p95_seconds": 193.50909996032715,
+   "latency_p99_seconds": 193.50909996032715,
+   "output_tokens_p99": 9292.0,
+   "pre_genesis_rendered": 0,
+   "refusal_rate": 0.14285714285714285,
+   "sessions": 6,
+   "sessions_bought": 7
+  }
+ },
+ "production_batch_width": 1,
+ "schema_version": "menagerie.crawler.checker-calibration-receipt.v2",
+ "source": "Receipt re-mint at the LIVE epoch (tl-receipt2 lane @ fe16c1831, 2026-08-31): B1-XV2 matrix re-run over the committed width-1 sol golden corpus (10 entries, W-7 manifest byte-match verified) under prompt epoch sha256:a19c07d6 (the W-8 mechanical-refutation closures on top of the round-4 weights-convention scope, the round-3 closures, and the round-2 locator authority + inventory_mode) at width-1 production constants on the durable calibration-r6 root; rotation = the last pre-W-8 epoch sha256:d7d0043f @ 5d291010e, so rotation disagreement reads as w8-closure-vs-round4-epoch. The landed round-4 receipt attests the superseded d7d0043f epoch and carries no structured checker_prompt_identity, so the wave-2 receipt-epoch door lawfully refuses every verdict lane until THIS receipt; the mint stamps checker_prompt_identity from the live shipped prompt. Conflict adjudication preceding this mint: the shadow probe's '29 verdict conflicts' decompose to 23 healthy K=2 duplicate-accept confirmations + 4 lawful cross-epoch identity-attributed-flip disclosures (m2222) + 2 genuine same-identity duplicate-accept conflicts (m10231, m4713; 2/25 = 8%, within the measured 200a bad-pass floor band ~6.7-8.5%) -- no AG-4 misclassification; the K=2 door settled both conflicts as designed. Lane measurements = the width-1 rung's (metadata at the width-1 cap, fidelity/TD from the R6 rung; attempt telemetry = calibration width-1 tails + pilot production fid/TD tails, metadata width-scoped by gather). Receipt v2: three zero bars + K=2 acceptance witness bound. Capacity: 200+confirmations@0.25 assumed accept (measured 0.077, break-even 0.867); dollars=0 per JMT subscription-cash ruling 2026-08-26"
+}

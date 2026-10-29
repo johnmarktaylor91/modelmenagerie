@@ -1,0 +1,99 @@
+version: 7
+platforms:
+- name: linux-64
+- name: osx-arm64
+environments:
+  default:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.11.14-h9e4cc4f_2_cpython.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/numpy-1.26.4-py311h64a7726_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/pytorch-2.6.0-cpu_mkl_py311h1d7a3a5_100.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/pyvips-3.2.0-py311h5733de1_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libvips-8.18.6-h1a2b3c4_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/cffi-2.1.1-py311h904a5e5_3.conda
+      - pypi: https://files.pythonhosted.org/packages/0e/4c/7610d3b5/torchlens-2.36.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/97/4e/dbdf6444/pyvips_binary-8.18.7-cp37-abi3-manylinux_2_28_x86_64.whl
+      osx-arm64:
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/python-3.11.14-h18782d2_2_cpython.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/numpy-1.26.4-py311h7125741_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pytorch-2.6.0-cpu_generic_py311h9ffc3b8_0.conda
+      - pypi: https://files.pythonhosted.org/packages/0e/4c/7610d3b5/torchlens-2.36.0-py3-none-any.whl
+packages:
+- conda: https://conda.anaconda.org/conda-forge/linux-64/cffi-2.1.1-py311h904a5e5_3.conda
+  sha256: 1111111111111111111111111111111111111111111111111111111111111111
+  depends:
+  - python >=3.11,<3.12.0a0
+  purls:
+  - pkg:pypi/cffi?source=hash-mapping
+- conda: https://conda.anaconda.org/conda-forge/linux-64/libvips-8.18.6-h1a2b3c4_0.conda
+  sha256: 2222222222222222222222222222222222222222222222222222222222222222
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  purls: []
+- conda: https://conda.anaconda.org/conda-forge/linux-64/numpy-1.26.4-py311h64a7726_0.conda
+  sha256: 3333333333333333333333333333333333333333333333333333333333333333
+  depends:
+  - python >=3.11,<3.12.0a0
+  purls:
+  - pkg:pypi/numpy?source=hash-mapping
+- conda: https://conda.anaconda.org/conda-forge/osx-arm64/numpy-1.26.4-py311h7125741_0.conda
+  sha256: 4444444444444444444444444444444444444444444444444444444444444444
+  depends:
+  - python >=3.11,<3.12.0a0
+  purls:
+  - pkg:pypi/numpy?source=hash-mapping
+- conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.11.14-h9e4cc4f_2_cpython.conda
+  sha256: 5555555555555555555555555555555555555555555555555555555555555555
+  depends: []
+  purls: []
+- conda: https://conda.anaconda.org/conda-forge/osx-arm64/python-3.11.14-h18782d2_2_cpython.conda
+  sha256: 6666666666666666666666666666666666666666666666666666666666666666
+  depends: []
+  purls: []
+- conda: https://conda.anaconda.org/conda-forge/linux-64/pytorch-2.6.0-cpu_mkl_py311h1d7a3a5_100.conda
+  sha256: 7777777777777777777777777777777777777777777777777777777777777777
+  depends:
+  - numpy >=1.19,<3
+  - python >=3.11,<3.12.0a0
+  purls:
+  - pkg:pypi/torch?source=hash-mapping
+- conda: https://conda.anaconda.org/conda-forge/osx-arm64/pytorch-2.6.0-cpu_generic_py311h9ffc3b8_0.conda
+  sha256: 8888888888888888888888888888888888888888888888888888888888888888
+  depends:
+  - numpy >=1.19,<3
+  - python >=3.11,<3.12.0a0
+  purls:
+  - pkg:pypi/torch?source=hash-mapping
+- conda: https://conda.anaconda.org/conda-forge/linux-64/pyvips-3.2.0-py311h5733de1_2.conda
+  sha256: 9999999999999999999999999999999999999999999999999999999999999999
+  depends:
+  - cffi >=1.0
+  - libvips >=8.18.6,<9.0a0
+  - python >=3.11,<3.12.0a0
+  purls:
+  - pkg:pypi/pyvips?source=compressed-mapping
+- conda: https://conda.anaconda.org/conda-forge/linux-64/stray-1.0-h0000000_0.conda
+  sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  depends: []
+  purls: []
+- pypi: https://files.pythonhosted.org/packages/97/4e/dbdf6444/pyvips_binary-8.18.7-cp37-abi3-manylinux_2_28_x86_64.whl
+  name: pyvips-binary
+  version: 8.18.7
+  sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  requires_dist:
+  - cffi>=1.0
+  requires_python: '>=3.7'
+- pypi: https://files.pythonhosted.org/packages/0e/4c/7610d3b5/torchlens-2.36.0-py3-none-any.whl
+  name: torchlens
+  version: 2.36.0
+  sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  requires_dist:
+  - numpy>=1.26.4
+  - torch>=2.1 ; python_full_version < '3.12'
+  - h5py>=3.10 ; extra == 'extraction-export'
+  requires_python: '>=3.11'

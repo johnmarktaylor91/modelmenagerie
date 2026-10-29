@@ -1,0 +1,78 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://torchlens.org/schemas/menagerie/crawler/requeue-grant-v1.schema.json",
+ "title": "Menagerie crawler operator requeue grant v1",
+ "description": "One tool-minted operator requeue grant. Historically the requeue-grants ledger was the one hand-appended canonical ledger with no schema identity (docket T2-12); rows minted before this version carry no schema_version and remain readable forever. The grant_id content hash covers the operator authorization facts (generation, stable_id, stage, reason, attempts, granted_by, and target_intent when present) and is recomputed on every read; schema_version is deliberately outside that preimage so stamping it never broke an existing identity.",
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "schema_version",
+  "grant_id",
+  "stable_id",
+  "stage",
+  "reason",
+  "attempts",
+  "granted_by",
+  "new_work_generation"
+ ],
+ "properties": {
+  "schema_version": {
+   "const": "menagerie.crawler.requeue-grant.v1",
+   "description": "Closed grant payload version."
+  },
+  "grant_id": {
+   "$ref": "#/$defs/hash",
+   "description": "Canonical grant identity, the one preimage owned by menagerie.crawler.grant_identity.tool_grant_identity."
+  },
+  "stable_id": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Durable identifier of the granted model."
+  },
+  "stage": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Closed failure stage the grant re-authorizes, or the typed deferred-terminal sentinel for review-held null-stage deferrals (docket T2-05)."
+  },
+  "reason": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Operator attribution for the authorization."
+  },
+  "attempts": {
+   "type": "integer",
+   "minimum": 1,
+   "description": "Author-session extension the granted work generation may spend beyond the base allowance (docket T1-13)."
+  },
+  "granted_by": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Operator identity that issued the grant."
+  },
+  "new_work_generation": {
+   "type": "integer",
+   "minimum": 1,
+   "description": "One-based ledger append generation allocated at issue time; folded into grant_id."
+  },
+  "blocked_award_revision": {
+   "$ref": "#/$defs/hash",
+   "description": "Optional exact runs record revision this grant authorizes superseding (AW-1). Folded into grant_id only when present; the single authority that releases the award-custody tripwire."
+  },
+  "target_intent": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Optional dependency-evidenced environment correction for the new work generation."
+  },
+  "capability": {
+   "enum": [
+    "host-capability-routing"
+   ],
+   "description": "Optional typed capability this grant authorizes. Only a grant NAMING host-capability-routing may re-open a deferred:needs-more-memory head; a generic requeue never does, because a new work id is not evidence that the host gained memory."
+  }
+ },
+ "$defs": {
+  "hash": {
+   "type": "string",
+   "pattern": "^sha256:[0-9a-f]{64}$"
+  },
+  "nonempty_string": {
+   "type": "string",
+   "minLength": 1
+  }
+ }
+}

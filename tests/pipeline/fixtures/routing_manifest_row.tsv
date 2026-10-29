@@ -1,0 +1,2 @@
+name	model_id	stable_id	recipe_revision_sha256	status	n_ops	validate_metadata_ok	scope	elapsed	dependency_cluster	error	graph_shape_hash
+resnet18	8088	m8839	b78608c64a56adb77b1c01f35cd45aba3004d32a37bc28d0870a19755327ce67	validated	85	true	forward	27.803	timm	forward=True	909da2bb8dc29f34a8120d701c9c91eb0b0fe6a4cee6d3c49bb712a11ea03d88

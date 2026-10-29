@@ -1,0 +1,52 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://torchlens.org/schemas/menagerie/crawler/requeue-grant-void-v1.schema.json",
+ "title": "Menagerie crawler operator requeue-grant void v1",
+ "description": "One append-only operator void of an existing requeue grant. A void never deletes or rewrites the grant; already-recorded consumptions stand as history. The void_id content hash deliberately excludes created_at so an identical void command stays idempotent across re-invocations; schema_version is likewise outside the preimage. Rows minted before this version carry no schema_version and remain readable forever (docket T2-12).",
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "schema_version",
+  "void_id",
+  "void_of",
+  "reason",
+  "voided_by",
+  "created_at"
+ ],
+ "properties": {
+  "schema_version": {
+   "const": "menagerie.crawler.requeue-grant-void.v1",
+   "description": "Closed void payload version."
+  },
+  "void_id": {
+   "$ref": "#/$defs/hash",
+   "description": "Canonical void identity over void_of, reason, and voided_by."
+  },
+  "void_of": {
+   "$ref": "#/$defs/hash",
+   "description": "Exact grant_id being voided; must already exist in the ledger."
+  },
+  "reason": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Operator attribution for the withdrawal."
+  },
+  "voided_by": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "Operator identity that voided the grant."
+  },
+  "created_at": {
+   "$ref": "#/$defs/nonempty_string",
+   "description": "UTC issue timestamp; outside the void identity by design."
+  }
+ },
+ "$defs": {
+  "hash": {
+   "type": "string",
+   "pattern": "^sha256:[0-9a-f]{64}$"
+  },
+  "nonempty_string": {
+   "type": "string",
+   "minLength": 1
+  }
+ }
+}

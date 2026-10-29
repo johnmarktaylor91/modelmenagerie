@@ -1,0 +1,9 @@
+# Direct pip-overlay requirements for the speech intent.
+# speechbrain has no conda distribution on any channel; it arrives through the
+# controlled offline overlay lane. Capped below 1.1: speechbrain 1.1.0 requires
+# soundfile>=0.12.1 (conda-forge pysoundfile tops out at 0.11, and shadowing a
+# conda-provided distribution is refused), while speechbrain<=1.0.3 requires
+# torchaudio<2.9 (it calls torchaudio.list_audio_backends, removed in 2.9) --
+# hence this intent's own torchaudio<2.9 conda pin. Revisit both caps when
+# conda-forge pysoundfile reaches 0.12.
+speechbrain<1.1

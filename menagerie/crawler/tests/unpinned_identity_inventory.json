@@ -1,0 +1,38 @@
+{
+  "schema_version": "menagerie.crawler.unpinned-identity-inventory.v1",
+  "comment": "BL-3: the closed inventory of load-bearing identity fields still bound to a non-versioned literal from constants.NON_VERSIONED_IDENTITY_LITERALS. A sole authority cannot be identified over a multi-week run by an alias plus the word 'current': every one of the 344 lifetime gate rows and all 298 live pilot model revisions carry checker_version='current', so a provider-side model update, a Codex CLI upgrade, or a prompt edit is indistinguishable from no change at all, and the W4 reuse key's version component is vacuous. This file is a CEILING, never a licence: test_checker_identity_flip.py::test_no_new_load_bearing_identity_is_a_non_versioned_literal fails on any site this file does not name, AND on any row here whose site no longer exists -- so pinning an identity must delete its row in the same reviewed change. Every row names the cluster that owns the file, because BL-3 may not edit another cluster's owner file in a parallel wave.",
+  "sites": [
+    {
+      "path": "menagerie/crawler/driver_contracts.py",
+      "symbol": "author_version",
+      "literal": "current",
+      "owner_cluster": "BL-8",
+      "note": "DriverConfig default. The root of the unpinned author identity: every leg, gate row, and model revision inherits it.",
+      "remedy": "Resolve from observable immutables at leg start (wrapper version, CLI version/digest, frozen prompt digest, schema digest, config digest) and refuse a NON_VERSIONED_IDENTITY_LITERALS value in production authority. One-line default change plus a resolver; driver_contracts.py is BL-8's owner file."
+    },
+    {
+      "path": "menagerie/crawler/driver_contracts.py",
+      "symbol": "checker_version",
+      "literal": "current",
+      "owner_cluster": "BL-8",
+      "note": "DriverConfig default. The root of CHECKER-B08 / CH-F9: the sole checker's identity is an alias plus a word, and WRAPPER_VERSION is not part of the gate identity either.",
+      "remedy": "Same as author_version, plus stamp the Codex CLI version/digest into the leg-config event and assert it at leg start, so a CLI upgrade becomes a leg-boundary act. driver_contracts.py is BL-8's owner file."
+    },
+    {
+      "path": "menagerie/crawler/tools/rebuild_views.py",
+      "symbol": "author_version",
+      "literal": "current",
+      "owner_cluster": "CH-10",
+      "note": "Hardcoded beside author_model='claude-sonnet' and checker_model='codex' -- the 'rebuild_views wrong authority' charter row. The tool rebuilds views under an authority no campaign ever ran under.",
+      "remedy": "Derive the authority context from the campaign binding for the intake snapshot being rebuilt (cli._snapshot_driver_config already does exactly this), so the tool cannot assert an authority that never existed."
+    },
+    {
+      "path": "menagerie/crawler/tools/rebuild_views.py",
+      "symbol": "checker_version",
+      "literal": "current",
+      "owner_cluster": "CH-10",
+      "note": "Same site as above; listed separately because the census keys on the exact symbol.",
+      "remedy": "Same as the author_version row: resolve the real binding instead of hardcoding one."
+    }
+  ]
+}

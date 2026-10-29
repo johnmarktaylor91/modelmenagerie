@@ -1,0 +1,41 @@
+---
+import ModelPage from "@/components/ModelPage.astro";
+import BaseLayout from "@/layouts/BaseLayout.astro";
+import { fixtureModelPages, fixturePagesEnabled, realNeighbours } from "@/fixtures/records";
+import { getAdjacentModels, getModelBySlug, listModelSlugs, type ModelRecord } from "@/lib/catalog";
+import { familyHref, familyRelatives, getFamilyOf, sameShapeModels, type Family } from "@/lib/families";
+import { formatNumber } from "@/lib/labels";
+import { modelSeo } from "@/lib/seo";
+
+interface FixtureProps {
+  fixture?: { model: ModelRecord; family: Family | null };
+}
+
+export function getStaticPaths() {
+  const real = listModelSlugs().map((slug) => ({ params: { slug }, props: {} }));
+  // Fixture records (all-empty, full, structure-only, preview backend) only in fixture builds.
+  const fixtures = fixturePagesEnabled() ? fixtureModelPages().map((fixture) => ({ params: { slug: fixture.model.slug }, props: { fixture } })) : [];
+  return [...real, ...fixtures];
+}
+
+const { fixture } = Astro.props as FixtureProps;
+const model = fixture?.model ?? getModelBySlug(Astro.params.slug ?? "");
+const { prev, next } = fixture ? { prev: fixture.family ? realNeighbours(1)[0] : null, next: null } : getAdjacentModels(model.slug);
+// A family of one only repeats the model's name, so it is not shown.
+const ownFamily = fixture ? fixture.family : getFamilyOf(model);
+const family = ownFamily && ownFamily.members.length > 1 ? ownFamily : null;
+const familyMembers = familyRelatives(model, family);
+const sameShape = fixture ? (fixture.family ? realNeighbours(3) : []) : sameShapeModels(model);
+const description = `Architecture diagram of ${model.display_name}, traced with TorchLens${model.n_ops !== null ? `: ${formatNumber(model.n_ops)} operations` : ""}.`;
+---
+
+<BaseLayout title={model.display_name} description={description} noindex={Boolean(fixture)} {...modelSeo(model)}>
+  <ModelPage
+    model={model}
+    family={family ? { name: family.name, href: familyHref(family), size: family.members.length } : null}
+    familyMembers={familyMembers}
+    sameShape={sameShape}
+    prev={prev}
+    next={next}
+  />
+</BaseLayout>

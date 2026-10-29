@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://torchlens.org/schemas/menagerie/crawler/author-result-v4.schema.json",
+  "title": "Menagerie crawler typed author result v4",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "result_id", "result_sha256", "kind", "stable_id", "work_id",
+    "campaign_id", "created_at", "author_identity", "prompt_identity",
+    "dispatcher_identity", "source_manifest_identity", "intake_snapshot_id",
+    "intake_snapshot_sha256", "intake_item_sha256", "payload"
+  ],
+  "properties": {
+    "schema_version": {"const": "menagerie.crawler.author-result.v4", "description": "Current typed author-result discriminator."},
+    "result_id": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Immutable typed result identity."},
+    "result_sha256": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Digest of the complete typed result."},
+    "kind": {"enum": ["PROPOSED", "DEFER_RECOMMENDATION", "SKIP_RECOMMENDATION", "BLOCKED"], "description": "Closed advisory result arm."},
+    "stable_id": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Trusted stable model identity."},
+    "work_id": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Exact work-generation identity."},
+    "campaign_id": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Exact author campaign identity."},
+    "created_at": {"$ref": "author-result-v3.schema.json#/$defs/timestamp", "description": "UTC result creation timestamp."},
+    "author_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact author model identity."},
+    "prompt_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact frozen prompt identity."},
+    "dispatcher_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact dispatcher closure identity."},
+    "source_manifest_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact frozen source-manifest identity."},
+    "intake_snapshot_id": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Exact intake snapshot identity."},
+    "intake_snapshot_sha256": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Digest of the active intake snapshot."},
+    "intake_item_sha256": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Digest of the trusted intake item."},
+    "payload": {
+      "oneOf": [
+        {"$ref": "author-result-v3.schema.json#/$defs/proposed_payload"},
+        {"$ref": "#/$defs/defer_payload"},
+        {"$ref": "#/$defs/skip_payload"},
+        {"$ref": "#/$defs/blocked_payload"}
+      ],
+      "description": "Closed arm-specific result payload."
+    }
+  },
+  "$defs": {
+    "evidence_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_id", "source_id", "locator", "text", "supports"],
+      "description": "One literal excerpt the author read and can quote. Every field here is something a reading agent produces directly; no digest is asked for, because the author has no hashing primitive and the machine re-derives the excerpt from the frozen source bytes anyway. Declaring an identity here is a parse rejection, not a remembered rule.",
+      "properties": {
+        "evidence_id": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Author correlation label; must match one entry of evidence_ids."},
+        "source_id": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Frozen manifest source the excerpt was read out of."},
+        "locator": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Where the excerpt sits in that source; a bytes:start-end locator receives strict byte-range checking."},
+        "text": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Verbatim excerpt text, matched byte-for-byte against the frozen source before it is ever presented as evidence."},
+        "supports": {"$ref": "author-result-v3.schema.json#/$defs/string_array", "description": "Claims this excerpt is offered in support of. Matched against the closed gated-claim vocabulary (author-proposal-v3.schema.json#/$defs/gated_claim_category) by EXACT string equality: a leaf path does not satisfy its aggregate, and a cross-block spelling satisfies nothing. Extra finer-grained entries are permitted and never penalized."},
+        "family_level": {"type": "boolean", "description": "Whether the excerpt is about the architecture family rather than this one model."},
+        "disposition": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Author's reading of what the excerpt establishes."}
+      }
+    },
+    "license_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_id", "locator", "text"],
+      "description": "The license text the author actually read at a frozen source. Grounded by the same dereference as an evidence record. It never becomes license_identity: that identity stays machine-derived.",
+      "properties": {
+        "source_id": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Frozen manifest source the license text was read out of."},
+        "locator": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Where the license text sits in that source."},
+        "text": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Verbatim license text, matched byte-for-byte against the frozen source."},
+        "declared_license": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "License the author reads that text as declaring, or NOASSERTION."}
+      }
+    },
+    "evidence_records": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evidence_record"},
+      "description": "Declared home for the excerpts the recommendation cites. Absence is a named gap in the checker envelope, never a silent claim of grounding. Resolution is PER RECORD, not all-or-nothing: every id in evidence_ids is re-derived independently, and a record whose text matches the frozen source named by its source_id byte-for-byte is shown to the checker while one that does not -- no record, a source_id outside the REQUEST envelope's source_manifest, or text absent from the frozen bytes -- is named in unresolved_evidence_ids and shown to nobody. The two sets partition evidence_ids exactly, so an unverified record can never be presented as verified: an unverified row is never presented as evidence, under any resolution. Two floors remain absolute: if NO record verifies, or no verified record's supports names the terminal arm's own predicate, the whole pack is unresolved and the arm terminalizes as disposition-unverifiable -- so ground the predicate-bearing excerpt above all. A pack in which some ids ground and some do not resolves partially-grounded, NOT grounded, and the checker is handed the gap list beside the excerpts; only a pack in which every id grounds resolves grounded. Citing a record you can ground is therefore never worse than omitting it, and citing one you cannot never launders itself by sitting beside records that did. A fact read anywhere the broker never froze -- a publisher-gated page, a metadata API response the broker did not freeze -- has no groundable source_id, will be named as a gap, and belongs in findings rather than here."
+    },
+    "handoff_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "proposal", "proposal_sha256", "code_manifest_identity",
+        "source_manifest_identity", "handoff_sha256"
+      ],
+      "properties": {
+        "proposal": {
+          "$ref": "author-proposal-v3.schema.json",
+          "description": "Complete executable proposal retained separately from the terminal arm."
+        },
+        "proposal_sha256": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Digest of the complete handoff proposal."},
+        "code_manifest_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Digest of the proposal code manifest."},
+        "source_manifest_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact terminal source-manifest identity."},
+        "handoff_sha256": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Digest of all preceding handoff fields."}
+      }
+    },
+    "defer_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "arm", "platform", "source_ids", "evidence_ids", "evidence_identity",
+        "license_identity", "handoff_execution", "recommendation_sha256"
+      ],
+      "properties": {
+        "arm": {"const": "DEFER_RECOMMENDATION", "description": "Platform-deferral arm discriminator."},
+        "platform": {"enum": ["cuda", "x86"], "description": "Closed target platform capability."},
+        "source_ids": {"$ref": "author-result-v3.schema.json#/$defs/string_array", "description": "Exact supporting source identities."},
+        "evidence_ids": {"$ref": "author-result-v3.schema.json#/$defs/string_array", "description": "Exact supporting evidence identities. Resolution is per record: an id with a matching, re-derivable evidence_records entry is grounded and shown to the checker; one without is named as a gap in unresolved_evidence_ids, shown to nobody, and drops the pack from grounded to partially-grounded. Ground everything you cite, and cite everything that supports the arm -- above all the record supporting the arm's own predicate. See evidence_records."},
+        "evidence_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact evidence-pack identity."},
+        "license_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact license disposition identity."},
+        "handoff_execution": {"$ref": "#/$defs/handoff_execution", "description": "Separately authenticated executable handoff authority."},
+        "evidence_records": {"$ref": "#/$defs/evidence_records", "description": "Declared literal excerpts for the cited evidence IDs."},
+        "license_record": {"$ref": "#/$defs/license_record", "description": "Declared literal license text read at a frozen source."},
+        "recommendation_sha256": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Digest of the complete recommendation payload."}
+      }
+    },
+    "skip_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "arm", "status_code", "source_ids", "evidence_ids", "evidence_identity",
+        "search_report_identity", "license_identity", "recommendation_sha256"
+      ],
+      "properties": {
+        "arm": {"const": "SKIP_RECOMMENDATION", "description": "Epistemic skip recommendation arm discriminator."},
+        "status_code": {
+          "enum": [
+            "skipped:insufficient-description",
+            "skipped:no-description",
+            "skipped:not-a-real-NN"
+          ],
+          "description": "Closed R5 status recommendation."
+        },
+        "source_ids": {"$ref": "author-result-v3.schema.json#/$defs/string_array", "description": "Hash-bound candidate source identities."},
+        "evidence_ids": {"$ref": "author-result-v3.schema.json#/$defs/string_array", "description": "Hash-bound candidate evidence excerpts. Resolution is per record: an id with a matching, re-derivable evidence_records entry is grounded and shown to the checker; one without is named as a gap in unresolved_evidence_ids, shown to nobody, and drops the pack from grounded to partially-grounded. Ground everything you cite, and cite everything that supports the arm -- above all the record supporting the arm's own predicate. See evidence_records."},
+        "evidence_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact candidate evidence-pack identity."},
+        "search_report_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact bounded search-report identity."},
+        "license_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact proposed license disposition identity."},
+        "evidence_records": {"$ref": "#/$defs/evidence_records", "description": "Declared literal excerpts for the cited evidence IDs."},
+        "license_record": {"$ref": "#/$defs/license_record", "description": "Declared literal license text read at a frozen source."},
+        "recommendation_sha256": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Digest of the closed recommendation payload."}
+      }
+    },
+    "blocked_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "arm", "stage", "reason_code", "prerequisite_ids", "evidence_ids",
+        "evidence_identity", "license_identity", "recommendation_sha256"
+      ],
+      "properties": {
+        "arm": {"const": "BLOCKED", "description": "Blocked-prerequisite recommendation arm discriminator."},
+        "stage": {
+          "enum": ["source", "fetch", "author", "evidence", "environment", "policy", "runner"],
+          "description": "Closed recommended blocking stage."
+        },
+        "reason_code": {"$ref": "author-result-v3.schema.json#/$defs/nonempty_string", "description": "Typed recommended root reason code. A prerequisite reason is adjudicated by the terminal checker against frozen source bytes, so it must name something a frozen source can witness. Effort and budget outcomes are different in kind: spell wall-clock exhaustion exactly 'wall-exceeded' (reserved with 'budget-exhausted', 'effort-cap-exhausted', and the 'effort-exhausted:*' family), which the engine refuses as a prerequisite claim and records instead as failed:<stage> with a stage-valid effort reason -- a requeueable terminal that no checker adjudicates. Any free-form exhaustion spelling parses as a prerequisite claim that no frozen source can support and terminalizes rejected."},
+        "prerequisite_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
+          "description": "Stable semantic IDs for missing external facts or capabilities; schema paths and output-field names are forbidden."
+        },
+        "evidence_ids": {"$ref": "author-result-v3.schema.json#/$defs/string_array", "description": "Hash-bound candidate evidence excerpts. Resolution is per record: an id with a matching, re-derivable evidence_records entry is grounded and shown to the checker; one without is named as a gap in unresolved_evidence_ids, shown to nobody, and drops the pack from grounded to partially-grounded. Ground everything you cite, and cite everything that supports the arm -- above all the record supporting the arm's own predicate. See evidence_records."},
+        "evidence_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact candidate evidence-pack identity."},
+        "license_identity": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Exact proposed license disposition identity."},
+        "evidence_records": {"$ref": "#/$defs/evidence_records", "description": "Declared literal excerpts for the cited evidence IDs."},
+        "license_record": {"$ref": "#/$defs/license_record", "description": "Declared literal license text read at a frozen source."},
+        "research_summary": {"$ref": "author-result-v3.schema.json#/$defs/research_summary", "description": "Bounded stage-1 research retained for a higher-tier promotion."},
+        "recommendation_sha256": {"$ref": "author-result-v3.schema.json#/$defs/hash", "description": "Digest of the closed recommendation payload."}
+      }
+    }
+  },
+  "x-authority-ownership-base": "menagerie.crawler.author-result.v3",
+  "x-authority-ownership-prefix-copies": {
+    "$.payload.proposal": "$.payload.handoff_execution.proposal"
+  },
+  "x-authority-ownership": {
+    "$.payload.evidence_identity": "reducer-derived",
+    "$.payload.evidence_records[].disposition": "author-gated",
+    "$.payload.evidence_records[].evidence_id": "author-gated",
+    "$.payload.evidence_records[].family_level": "author-gated",
+    "$.payload.evidence_records[].locator": "author-gated",
+    "$.payload.evidence_records[].source_id": "author-gated",
+    "$.payload.evidence_records[].supports[]": "author-gated",
+    "$.payload.evidence_records[].text": "author-gated",
+    "$.payload.license_record.declared_license": "author-gated",
+    "$.payload.license_record.locator": "author-gated",
+    "$.payload.license_record.source_id": "author-gated",
+    "$.payload.license_record.text": "author-gated",
+    "$.payload.handoff_execution.code_manifest_identity": "reducer-derived",
+    "$.payload.handoff_execution.handoff_sha256": "reducer-derived",
+    "$.payload.handoff_execution.proposal_sha256": "reducer-derived",
+    "$.payload.handoff_execution.source_manifest_identity": "reducer-derived",
+    "$.payload.license_identity": "reducer-derived",
+    "$.payload.recommendation_sha256": "reducer-derived",
+    "$.payload.search_report_identity": "reducer-derived"
+  }
+}

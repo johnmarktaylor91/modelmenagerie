@@ -1,0 +1,1 @@
+{"schema":"sweep/1","sweep":"S-A-younger","kind":"prior-art-diff","started":"2026-06-18","method":"menagerie/data/crawl_history.json","axes":{"prior-art/younger":{"state":"drained","frontier":"2026-06-18"}},"ended":"2026-06-18","admitted":0,"rejected":0,"note":"Younger (arXiv 2406.15132) diffed by name and alias: zero new named families"}

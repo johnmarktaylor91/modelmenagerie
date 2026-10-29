@@ -1,0 +1,70 @@
+---
+interface Props {
+  code: string;
+  /** Accessible name for the copy button, e.g. "Copy install command". */
+  label?: string;
+  /** Accessible name for the code block, unique on the page, e.g. "Install command". */
+  name?: string;
+}
+
+const { code, label = "Copy code", name = "Code" } = Astro.props;
+---
+
+<div class="copy-code">
+  <pre class="copy-code__pre" tabindex="0" role="region" aria-label={name}><code class="mono">{code}</code></pre>
+  <button class="button copy-code__button" type="button" data-copy={code} aria-label={label}>Copy</button>
+  <span class="sr-only" role="status" aria-live="polite" data-copy-status></span>
+</div>
+
+<script>
+  /** Copy to the clipboard; when that is refused, select the text so the visitor can copy it. */
+  async function copyFrom(button: HTMLButtonElement): Promise<void> {
+    const box = button.closest(".copy-code");
+    const status = box?.querySelector<HTMLElement>("[data-copy-status]");
+    const code = box?.querySelector("code");
+    try {
+      await navigator.clipboard.writeText(button.dataset.copy ?? "");
+      button.textContent = "Copied";
+      if (status) status.textContent = "Copied to clipboard";
+    } catch {
+      if (code) window.getSelection()?.selectAllChildren(code);
+      button.textContent = "Selected";
+      if (status) status.textContent = "Copying was blocked; the code is selected, press Ctrl+C or Cmd+C";
+    }
+    window.setTimeout(() => {
+      button.textContent = "Copy";
+    }, 1600);
+  }
+
+  document.querySelectorAll<HTMLButtonElement>(".copy-code__button").forEach((button) => {
+    button.addEventListener("click", () => void copyFrom(button));
+  });
+</script>
+
+<style>
+  .copy-code {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 0.75rem;
+    min-width: 0;
+    padding: 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--surface) 90%, transparent);
+  }
+
+  .copy-code__pre {
+    flex: 1 1 14rem;
+    min-width: 0;
+    margin: 0;
+    overflow-x: auto;
+    font-size: 0.875rem;
+    line-height: 1.6;
+    white-space: pre;
+  }
+
+  .copy-code__button {
+    flex: none;
+  }
+</style>

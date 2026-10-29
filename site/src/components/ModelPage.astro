@@ -1,0 +1,565 @@
+---
+/**
+ * The model page body: name and task, the diagram, the facts, what the model is (when a summary
+ * exists), files, details and related models. Used by /models/<slug>/ and the fixture pages,
+ * so a full record and an all-empty one both render through the same markup.
+ */
+import DiagramViewer from "@/components/DiagramViewer.astro";
+import ModelCard from "@/components/ModelCard.astro";
+import { findDefaultVariant, type ModelRecord } from "@/lib/catalog";
+import { categoryLabel, formatNumber, isPresent } from "@/lib/labels";
+import { renderSummaryMarkdown } from "@/lib/markdown";
+import { modelDetails, modelFacts, modelFiles, validationTag } from "@/lib/modelFacts";
+
+interface Props {
+  model: ModelRecord;
+  /** The model's family, with where it is shown and its size. */
+  family: { name: string; href: string; size: number } | null;
+  familyMembers: ModelRecord[];
+  sameShape: ModelRecord[];
+  prev: ModelRecord | null;
+  next: ModelRecord | null;
+}
+
+/** The one-line label shown with every AI-written summary (site plan fork 3, JMT 2026-10-10). */
+const SUMMARY_LABEL = "Summary written from the paper by an AI assistant and checked against it; corrections welcome.";
+
+const { model, family, familyMembers, sameShape, prev, next } = Astro.props;
+const variant = findDefaultVariant(model);
+const category = categoryLabel(model.category);
+const tag = validationTag(model);
+const facts = modelFacts(model, family);
+const files = modelFiles(model, variant);
+const details = modelDetails(model, variant);
+const pdfInSomeVariant = model.variants.some((candidate) => candidate.pdf !== null);
+const summaryHtml = renderSummaryMarkdown(model.summary_markdown);
+const tagline = isPresent(model.tagline) ? model.tagline : null;
+const keyContribution = isPresent(model.key_contribution) ? model.key_contribution : null;
+const keywords = (model.keywords ?? []).filter(isPresent);
+const hasSummary = Boolean(summaryHtml || tagline || keyContribution);
+const structureOnly = model.capture === "structure_only" || model.validation_state === "structure_only";
+const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} operations` : null].filter(Boolean).join(" · ");
+---
+
+<section class="shell model-page py-8">
+  <header class="model-head">
+    <a href="/models/" class="model-back" data-listing-back>All models</a>
+    <h1 class="model-title">{model.display_name}</h1>
+    <p class="model-summary">
+      {lede}
+      {tag && <span class:list={["chip", { "model-verified": !structureOnly }]}>{tag}</span>}
+    </p>
+  </header>
+
+  {
+    structureOnly && (
+      <p class="panel model-banner" role="note">
+        Structure-only capture: TorchLens recorded this graph without running real numbers through the model, so shapes and data
+        types on the diagram are hypotheses, not measurements.
+      </p>
+    )
+  }
+
+  <div class="model-layout">
+    {
+      variant ? (
+        <div class="model-viewer">
+          <DiagramViewer model={model} />
+        </div>
+      ) : (
+        <section class="panel model-viewer model-missing" aria-labelledby="model-missing-title">
+          <h2 id="model-missing-title">No diagram yet</h2>
+          <p>
+            This model has not been drawn yet. The diagram appears here once it has been traced{facts.length > 0 ? "; its facts are below." : "."}
+          </p>
+        </section>
+      )
+    }
+
+    {
+      facts.length > 0 && (
+        <section class="panel model-box model-facts-box" aria-labelledby="model-facts-title">
+          <h2 id="model-facts-title">At a glance</h2>
+          <dl class="model-facts">
+            {facts.map((fact) => (
+              <div>
+                <dt>{fact.label}</dt>
+                <dd title={fact.title}>
+                  {fact.href ? (
+                    <a class="textlink" href={fact.href} rel={fact.href.startsWith("http") ? "noopener" : undefined}>
+                      {fact.value}
+                    </a>
+                  ) : (
+                    fact.value
+                  )}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </section>
+      )
+    }
+
+    {
+      files.length > 0 && (
+        <section class="panel model-box model-files-box" aria-labelledby="model-files-title">
+          <h2 id="model-files-title">Files</h2>
+          <ul class="model-files">
+            {files.map((file) => (
+              <li>
+                <span>
+                  {file.label}
+                  {file.note && <span class="model-size">, {file.note}</span>}{" "}
+                  <span class="model-size" data-asset-size={file.asset}>
+                    {file.size}
+                  </span>
+                </span>
+                <span class="model-file-actions">
+                  <a class="button" href={file.href} data-asset={file.asset} target="_blank" rel="noopener">
+                    Open
+                  </a>
+                  {file.asset === "svg" && (
+                    <a class="button" href={file.href} data-asset="svg-save" download={file.saveAs}>
+                      Save
+                    </a>
+                  )}
+                </span>
+              </li>
+            ))}
+            {variant && !variant.pdf && pdfInSomeVariant && (
+              <li data-asset-group="pdf" hidden>
+                <span>
+                  Diagram, PDF <span class="model-size" data-asset-size="pdf" />
+                </span>
+                <span class="model-file-actions">
+                  <a class="button" href="" data-asset="pdf" target="_blank" rel="noopener">
+                    Open
+                  </a>
+                </span>
+              </li>
+            )}
+          </ul>
+          <p class="model-note" data-save-note hidden>
+            The file opened in a new tab. Use your browser's Save command there to keep it.
+          </p>
+          {variant && <p class="model-note">The diagram is a drawing of a TorchLens trace of the source code. It contains no code or weights.</p>}
+        </section>
+      )
+    }
+
+    {
+      details.length > 0 && (
+        <details class="panel model-box model-details">
+          <summary>Details</summary>
+          <dl>
+            {details.map((item) => (
+              <div>
+                <dt>{item.label}</dt>
+                <dd class="mono">{item.value}</dd>
+              </div>
+            ))}
+          </dl>
+          {isPresent(model.recipe_text) && (
+            <>
+              <p class="model-details-heading">How this diagram was made</p>
+              <pre class="model-recipe mono" tabindex="0" aria-label="How this diagram was made">{model.recipe_text}</pre>
+            </>
+          )}
+        </details>
+      )
+    }
+
+    {
+      hasSummary && (
+        <section class="model-about" aria-labelledby="model-about-title">
+          <h2 id="model-about-title">What it is</h2>
+          {tagline && <p class="model-tagline">{tagline}</p>}
+          {summaryHtml && <div class="model-prose" set:html={summaryHtml} />}
+          {keyContribution && (
+            <p class="model-key">
+              <strong>Key idea.</strong> {keyContribution}
+            </p>
+          )}
+          {keywords.length > 0 && (
+            <ul class="model-keywords" aria-label="Keywords">
+              {keywords.map((keyword) => (
+                <li class="chip">{keyword}</li>
+              ))}
+            </ul>
+          )}
+          <p class="model-ai-label">{SUMMARY_LABEL}</p>
+        </section>
+      )
+    }
+
+    {
+      (familyMembers.length > 0 || sameShape.length > 0 || prev || next) && (
+        <section class="model-related" aria-labelledby="model-related-title">
+          <h2 id="model-related-title">Related models</h2>
+          {family && familyMembers.length > 0 && (
+            <div class="model-related-group">
+              <div class="model-related-head">
+                <h3>In the {family.name} family</h3>
+                {family.size > familyMembers.length + 1 && (
+                  <a class="textlink" href={family.href}>
+                    All {formatNumber(family.size)} in the family
+                  </a>
+                )}
+              </div>
+              <div class="model-related-grid">
+                {familyMembers.map((member) => (
+                  <ModelCard model={member} headingLevel={3} />
+                ))}
+              </div>
+            </div>
+          )}
+          {sameShape.length > 0 && (
+            <div class="model-related-group">
+              <div class="model-related-head">
+                <h3>Same graph shape</h3>
+              </div>
+              <div class="model-related-grid">
+                {sameShape.map((other) => (
+                  <ModelCard model={other} headingLevel={3} />
+                ))}
+              </div>
+            </div>
+          )}
+          {(prev || next) && (
+            <nav class="model-neighbours" aria-label={`More in ${category}`}>
+              <p>More in {category}</p>
+              {prev && (
+                <a class="button" href={`/models/${prev.slug}/`} rel="prev">
+                  <span>Previous</span>
+                  {prev.display_name}
+                </a>
+              )}
+              {next && (
+                <a class="button" href={`/models/${next.slug}/`} rel="next">
+                  <span>Next</span>
+                  {next.display_name}
+                </a>
+              )}
+            </nav>
+          )}
+        </section>
+      )
+    }
+  </div>
+</section>
+
+<script>
+  import { restoreBackLinks } from "@/scripts/ListingReturn";
+
+  restoreBackLinks();
+</script>
+
+<style>
+  .model-page {
+    min-width: 0;
+  }
+
+  .model-head {
+    margin-bottom: 1.25rem;
+    min-width: 0;
+  }
+
+  .model-back,
+  .model-summary,
+  .model-size,
+  .model-note,
+  .model-facts dt,
+  .model-details dt,
+  .model-neighbours p,
+  .model-neighbours span,
+  .model-ai-label,
+  .model-details-heading {
+    color: var(--secondary);
+  }
+
+  .model-back {
+    font-size: 0.875rem;
+  }
+
+  .model-title {
+    margin: 0.4rem 0 0;
+    font-size: clamp(1.6rem, 4.5vw, 2.25rem);
+    font-weight: 600;
+    line-height: 1.15;
+    overflow-wrap: anywhere;
+  }
+
+  .model-summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.4rem 0 0;
+  }
+
+  .model-verified {
+    border-color: var(--verified);
+    color: var(--verified);
+  }
+
+  .model-banner {
+    margin: 0 0 1.25rem;
+    padding: 0.75rem 1rem;
+    border-left: 3px solid var(--text);
+    font-size: 0.9rem;
+  }
+
+  /*
+   * One column on phones and tablets, in reading order: diagram, facts, files, details, summary,
+   * related. Wide screens put facts, files and details beside the diagram; the empty last row
+   * track takes the diagram's extra height so the side panels stay packed at the top.
+   */
+  .model-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1.25rem;
+  }
+
+  @media (min-width: 1280px) {
+    .model-layout {
+      grid-template-columns: minmax(0, 1fr) 320px;
+      grid-template-rows: auto auto auto 1fr;
+      align-items: start;
+    }
+
+    .model-viewer {
+      grid-column: 1;
+      grid-row: 1 / span 4;
+    }
+
+    .model-facts-box,
+    .model-files-box,
+    .model-details {
+      grid-column: 2;
+    }
+
+    .model-about,
+    .model-related {
+      grid-column: 1 / -1;
+    }
+
+    .model-about {
+      max-width: 46rem;
+    }
+  }
+
+  @media (min-width: 720px) and (max-width: 1279px) {
+    .model-layout {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .model-viewer,
+    .model-about,
+    .model-related,
+    .model-details {
+      grid-column: 1 / -1;
+    }
+  }
+
+  .model-missing {
+    padding: 2rem 1.25rem;
+    text-align: center;
+  }
+
+  .model-missing h2 {
+    margin: 0 0 0.5rem;
+    font-size: 1.15rem;
+  }
+
+  .model-missing p {
+    margin: 0 auto;
+    max-width: 32rem;
+    color: var(--secondary);
+  }
+
+  .model-box {
+    min-width: 0;
+    padding: 1rem;
+    font-size: 0.875rem;
+  }
+
+  .model-box h2 {
+    margin: 0 0 0.75rem;
+    font-size: 1rem;
+    font-weight: 600;
+  }
+
+  .model-facts,
+  .model-details dl {
+    display: grid;
+    gap: 0.55rem;
+    margin: 0;
+  }
+
+  .model-facts div {
+    display: grid;
+    grid-template-columns: 6.5rem minmax(0, 1fr);
+    gap: 0.75rem;
+  }
+
+  .model-facts dd,
+  .model-details dd {
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .model-details div {
+    display: grid;
+    gap: 0.15rem;
+  }
+
+  .model-details dd {
+    font-size: 0.78rem;
+    user-select: all;
+  }
+
+  .model-details summary {
+    min-height: 1.5rem;
+    cursor: pointer;
+    font-weight: 600;
+  }
+
+  .model-details[open] summary {
+    margin-bottom: 0.75rem;
+  }
+
+  .model-details-heading {
+    margin: 1rem 0 0.35rem;
+    font-size: 0.8rem;
+  }
+
+  .model-files {
+    display: grid;
+    gap: 0.6rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .model-files li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+
+  .model-files li[hidden] {
+    display: none;
+  }
+
+  .model-file-actions {
+    display: flex;
+    gap: 0.4rem;
+  }
+
+  .model-note {
+    margin: 0.75rem 0 0;
+    font-size: 0.8rem;
+  }
+
+  .model-note[hidden] {
+    display: none;
+  }
+
+  .model-recipe {
+    margin: 0;
+    overflow-x: auto;
+    white-space: pre;
+    font-size: 0.78rem;
+  }
+
+  .model-about h2,
+  .model-related h2 {
+    margin: 0.5rem 0 0.75rem;
+    font-size: 1.35rem;
+  }
+
+  .model-tagline {
+    margin: 0 0 0.75rem;
+    font-size: 1.05rem;
+  }
+
+  .model-prose :global(p),
+  .model-prose :global(ul) {
+    margin: 0 0 0.75rem;
+    line-height: 1.6;
+  }
+
+  .model-key {
+    margin: 0 0 0.75rem;
+  }
+
+  .model-keywords {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin: 0 0 0.75rem;
+    padding: 0;
+    list-style: none;
+  }
+
+  .model-ai-label {
+    margin: 0;
+    font-size: 0.8rem;
+  }
+
+  .model-related-group {
+    margin-bottom: 1.5rem;
+  }
+
+  .model-related-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem 1rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .model-related-head h3 {
+    margin: 0;
+    font-family: var(--font-body);
+    font-size: 1rem;
+    font-weight: 600;
+  }
+
+  .model-related-grid {
+    display: grid;
+    align-items: start;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 13rem), 1fr));
+    gap: 0.75rem;
+  }
+
+  .model-neighbours {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
+    gap: 0.5rem;
+    min-width: 0;
+  }
+
+  .model-neighbours p {
+    grid-column: 1 / -1;
+    margin: 0;
+    font-size: 0.8rem;
+  }
+
+  .model-neighbours .button {
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    text-align: left;
+  }
+
+  .model-neighbours span {
+    font-size: 0.75rem;
+    font-weight: 400;
+  }
+</style>

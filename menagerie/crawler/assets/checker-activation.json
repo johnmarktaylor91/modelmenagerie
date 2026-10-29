@@ -1,0 +1,77 @@
+{
+  "activations": [
+    {
+      "activated_at": "2026-09-01",
+      "arms": [
+        "B",
+        "C"
+      ],
+      "checker_model": "claude-fable-5-1",
+      "checker_prompt_identity": "sha256:a19c07d62f350aac9ec4fea5495304b47e89d63fd9e3aa8c2b4fb72c6d8d7557",
+      "cli": "claude 2.1.257 --bare --setting-sources project --json-schema",
+      "distinct_envelopes": 15,
+      "draws": 15,
+      "gate_kind": "metadata_batch",
+      "goldens": [
+        "metadata_accept",
+        "metadata_accept_lineage_grounded",
+        "metadata_component_drift",
+        "metadata_refusal",
+        "metadata_rung_adverse"
+      ],
+      "model_witnessed": 15,
+      "note": "arm B 12 draws over 4 goldens + arm C 3 draws over the disclosed-drift variant of metadata_rung_adverse; the recorded metadata_rung_adverse pack refuses pre-spend under the digest attestation on both seats",
+      "provider": "anthropic",
+      "ruling": "SEAT_RULING.md (JMT 2026-09-01, measurement-gated seat)",
+      "sessions_ok": 15,
+      "source": "torchlens-200b-seaworthy-2026-08-23 sprint, f51-audit/checker-bench (journal.jsonl, bench-summary.json, runs/B, runs/C; SEAT_RULING.md)"
+    },
+    {
+      "activated_at": "2026-09-01",
+      "arms": [
+        "B"
+      ],
+      "checker_model": "claude-fable-5-1",
+      "checker_prompt_identity": "sha256:a19c07d62f350aac9ec4fea5495304b47e89d63fd9e3aa8c2b4fb72c6d8d7557",
+      "cli": "claude 2.1.257 --bare --setting-sources project --json-schema",
+      "distinct_envelopes": 6,
+      "draws": 6,
+      "gate_kind": "fidelity",
+      "goldens": [
+        "fidelity_accept",
+        "fidelity_refusal"
+      ],
+      "model_witnessed": 6,
+      "note": "",
+      "provider": "anthropic",
+      "ruling": "SEAT_RULING.md (JMT 2026-09-01, measurement-gated seat)",
+      "sessions_ok": 6,
+      "source": "torchlens-200b-seaworthy-2026-08-23 sprint, f51-audit/checker-bench (journal.jsonl, bench-summary.json, runs/B, runs/C; SEAT_RULING.md)"
+    },
+    {
+      "activated_at": "2026-09-01",
+      "arms": [
+        "B"
+      ],
+      "checker_model": "claude-fable-5-1",
+      "checker_prompt_identity": "sha256:a19c07d62f350aac9ec4fea5495304b47e89d63fd9e3aa8c2b4fb72c6d8d7557",
+      "cli": "claude 2.1.257 --bare --setting-sources project --json-schema",
+      "distinct_envelopes": 9,
+      "draws": 9,
+      "gate_kind": "terminal_disposition",
+      "goldens": [
+        "terminal_accept",
+        "terminal_disputed",
+        "terminal_refusal"
+      ],
+      "model_witnessed": 9,
+      "note": "",
+      "provider": "anthropic",
+      "ruling": "SEAT_RULING.md (JMT 2026-09-01, measurement-gated seat)",
+      "sessions_ok": 9,
+      "source": "torchlens-200b-seaworthy-2026-08-23 sprint, f51-audit/checker-bench (journal.jsonl, bench-summary.json, runs/B, runs/C; SEAT_RULING.md)"
+    }
+  ],
+  "comment": "Activation matrix once per new (checker model, gate kind) -- overhaul RULING B.2 checker row, replacing the per-epoch calibration receipt re-mint. Each row is the tl-checkerbench arm-B (and arm-C) Fable draws over the frozen live-epoch golden packs sealed by this tree's production envelope builders, model-witnessed via the harness modelUsage block on every session. Acceptance-bit agreement with the recorded adjudications: 23 of 27 arm-B draws, identical goldens to sol; 0 digest disputes, 0 locator disputes. Thereafter the production K=2 conflict census per (kind, model, epoch) takes over.",
+  "schema_version": "menagerie.crawler.checker-activation.v1"
+}

@@ -1,0 +1,22 @@
+---
+import FamilyPage from "@/components/FamilyPage.astro";
+import BaseLayout from "@/layouts/BaseLayout.astro";
+import { emptyFamily, fixtureFamily, fixturePagesEnabled } from "@/fixtures/records";
+import { listFamilyPages, type Family } from "@/lib/families";
+import { formatNumber } from "@/lib/labels";
+
+export function getStaticPaths() {
+  const real = listFamilyPages().map((family) => ({ params: { slug: family.slug }, props: { family, fixture: false } }));
+  const fixtures = fixturePagesEnabled()
+    ? [fixtureFamily(), emptyFamily()].map((family) => ({ params: { slug: family.slug }, props: { family, fixture: true } }))
+    : [];
+  return [...real, ...fixtures];
+}
+
+const { family, fixture } = Astro.props as { family: Family; fixture: boolean };
+const description = `${formatNumber(family.members.length)} models in the ${family.name} family, each with its architecture diagram traced with TorchLens.`;
+---
+
+<BaseLayout title={`${family.name} family`} description={description} noindex={fixture}>
+  <FamilyPage family={family} />
+</BaseLayout>

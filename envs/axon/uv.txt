@@ -1,0 +1,3 @@
+0.12.23 1cff8783850e794470aadb73f54b749542a511fc57b0ce6468b64bd3852e0ade
+# The static uv the cluster batches run (official x86_64-unknown-linux-musl release and its
+# published sha256): it needs no glibc, and its managed Python runs on the cluster glibc 2.17.

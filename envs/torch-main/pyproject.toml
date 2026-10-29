@@ -1,0 +1,47 @@
+# torch-main: Python 3.11, CPU torch 2.6 (one lock identity for the worker and the cluster),
+# TorchLens at the project pin, the library zoos the harvester covers at rung 0, and Menagerie's
+# own runtime dependencies, so both the pipeline worker and the June validator run in it
+# without installing anything. Built by `menagerie-pipeline envs build torch-main` from uv.lock.
+[project]
+name = "menagerie-env-torch-main"
+version = "0"
+requires-python = "==3.11.*"
+dependencies = [
+    "torch==2.6.*",
+    "torchvision==0.21.*",
+    "torchlens==2.36.0",
+    "timm==1.0.30",
+    "transformers",
+    "diffusers",
+    "segmentation-models-pytorch",
+    "ultralytics",
+    "einops",
+    "pillow",
+    # Menagerie's runtime dependencies (pyproject.toml), for the June validator and the runner.
+    "numpy",
+    "packaging",
+    "tqdm",
+    "psutil>=5.9",
+    "pydantic>=2.0",
+    "PyYAML>=6.0",
+    "jsonschema>=4.18",
+    "referencing>=0.28",
+    # The renderer's packages (render.EXTRAS). Declared non-trace roots
+    # (menagerie.pipeline.NON_TRACE_ROOTS): recipe revisions leave them out, renderer_rev has them.
+    "pyvips[binary]==3.2.0",
+    "pyvips-binary==8.18.7",
+]
+
+[tool.uv]
+package = false
+# Linux x86_64 only: the worker and the cluster; the CPU wheels have no macOS twin.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }

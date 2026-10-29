@@ -1,0 +1,12 @@
+{
+  "name": "model-menagerie-qa",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Site QA harness: crawl, axe, Lighthouse, overflow, copy and file-count checks (run.sh). Kept out of the site's own dependencies so the hosting build never installs it.",
+  "type": "module",
+  "dependencies": {
+    "axe-core": "4.14.0",
+    "lighthouse": "13.5.0",
+    "playwright-core": "1.64.0"
+  }
+}

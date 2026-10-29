@@ -1,0 +1,412 @@
+---
+import CopyCode from "@/components/CopyCode.astro";
+import BaseLayout from "@/layouts/BaseLayout.astro";
+import { getAllModels, getCatalogIndex, getDefaultVariant, getDiagramFocus } from "@/lib/catalog";
+import { getFeaturedModels, getHeroImage } from "@/lib/featured-select";
+import { categoryLabel, formatNumber, labelCategoryFacets } from "@/lib/labels";
+import { diagramAlt } from "@/lib/alt";
+import { cardImage } from "@/lib/preview";
+
+const models = getAllModels();
+const total = formatNumber(models.length);
+const hero = getHeroImage(models);
+/**
+ * A wide graph is drawn at twice the panel width around where its drawing starts (left, centre
+ * or right half, from its stored focus), so the panel shows nodes instead of a faint whole graph.
+ */
+function panelZoom(focus: number | null): string {
+  if (focus === null) {
+    return "";
+  }
+  return focus < 0.375 ? "home-panel__frame--zoom-left" : focus > 0.625 ? "home-panel__frame--zoom-right" : "home-panel__frame--zoom-centre";
+}
+
+const panels = getFeaturedModels(models, 6, hero ? [hero.model.slug] : []).map((model) => {
+  const variant = getDefaultVariant(model);
+  return { model, imageUrl: cardImage(variant).url, zoom: panelZoom(getDiagramFocus(variant)) };
+});
+const categories = labelCategoryFacets(getCatalogIndex().facets.categories);
+const README_URL = "https://github.com/johnmarktaylor91/torchlens#readme";
+// Matches the TorchLens README quickstart.
+const snippet = `import torchlens as tl
+
+log = tl.trace(model, x)
+log.draw()`;
+---
+
+<BaseLayout
+  title="TorchLens Model Menagerie"
+  description={`Architecture diagrams of ${total} neural networks, traced with TorchLens. Browse, zoom and download.`}
+>
+  <section class="shell home-hero">
+    <div class="home-hero__text">
+      <h1 class="home-hero__title">TorchLens Model Menagerie</h1>
+      <p class="home-hero__lede">
+        Architecture diagrams of {total} neural networks, each traced with TorchLens.
+        <a class="textlink" href="/about/#status">This is a preview; here is what has been checked so far.</a>
+      </p>
+      <div class="home-hero__actions">
+        <a class="button primary" href="/models/">Browse models</a>
+        <a class="button" href="/dataset/">Download the dataset</a>
+      </div>
+    </div>
+    {
+      hero && (
+        <figure class="home-hero__figure">
+          <a class:list={["home-hero__frame", `home-hero__frame--${hero.kind}`]} href={`/models/${hero.model.slug}/`}>
+            <img src={hero.url} alt={diagramAlt(hero.model.display_name, getDefaultVariant(hero.model))} fetchpriority="high" decoding="async" />
+          </a>
+          <figcaption class="home-hero__caption">
+            <a href={`/models/${hero.model.slug}/`}>{hero.model.display_name}</a>
+            <span>{categoryLabel(hero.model.category)}{hero.model.n_ops !== null && `, ${formatNumber(hero.model.n_ops)} operations`}</span>
+          </figcaption>
+        </figure>
+      )
+    }
+  </section>
+
+  {
+    panels.length > 0 && (
+      <section class="shell home-section" aria-labelledby="home-panels-title">
+        <h2 class="home-section__title" id="home-panels-title">Well-known architectures</h2>
+        <ul class="home-panels">
+          {panels.map(({ model, imageUrl, zoom }) => (
+            <li>
+              <a class="home-panel" href={`/models/${model.slug}/`}>
+                <span class:list={["home-panel__frame", zoom]}>
+                  <img src={imageUrl} alt="" loading="lazy" decoding="async" />
+                </span>
+                <span class="home-panel__name">{model.display_name}</span>
+                <span class="home-panel__task">{categoryLabel(model.category)}</span>
+              </a>
+            </li>
+          ))}
+        </ul>
+      </section>
+    )
+  }
+
+  <section class="shell home-section">
+    <h2 class="home-section__title">Browse by task</h2>
+    <ul class="home-tasks">
+      {
+        categories.map((category) => (
+          <li>
+            <a class="home-tasks__link" href={`/models/?category=${encodeURIComponent(category.value)}`}>
+              <span>{category.label}</span>
+              <span class="home-tasks__count">{formatNumber(category.count)}</span>
+            </a>
+          </li>
+        ))
+      }
+    </ul>
+  </section>
+
+  <section class="shell home-section home-section--last">
+    <div class="home-own">
+      <div class="home-own__text">
+        <h2 class="home-section__title">Draw your own model</h2>
+        <p class="home-own__note">
+          Install Graphviz, then TorchLens. Any PyTorch model and input give you the same kind of diagram.
+        </p>
+      </div>
+      <div class="home-own__actions">
+        <CopyCode code="pip install torchlens" label="Copy the install command" name="Install command" />
+        <CopyCode code={snippet} label="Copy the TorchLens example" name="TorchLens example" />
+        <div class="home-own__links">
+          <a class="button primary" href={README_URL} rel="noreferrer">TorchLens quickstart</a>
+          <a class="button" href="https://pypi.org/project/torchlens/" rel="noreferrer">PyPI</a>
+        </div>
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .home-hero {
+    display: grid;
+    gap: 1.75rem;
+    padding-block: 2rem 2.5rem;
+  }
+
+  .home-hero__text {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+    min-width: 0;
+  }
+
+  .home-hero__title {
+    margin: 0;
+    font-size: clamp(2rem, 6vw, 3.25rem);
+    font-weight: 600;
+    line-height: 1.1;
+  }
+
+  .home-hero__lede {
+    margin: 0;
+    max-width: 34rem;
+    color: var(--secondary);
+    font-size: 1.125rem;
+    line-height: 1.6;
+  }
+
+  .home-hero__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+
+  .home-hero__figure {
+    min-width: 0;
+    margin: 0;
+  }
+
+  /* The diagram is shown from its top (the output end) at reading scale, never stretched. */
+  .home-hero__frame {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    height: 22rem;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--diagram-paper);
+  }
+
+  /* The fade ends in paper white, so in dark mode the diagram stays a white sheet instead of dimming. */
+  .home-hero__frame::after {
+    position: absolute;
+    inset: auto 0 0;
+    height: 15%;
+    background: linear-gradient(to bottom, transparent, var(--diagram-paper));
+    content: "";
+    pointer-events: none;
+  }
+
+  .home-hero__frame img {
+    display: block;
+    flex: none;
+    max-width: none;
+    height: auto;
+  }
+
+  .home-hero__frame--svg img,
+  .home-hero__frame--thumb img {
+    width: 100%;
+  }
+
+  /* From tablet width up, draw the SVG at reading scale and crop the sides evenly. */
+  @media (min-width: 640px) {
+    .home-hero__frame--svg img {
+      width: max(100%, 34rem);
+    }
+  }
+
+  .home-hero__frame:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .home-hero__caption {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 0.75rem;
+    margin-top: 0.6rem;
+    color: var(--secondary);
+    font-size: 0.875rem;
+  }
+
+  .home-hero__caption a {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .home-section {
+    padding-bottom: 3rem;
+  }
+
+  .home-section--last {
+    padding-bottom: 4rem;
+  }
+
+  .home-section__title {
+    margin: 0 0 1rem;
+    font-size: 1.5rem;
+    font-weight: 600;
+  }
+
+  /* Six small panels in one row on a desktop, two or three to a row on smaller screens. */
+  .home-panels {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 9.5rem), 1fr));
+    gap: 1rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .home-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    height: 100%;
+    color: var(--text);
+    text-decoration: none;
+  }
+
+  /* A fixed box (no layout shift); the top of the graph at panel width, faded at the bottom. */
+  .home-panel__frame {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    justify-content: safe center;
+    aspect-ratio: 5 / 6;
+    margin-bottom: 0.45rem;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--diagram-paper);
+    transition: border-color 150ms ease;
+  }
+
+  .home-panel__frame::after {
+    position: absolute;
+    inset: auto 0 0;
+    height: 18%;
+    background: linear-gradient(to bottom, transparent, var(--diagram-paper));
+    content: "";
+    pointer-events: none;
+  }
+
+  .home-panel__frame img {
+    display: block;
+    flex: none;
+    width: 100%;
+    max-width: none;
+    height: auto;
+  }
+
+  .home-panel__frame--zoom-left img,
+  .home-panel__frame--zoom-centre img,
+  .home-panel__frame--zoom-right img {
+    width: 200%;
+  }
+
+  .home-panel__frame--zoom-centre img {
+    margin-left: -50%;
+  }
+
+  .home-panel__frame--zoom-right img {
+    margin-left: -100%;
+  }
+
+  .home-panel:hover .home-panel__frame,
+  .home-panel:focus-visible .home-panel__frame {
+    border-color: color-mix(in srgb, var(--accent) 65%, var(--border));
+  }
+
+  .home-panel:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 8px;
+  }
+
+  .home-panel__name {
+    overflow: hidden;
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .home-panel__task {
+    color: var(--secondary);
+    font-size: 0.8rem;
+  }
+
+  .home-tasks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .home-tasks__link {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.35rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 0.875rem;
+    text-decoration: none;
+  }
+
+  .home-tasks__link:hover,
+  .home-tasks__link:focus-visible {
+    border-color: color-mix(in srgb, var(--accent) 65%, var(--border));
+  }
+
+  .home-tasks__count {
+    color: var(--secondary);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .home-own {
+    display: grid;
+    gap: 1.25rem;
+    padding: 1.25rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--surface) 90%, transparent);
+  }
+
+  .home-own__note {
+    margin: 0;
+    color: var(--secondary);
+  }
+
+  .home-own__actions {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    min-width: 0;
+  }
+
+  .home-own__links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+
+  @media (min-width: 640px) {
+    .home-hero__frame {
+      height: 26rem;
+    }
+  }
+
+  /* Desktop: the text beside a larger diagram, tall enough to read several layers. */
+  @media (min-width: 1024px) {
+    .home-hero {
+      grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+      align-items: center;
+      gap: 3rem;
+      padding-block: 2.5rem;
+    }
+
+    .home-hero__frame {
+      height: min(32rem, calc(100vh - 12rem));
+      min-height: 24rem;
+    }
+
+    .home-own {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      align-items: center;
+    }
+  }
+</style>

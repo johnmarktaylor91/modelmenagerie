@@ -1,0 +1,77 @@
+{
+  "schema_version": "menagerie.crawler.golden-corpus-manifest.v1",
+  "comment": "Committed byte-digest membership manifest for the golden checker-transcript corpus (W-7 anti-substitution floor). Enforced by name-set equality plus per-file sha256 identity in menagerie.crawler.tools.golden_corpus_floor.enforce(); consumed by the in-suite anti-substitution test, the production calibration activation gate, and the receipt mint/verify path. Regenerate ONLY via `python -m menagerie.crawler.tools.golden_corpus_floor write`; never hand-edit. The retired list is a PERMANENT census \u2014 rows are appended by --retire and removed only by an explicit --reactivate reviewed change.",
+  "members": [
+    {
+      "file": "fidelity_accept.json",
+      "gate_kind": "fidelity",
+      "sha256": "703c31f48d0f7970ae25d28f83494fce7a18fa9be9034950bc90ff2182ed2691"
+    },
+    {
+      "file": "fidelity_refusal.json",
+      "gate_kind": "fidelity",
+      "sha256": "2792cc87207809b433002c6af73a2001a3cc0b4b83bbe453f3514f06fce677bd"
+    },
+    {
+      "file": "metadata_accept.json",
+      "gate_kind": "metadata_batch",
+      "sha256": "165184a3cf160e2e65646ea6cbab7d291cfd48b16012e8985c7351a954cc2618"
+    },
+    {
+      "file": "metadata_accept_lineage_grounded.json",
+      "gate_kind": "metadata_batch",
+      "sha256": "53e55a0a702aa7e85b88e98389367d2a1c50c2fecd2736c53910d88cf2ba9f62"
+    },
+    {
+      "file": "metadata_component_drift.json",
+      "gate_kind": "metadata_batch",
+      "sha256": "d9a30de3145df2e9f3858f3f1b41d993c5dcb07b5b6c022bf476b10d7e703870"
+    },
+    {
+      "file": "metadata_refusal.json",
+      "gate_kind": "metadata_batch",
+      "sha256": "05f3588583b6803a626cdf35be08b1a97548aa034155772c47956c71a8ab62ce"
+    },
+    {
+      "file": "metadata_rung_adverse.json",
+      "gate_kind": "metadata_batch",
+      "sha256": "a49dd06804d6d7b5898012699758f2abea7c2dc925a6f8d22bd164824ce65c43"
+    },
+    {
+      "file": "terminal_accept.json",
+      "gate_kind": "terminal_disposition",
+      "sha256": "ec301ffdc04d1f757b82740e180a7be6d3aa068c2e25d203a7490526142b91ae"
+    },
+    {
+      "file": "terminal_disputed.json",
+      "gate_kind": "terminal_disposition",
+      "sha256": "41d4bb5614e890f56a6b91f36c28fcffe653a5a86a27d65e5fcb7040c2b100b5"
+    },
+    {
+      "file": "terminal_refusal.json",
+      "gate_kind": "terminal_disposition",
+      "sha256": "05242c8ed195915c9d9bed3fc09d5b13e782dfd38d9ff7f2c3d60fe8977f0a58"
+    }
+  ],
+  "class_minimums": {
+    "fidelity": 2,
+    "metadata_batch": 4,
+    "terminal_disposition": 3
+  },
+  "retired": [
+    {
+      "file": "metadata_mixed_batch.json",
+      "gate_kind": "metadata_batch",
+      "sha256": "a1dfa2bfd5d81861156faeddeb92e5bd9acc1a248a018291e5e8c32650ebd83a",
+      "retired_at": "2026-08-29",
+      "reason": "width-retired class: accepted-beside-rejected is a MULTI-ITEM shape; at the calibrated width-1 production config (2179939ce) no recorded session can populate it. A future width increase re-records and --reactivate re-arms it."
+    },
+    {
+      "file": "metadata_mixed_disputed.json",
+      "gate_kind": "metadata_batch",
+      "sha256": "b9b3d162d50fb41334246f53650d41ea61f874ec23cf9d155bb9c34a30c3f562",
+      "retired_at": "2026-08-29",
+      "reason": "width-retired class: cap-width heterogeneity with a disputed item is a MULTI-ITEM shape; at the calibrated width-1 production config (2179939ce) no recorded session can populate it. A future width increase re-records and --reactivate re-arms it."
+    }
+  ]
+}

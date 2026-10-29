@@ -1,0 +1,65 @@
+---
+import type { Funnel } from "@/lib/catalog";
+import { formatNumber } from "@/lib/labels";
+
+interface Props {
+  funnel: Funnel;
+}
+
+const { funnel } = Astro.props;
+// Stages a visitor can read; a stage with nothing in it yet is left out rather than shown as 0.
+const stages: Array<[string, number]> = [
+  ["Models catalogued", funnel.cataloged],
+  ["Built in PyTorch", funnel.build_verified],
+  ["Checked on a real input", funnel.forward_validated_real],
+  ["Checked through a wrapper", funnel.forward_validated_wrapper],
+  ["Diagrams drawn", funnel.rendered],
+  ["Set aside for review", funnel.quarantined],
+  ["Deferred", funnel.deferred],
+];
+const shown = stages.filter(([, value]) => value > 0);
+---
+
+{
+  shown.length > 0 && (
+    <dl class="funnel-strip" aria-label="What has been checked">
+      {shown.map(([label, value]) => (
+        <div class="funnel-strip__stage">
+          <dt>{label}</dt>
+          <dd class="mono">{formatNumber(value)}</dd>
+        </div>
+      ))}
+    </dl>
+  )
+}
+
+<style>
+  .funnel-strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+    gap: 0.75rem;
+    margin: 0;
+    padding: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--surface) 90%, transparent);
+  }
+
+  .funnel-strip__stage {
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 0.15rem;
+  }
+
+  .funnel-strip dt {
+    color: var(--secondary);
+    font-size: 0.875rem;
+  }
+
+  .funnel-strip dd {
+    margin: 0;
+    color: var(--text);
+    font-size: 1.5rem;
+    font-weight: 600;
+  }
+</style>

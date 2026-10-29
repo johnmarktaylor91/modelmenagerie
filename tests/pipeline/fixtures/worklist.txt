@@ -1,0 +1,16 @@
+# Menagerie tick worklist, rung 3 (lines sampled from the 2026-10-09 file, in its order)
+# one stable id per line in priority order; '#' lines are ignored by tick_full.worklist()
+# --- c2_tail (187 frozen rows)
+m4527
+m1707
+m1708
+# --- needs_adapter (1217 frozen rows)
+m3142
+m10244
+# --- rung3-env (445 frozen rows) [held: no record, next step reads 2a; waits for the mmlab/detectron2 env harvest path]
+#m4006
+#m4007
+# --- x_standin (1219 frozen rows)
+m3595
+# --- repin (253 frozen rows) [held: re-pin list; repin flip (TorchLens 2.36.0 after Slice A) re-arms and queues it]
+#m3796

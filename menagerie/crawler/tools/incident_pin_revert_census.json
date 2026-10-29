@@ -1,0 +1,182 @@
+{
+  "base_sha": "914e04e847ef9a160f088bd5023aa9e4ebff4098",
+  "rows": [
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "1f9b3b4eef4cc80d660f75dd3ee561ab36370068",
+      "subject": "test(crawler): land the W17 virtual-time rung-scale rig as the scale-time-shaped-blindness tree node",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "sha": "8c9b91dba8b360b715f7fd158afb8f89fbfa1c4c",
+      "subject": "test(crawler): complete W16/S-2 cert-kind integration in three stale test compositions",
+      "verdict": "pinned-by-blocking-gate"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "edd1606e7896dfd534953d262a5fa119f8888540",
+      "subject": "feat(crawler): W16/S-2 certificate-kind consumer split keyed on staging-declared rung classes",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "f89244ab308f0a2b164b4f6df2870689d1d76920",
+      "subject": "fix(crawler): finish the restore-write env leak class -- mirror exports join the session isolation vocabulary",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "2091783dc97006f22741d696249a9a2ec6e0cbe3",
+      "subject": "feat(crawler): PD-8 state-placement contract \u2014 wake-touched roots must live on the launchd-proven anchor volume",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "e4745dbfa951982a7e73992fa23e86b7bb72e916",
+      "subject": "fix(crawler): closed replay-derived owner authority for driver-lane attempt failures (B3-XV-4)",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "c62058ad20d46f6ee1a3b718fe3bcc349b3a8355",
+      "subject": "fix(crawler): strict doctor reads an unopenable execution-flock path as slot-unavailable, never an untyped crash",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "2ae7567250073df148d6ff389477f8b5370df2f4",
+      "subject": "chore(crawler): regenerate smoke inventory on the post-crashfix tree (prior regeneration preceded the resolved reaper/rollover test files)",
+      "verdict": "pinned-by-blocking-gate"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "6c193a8f59594ebfcdc09034c018025e9836cc66",
+      "subject": "fix(crawler): custody deadline reaper reads the campaign clock, never the host wall clock",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "detail": "revert does not apply cleanly outside the inventory artifacts (conflicts: ['menagerie/crawler/tests/kill_matrix_support.py']): the diff is load-bearing for later committed state",
+      "sha": "fca36525bc3188598c97cb7f8f6623b4e19949c8",
+      "subject": "fix(crawler): teach the kill-durability oracle the D-20/DX-26 per-leg close-preview disclosures",
+      "verdict": "pinned-by-conflict"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "b1e5ddf429bb0356a2cf4c9da0a8fae7fc06418b",
+      "subject": "feat(crawler): DX-26 leg-partial.v1 checkpoint on every leg exit (ratified, RULING W7 clause 15)",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "977b1bf72b959da0d6df277e04caac9af7ebd6f8",
+      "subject": "feat(crawler): LC-11 continuation-budget + generation-span loop alarms (D-23, OPEN-5 arm)",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "7ea94ef40170440315ecb72040ee8219eb531730",
+      "subject": "feat(crawler): W42 close half -- operator-act census, live-grant disclosure, void-beside-live-grant refusal",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "1cf1ba2dd284205b34b98d8a86574f7ee9e40525",
+      "subject": "feat(crawler): D-27 carried-authority preflight + require_links hardening -- park voids caught pre-spend",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "detail": "revert does not apply cleanly outside the inventory artifacts (conflicts: ['menagerie/crawler/driver.py', 'menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json', 'menagerie/crawler/tests/test_close_preview.py', 'menagerie/crawler/tests/test_slice_f_driver.py']): the diff is load-bearing for later committed state",
+      "sha": "ae3e061861699c404013561f467376845e83ba33",
+      "subject": "feat(crawler): D-20 per-leg read-only close preview -- would-refuse members legible at leg START",
+      "verdict": "pinned-by-conflict"
+    },
+    {
+      "detail": "revert does not apply cleanly outside the inventory artifacts (conflicts: ['menagerie/crawler/driver.py', 'menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']): the diff is load-bearing for later committed state",
+      "sha": "daa43dc2bdd3ceb452902816fe046619ffe9234c",
+      "subject": "feat(crawler): SD-2 leg-start licensing-debt refusal arm -- R9/R2 refusals move to leg open",
+      "verdict": "pinned-by-conflict"
+    },
+    {
+      "detail": "revert does not apply cleanly outside the inventory artifacts (conflicts: ['menagerie/crawler/driver.py', 'menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']): the diff is load-bearing for later committed state",
+      "sha": "fbf97eea5148489d7f17a1874fc920610f38f7a3",
+      "subject": "fix(crawler): DX-22 close licenses its own successor -- accounting-arm totality, parks are disclosure",
+      "verdict": "pinned-by-conflict"
+    },
+    {
+      "detail": "revert does not apply cleanly outside the inventory artifacts (conflicts: ['menagerie/crawler/tests/conftest.py']): the diff is load-bearing for later committed state",
+      "sha": "1596cbfaadeee8ee08089c79f8ff6ee9d39349ba",
+      "subject": "fix(crawler): full-tier fixes -- launch-env leakage isolation + parent-attestation v3 pin",
+      "verdict": "pinned-by-conflict"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "a78a8a23a4cc27e1860a75574963d32eb14cc46f",
+      "subject": "fix(crawler): era-key the DX-23 leg_citations proof-body field (v3 emits none)",
+      "verdict": "pinned-by-inventory"
+    },
+    {
+      "detail": "revert does not apply cleanly outside the inventory artifacts (conflicts: ['menagerie/crawler/close_object.py', 'menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json', 'menagerie/crawler/tests/test_pd1_continuation_ruling.py']): the diff is load-bearing for later committed state",
+      "sha": "b41963cefc6a747f9ef959528e6a756a84cfab2d",
+      "subject": "feat(crawler): PD-1 continuation-marker ruling (W7) -- era-keyed proof v4, routing-marker census, custody-silence conjunct, CONTINUING disposition, per-row park liveness, exact close-status grammar (D-24)",
+      "verdict": "pinned-by-conflict"
+    },
+    {
+      "sha": "789a7e98c2f68a8fec32982b88a9eee7f5424cf0",
+      "subject": "fix(crawler): rotation e2e stages the fixture calibration receipt",
+      "verdict": "pinned-by-blocking-gate"
+    },
+    {
+      "detail": "inventory-artifact conflicts kept at current tree: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']",
+      "sha": "300dff4e254653032865f8487e2ffe6f046db43b",
+      "subject": "chore(crawler): regenerate smoke inventory at the batch tip (3602 smoke / 5656 collected; source-link partition ids moved with the W13 blocked:* fold)",
+      "verdict": "pinned-by-blocking-gate"
+    },
+    {
+      "detail": "revert does not apply cleanly outside the inventory artifacts (conflicts: ['menagerie/crawler/tests/kill_matrix_support.py']): the diff is load-bearing for later committed state",
+      "sha": "f93ad497b6eb49775144b5310f97f036350e1f39",
+      "subject": "test(crawler): kill-matrix oracle contract composed with W6/OB-M12 leg topology",
+      "verdict": "pinned-by-conflict"
+    },
+    {
+      "detail": "revert does not apply cleanly outside the inventory artifacts (conflicts: ['menagerie/crawler/tests/test_close_read_scale.py', 'menagerie/crawler/tests/test_slice_f_driver.py']): the diff is load-bearing for later committed state",
+      "sha": "e19e449d443ed78e64d1de79d58fa86a257fb06e",
+      "subject": "fix(crawler): full-tier cited contract updates for the batch (restored after a triage sub-lane's bisect stashed the working tree)",
+      "verdict": "pinned-by-conflict"
+    },
+    {
+      "sha": "0ed6d8123e20a809b8089fb9c461ebafe29c58d1",
+      "subject": "fix(crawler): relocation-safe canonical rehydration -- validate source evidence at the staged digest-addressed twin CAS (W9 x warm-redrive spend regression)",
+      "verdict": "pinned-by-blocking-gate"
+    },
+    {
+      "sha": "7cc3f3a2d663e36ecda433682a70aa1583b5482f",
+      "subject": "fix(crawler): resolve the three cross-lane gate seams surfaced by the batch smoke tier",
+      "verdict": "pinned-by-blocking-gate"
+    },
+    {
+      "detail": "revert does not apply cleanly outside the inventory artifacts (conflicts: ['menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json', 'menagerie/crawler/tests/test_mixed_era_scheduler_quarantine.py']): the diff is load-bearing for later committed state",
+      "sha": "768a16c56915a86452a1f014832315a0ec8ed49c",
+      "subject": "feat(crawler): Wave-2 batch-assembly fold -- AB-30 registry reconciliation, 12 mixed-era matrix modules, DX-23 close-citation wiring, AG-4 admission-edge registration",
+      "verdict": "pinned-by-conflict"
+    },
+    {
+      "sha": "8ce4679dc217918f53db50038d902856eea5302e",
+      "subject": "fix(crawler): resolve the two final-gate seams (static width resolution, wave-concurrency containment pin)",
+      "verdict": "pinned-by-blocking-gate"
+    },
+    {
+      "detail": "revert does not apply cleanly outside the inventory artifacts (conflicts: ['menagerie/crawler/procedures/SCHEMA_REFERENCE.md']): the diff is load-bearing for later committed state",
+      "sha": "efe27586b79c9b9db6edd21703caf6412dd18f3e",
+      "subject": "fix(crawler): schema-governance conformance for the runner-wave leaves + the two remaining repair-exhaustion pins (DX-9/DX-10/DX-11 follow-through)",
+      "verdict": "pinned-by-conflict"
+    },
+    {
+      "detail": "revert does not apply cleanly outside the inventory artifacts (conflicts: ['menagerie/crawler/rotation_registry.py', 'menagerie/crawler/tests/smoke_inventory.lock', 'menagerie/crawler/tests/smoke_inventory_floor.json']): the diff is load-bearing for later committed state",
+      "sha": "7637499cf6dad771f8c733a4d18278bfe8cbb211",
+      "subject": "feat(crawler): AL-22 author steering-surface identity (disclosed-non-staling rotation class)",
+      "verdict": "pinned-by-conflict"
+    }
+  ],
+  "schema_version": "menagerie.crawler.incident-pin-revert-census.v1",
+  "unpinned": []
+}

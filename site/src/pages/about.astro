@@ -1,0 +1,249 @@
+---
+import CopyCode from "@/components/CopyCode.astro";
+import EmailLink from "@/components/EmailLink.astro";
+import BaseLayout from "@/layouts/BaseLayout.astro";
+import { getManifest } from "@/lib/catalog";
+import { exportDate } from "@/lib/dataset";
+import {
+  CONTACT,
+  CONTENT_LICENCE,
+  CREATOR,
+  GRAPHVIZ_URL,
+  SITE_NAME,
+  TORCHLENS,
+  TORCHLENS_BIBTEX,
+  TORCHLENS_CITATION,
+  releaseVersion,
+  siteBibtex,
+  siteCitation,
+} from "@/lib/site";
+
+const manifest = getManifest();
+const version = releaseVersion(manifest.export_version);
+const asOf = exportDate();
+const year = asOf ? Number(asOf.slice(0, 4)) : new Date().getUTCFullYear();
+const tracedWith = /^\d/.test(manifest.torchlens_version) ? manifest.torchlens_version : null;
+
+// Matches the TorchLens README quickstart at the version Menagerie pins.
+const traceExample = `pip install torchlens   # install Graphviz first
+
+import torch, torchvision.models as models, torchlens as tl
+model = models.alexnet(weights=None)
+log = tl.trace(model, torch.randn(1, 3, 224, 224))
+log.draw()   # draws the computational graph`;
+
+const jsonLd = {
+  "@context": "https://schema.org",
+  "@type": "AboutPage",
+  name: `About the ${SITE_NAME}`,
+  url: "https://modelmenagerie.ai/about/",
+  author: { "@type": "Person", name: CREATOR.name, url: CREATOR.url },
+};
+---
+
+<BaseLayout
+  title="About"
+  description="What the Model Menagerie is, how each diagram is traced, checked and drawn with TorchLens, how to read one, and how to cite it."
+  jsonLd={jsonLd}
+>
+  <article class="shell about py-10">
+    <h1 class="text-3xl font-semibold sm:text-4xl">About the Model Menagerie</h1>
+    <p class="lead mt-4 text-secondary">
+      The Model Menagerie is an atlas of neural network architectures. Each diagram is the computational graph that
+      TorchLens recorded while the model ran: every operation, in order, and the tensors passed between them.
+    </p>
+
+    <nav class="about-toc panel" aria-label="On this page">
+      <ul>
+        <li><a class="textlink" href="#torchlens">TorchLens</a></li>
+        <li><a class="textlink" href="#method">How a diagram is made</a></li>
+        <li><a class="textlink" href="#checked">What checked means</a></li>
+        <li><a class="textlink" href="#status-heading">This release</a></li>
+        <li><a class="textlink" href="#read">Reading a diagram</a></li>
+        <li><a class="textlink" href="#cite-heading">How to cite</a></li>
+        <li><a class="textlink" href="#contact">Corrections</a></li>
+        <li><a class="textlink" href="#credits">Credits</a></li>
+      </ul>
+    </nav>
+
+    <section aria-labelledby="torchlens">
+      <h2 id="torchlens">TorchLens</h2>
+      <p>
+        <a class="textlink" href={TORCHLENS.repo}>TorchLens</a> is an open-source Python package for seeing, saving and
+        steering PyTorch models. It captures every activation, draws the full computational graph and records detailed
+        metadata for every operation, for any architecture, including dynamic and recurrent ones. It is described in a
+        <a class="textlink" href={TORCHLENS.paper}>paper in Scientific Reports</a>. You can draw a model of your own the
+        same way the diagrams here are drawn:
+      </p>
+      <div class="mt-4">
+        <CopyCode code={traceExample} label="Copy the TorchLens example" name="Example: trace and draw a model" />
+      </div>
+    </section>
+
+    <section aria-labelledby="method">
+      <h2 id="method">How a diagram is made</h2>
+      <ol>
+        <li>
+          <strong>Build.</strong> The model is built from its published code and given an example input: a real one where
+          there is one, otherwise generated data of the right shape.
+        </li>
+        <li>
+          <strong>Trace.</strong> TorchLens runs one forward pass and records every operation it executes, with the shape of
+          every tensor.
+        </li>
+        <li>
+          <strong>Check.</strong> TorchLens replays the capture and compares it with the model's own output (next section).
+        </li>
+        <li>
+          <strong>Draw.</strong> Graphviz lays out the recorded graph, and TorchLens draws it as the diagram on the model's
+          page. The PDF and the other files on the page come from the same trace.
+        </li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="checked">
+      <h2 id="checked">What checked means</h2>
+      <p>
+        For a PyTorch model, the capture is replayed operation by operation against the original forward output, and the
+        graph's metadata is checked for consistency. If the replay or a check fails, the capture counts as wrong, not as a
+        pass because the model ran.
+      </p>
+      <p>
+        TorchLens also traces TensorFlow, JAX, Paddle, MLX and tinygrad models, with
+        <a class="textlink" href={TORCHLENS.backends}>newer support for those frameworks</a>. Their check replays each
+        captured operation from its inputs but does not rerun the whole model against a known output, so it is a weaker
+        check than the one for PyTorch.
+      </p>
+      <p>
+        Some models are too large to run. For those, TorchLens can record the graph's structure without running it. Such a
+        drawing carries TorchLens's own banner, saying that its shapes and data types are hypotheses, not measurements, and
+        it has no replay check.
+      </p>
+    </section>
+
+    <section id="status" aria-labelledby="status-heading">
+      <h2 id="status-heading">This release</h2>
+      <p>
+        {
+          version
+            ? `This is release ${version} of the catalog.`
+            : "This is a preview release, and the site is still being built."
+        }
+        {" "}Every model listed here has a rendered diagram{tracedWith && `, traced with TorchLens ${tracedWith}`}. Some still
+        share a stand-in drawing with other models until their own trace is redone; the listing shows no picture for
+        those. The replay check is being run across the catalog, and each model's source, licence and paper are still being added;
+        a model page shows them once they are recorded. The <a class="textlink" href="/dataset/">Dataset page</a> says
+        what the current release contains, and the <a class="textlink" href="/changelog/">list of changes</a> says what
+        changed.
+      </p>
+    </section>
+
+    <section aria-labelledby="read">
+      <h2 id="read">How to read a diagram</h2>
+      <p>
+        Each box is one operation, such as a convolution or an addition, labelled with the shape of the tensor it
+        produced. Arrows show which results feed which operations, from the input to the output. Nested frames group the
+        operations that belong to one module, such as a residual block. An unrolled drawing shows every pass through a
+        repeated module; a rolled drawing folds the passes into one box, which keeps recurrent models compact.
+      </p>
+    </section>
+
+    <section id="cite" aria-labelledby="cite-heading">
+      <h2 id="cite-heading">How to cite</h2>
+      <p>If the diagrams or the dataset help your work, please cite the Menagerie and the TorchLens paper:</p>
+      <p class="citation panel">{siteCitation(year, version)}</p>
+      <CopyCode code={siteBibtex(year, version)} label="Copy the BibTeX entry for the Menagerie" name="BibTeX for the Menagerie" />
+      <p class="citation panel">{TORCHLENS_CITATION}</p>
+      <CopyCode code={TORCHLENS_BIBTEX} label="Copy the BibTeX entry for TorchLens" name="BibTeX for TorchLens" />
+    </section>
+
+    <section aria-labelledby="contact">
+      <h2 id="contact">Corrections and requests</h2>
+      <p>
+        Found a wrong or missing diagram, or a wrong fact? Open an issue on the
+        <a class="textlink" href={CONTACT.issues}>TorchLens issues page</a> with the model's address. For anything you
+        would rather not post in public, including a request to remove a model, email
+        <EmailLink email={CONTACT.email} />.
+      </p>
+    </section>
+
+    <section aria-labelledby="credits">
+      <h2 id="credits">Credits</h2>
+      <p>
+        Every diagram is traced and drawn by <a class="textlink" href={TORCHLENS.repo}>TorchLens</a>
+        (<a class="textlink" href={TORCHLENS.licence.url}>{TORCHLENS.licence.name}</a>), by JohnMark Taylor and Nikolaus
+        Kriegeskorte, and laid out by <a class="textlink" href={GRAPHVIZ_URL}>Graphviz</a>. Each model's code comes from its
+        authors' project, linked on its page where recorded, and keeps its own licence. The Menagerie is made by
+        <a class="textlink" href={CREATOR.url}>{CREATOR.name}</a>; its text, diagrams and dataset are free to reuse under
+        <a class="textlink" href={CONTENT_LICENCE.url} rel="license">{CONTENT_LICENCE.short}</a>
+        (<a class="textlink" href="/legal/">privacy and licences</a>).
+      </p>
+    </section>
+  </article>
+</BaseLayout>
+
+<style>
+  .about {
+    max-width: 46rem;
+  }
+
+  .about .lead {
+    font-size: 1.125rem;
+    line-height: 1.7;
+  }
+
+  .about-toc {
+    margin-top: 2rem;
+    padding: 0.25rem 1rem;
+  }
+
+  .about-toc ul {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 1.25rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-size: 0.95rem;
+  }
+
+  /* A full tap height (44 px) for each link in the wrapping row. */
+  .about-toc li,
+  .about-toc a {
+    display: flex;
+    align-items: center;
+    min-height: 2.75rem;
+  }
+
+  .about section {
+    margin-top: 2.5rem;
+    scroll-margin-top: 1rem;
+  }
+
+  .about h2 {
+    font-size: 1.375rem;
+    font-weight: 600;
+  }
+
+  .about p,
+  .about ol {
+    margin-top: 0.75rem;
+    line-height: 1.7;
+  }
+
+  .about ol {
+    padding-left: 1.4rem;
+    list-style: decimal;
+  }
+
+  .about ol li + li {
+    margin-top: 0.4rem;
+  }
+
+  .about .citation {
+    margin-block: 1rem 0.75rem;
+    padding: 1rem;
+    font-size: 0.95rem;
+    overflow-wrap: anywhere;
+  }
+</style>

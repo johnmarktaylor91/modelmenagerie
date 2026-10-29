@@ -1,0 +1,292 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens. Every colour and font on the site comes from these variables.
+ *
+ * The look is a light "paper atlas": warm off-white page, serif headings, ink-black controls. Dark mode keeps
+ * the same structure on a warm dark ground. Light is the default; the visitor's OS setting and the header
+ * switch choose dark (DEFAULT_THEME in src/layouts/BaseLayout.astro).
+ */
+:root {
+  --font-body: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-heading: "Source Serif 4", Charter, "Bitstream Charter", "Iowan Old Style", Georgia, serif;
+  --font-code: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  /* Paper behind diagrams and their previews (cards, home hero, viewer). Graphviz draws on white, so this
+     stays white in both themes and the page matches the downloaded files: no recolouring or inversion. */
+  --diagram-paper: #ffffff;
+}
+
+/* Light is also the palette when no theme is set (scripts off). */
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #faf8f3;
+  --surface: #ffffff;
+  --surface-2: #f2efe7;
+  --border: #ddd7ca;
+  --text: #1c1b19;
+  --secondary: #5c574e;
+  --accent: #1c1b19;
+  --on-accent: #faf8f3;
+  --focus: #1c1b19;
+  --verified: #2f6b2a;
+  --danger: #a4302a;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #171614;
+  --surface: #201f1c;
+  --surface-2: #121110;
+  --border: #3a3732;
+  --text: #ece8df;
+  --secondary: #a9a397;
+  --accent: #ece8df;
+  --on-accent: #171614;
+  --focus: #ece8df;
+  --verified: #7fbf72;
+  --danger: #f08070;
+}
+
+/* Tailwind utilities for the tokens: text-secondary, text-ink, bg-surface, border-line, text-accent, ... */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--border);
+  --color-ink: var(--text);
+  --color-secondary: var(--secondary);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-verified: var(--verified);
+  --color-danger: var(--danger);
+  --color-diagram-paper: var(--diagram-paper);
+  --font-sans: var(--font-body);
+  --font-mono: var(--font-code);
+}
+
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: var(--border);
+  }
+
+  html {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    min-height: 100vh;
+    margin: 0;
+    background: var(--bg);
+  }
+
+  a {
+    color: inherit;
+  }
+
+  h1,
+  h2,
+  h3 {
+    overflow-wrap: anywhere;
+  }
+
+  /* Page and section headings are serif; card and panel titles (h3) keep the body face. */
+  h1,
+  h2 {
+    font-family: var(--font-heading);
+    font-weight: 600;
+  }
+
+  h1 {
+    text-wrap: balance;
+  }
+
+  code,
+  pre,
+  kbd,
+  .mono {
+    font-family: var(--font-code);
+  }
+
+  pre {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+}
+
+@layer components {
+  .shell {
+    width: min(1160px, calc(100% - 32px));
+    margin-inline: auto;
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    transition: border-color 150ms ease;
+  }
+
+  .card:hover,
+  .card:focus-within {
+    border-color: color-mix(in srgb, var(--accent) 65%, var(--border));
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-height: 1.6rem;
+    padding: 0.18rem 0.55rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--secondary);
+    font-size: 0.8125rem;
+  }
+
+  /* Secondary action: outlined. One filled .button.primary per screen. */
+  .button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    min-height: 2.35rem;
+    padding: 0.5rem 0.9rem;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--surface);
+    color: var(--text);
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  .button:hover {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  }
+
+  .button.primary {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--on-accent);
+  }
+
+  .button.primary:hover {
+    background: color-mix(in srgb, var(--accent) 82%, var(--bg));
+  }
+
+  .button[aria-disabled="true"],
+  .button:disabled {
+    color: var(--secondary);
+    pointer-events: none;
+    opacity: 0.55;
+  }
+
+  /* Plain text link with an underline on hover, for navigation and secondary actions. */
+  .navlink {
+    color: var(--secondary);
+    font-weight: 600;
+    text-decoration: none;
+    text-underline-offset: 0.25em;
+  }
+
+  .navlink:hover,
+  .navlink[aria-current] {
+    color: var(--text);
+    text-decoration: underline;
+  }
+
+  .textlink {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 0.2em;
+  }
+
+  .textlink:hover {
+    text-decoration-thickness: 2px;
+  }
+
+  .icon-button {
+    display: inline-grid;
+    place-items: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--secondary);
+    cursor: pointer;
+  }
+
+  .icon-button:hover {
+    border-color: var(--border);
+    color: var(--text);
+  }
+
+  .field {
+    min-width: 0;
+    min-height: 2.25rem;
+    padding: 0.35rem 0.7rem;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+  }
+
+  .field::placeholder {
+    color: var(--secondary);
+  }
+
+  .skip-link {
+    position: absolute;
+    top: 0.5rem;
+    left: 0.5rem;
+    z-index: 100;
+    padding: 0.5rem 0.9rem;
+    border-radius: 7px;
+    background: var(--accent);
+    color: var(--on-accent);
+    font-weight: 600;
+    transform: translateY(-200%);
+  }
+
+  .skip-link:focus {
+    transform: none;
+  }
+}
+
+/*
+ * Outside the layers on purpose: a visible focus ring wins over utilities such as outline-none,
+ * in both themes.
+ */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "menagerie-recsys",
+  "channels": ["aibox", "conda-forge", "nodefaults"],
+  "dependencies": ["python>=3.10,<3.11", "pytorch>=2.5,<2.6", "torchvision", "recbole=1.2.1", "d3rlpy=2.8.1", "bindsnet=0.3.3", "numpy", "scipy", "pandas", "scikit-learn"]
+}

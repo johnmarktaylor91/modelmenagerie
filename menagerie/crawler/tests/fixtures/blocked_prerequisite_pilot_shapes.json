@@ -1,0 +1,191 @@
+[
+ {
+  "stable_id": "m1035",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-transformers"
+  ]
+ },
+ {
+  "stable_id": "m1239",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-torch-geometric",
+   "runtime-dependency-torch-scatter",
+   "runtime-dependency-performer-pytorch"
+  ]
+ },
+ {
+  "stable_id": "m1471",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency",
+   "pytorch-pretrained-bert"
+  ]
+ },
+ {
+  "stable_id": "m1777",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-minkowskiengine"
+  ]
+ },
+ {
+  "stable_id": "m2221",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-knn-cuda",
+   "runtime-dependency-pointnet2-ops",
+   "runtime-dependency-chamfer-distance-extension"
+  ]
+ },
+ {
+  "stable_id": "m2241",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-torch-cluster"
+  ]
+ },
+ {
+  "stable_id": "m2304",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-torch-cluster"
+  ]
+ },
+ {
+  "stable_id": "m3122",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-torch-geometric",
+   "runtime-dependency-torch-scatter",
+   "runtime-dependency-torch-cluster",
+   "runtime-dependency-pytorch-lightning"
+  ]
+ },
+ {
+  "stable_id": "m3423",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-torch-cluster"
+  ]
+ },
+ {
+  "stable_id": "m3709",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-boltz",
+   "runtime-dependency-pytorch-lightning",
+   "runtime-dependency-torchmetrics",
+   "runtime-dependency-fairscale"
+  ]
+ },
+ {
+  "stable_id": "m4897",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency",
+   "flash-linear-attention-distribution",
+   "transformers-distribution",
+   "triton-distribution"
+  ]
+ },
+ {
+  "stable_id": "m4903",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-flash-linear-attention",
+   "runtime-dependency-transformers",
+   "runtime-dependency-flash-attn",
+   "runtime-dependency-triton"
+  ]
+ },
+ {
+  "stable_id": "m4905",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-transformers",
+   "runtime-dependency-triton"
+  ]
+ },
+ {
+  "stable_id": "m4954",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency"
+  ]
+ },
+ {
+  "stable_id": "m4974",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-transformers",
+   "runtime-dependency-flash-linear-attention"
+  ]
+ },
+ {
+  "stable_id": "m4976",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-transformers",
+   "runtime-dependency-triton",
+   "runtime-dependency-flash-linear-attention"
+  ]
+ },
+ {
+  "stable_id": "m5006",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-transformers",
+   "runtime-dependency-triton",
+   "runtime-dependency-flash-linear-attention"
+  ]
+ },
+ {
+  "stable_id": "m8131",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency",
+   "spconv-distribution",
+   "pcdet-package"
+  ]
+ },
+ {
+  "stable_id": "m820",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-torch-cluster"
+  ]
+ },
+ {
+  "stable_id": "m9073",
+  "blocked_stage": "environment",
+  "author_reason": "missing-runtime-dependency",
+  "prerequisite_ids": [
+   "runtime-dependency-torch-scatter",
+   "runtime-dependency-plyfile",
+   "runtime-dependency-simple-knn",
+   "runtime-dependency-diff-gaussian-rasterization",
+   "cuda-runtime"
+  ]
+ }
+]

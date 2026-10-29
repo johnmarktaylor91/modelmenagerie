@@ -1,0 +1,18 @@
+{
+ "field": "modality_output",
+ "source": "docs/metadata/SCHEMA_v2.md column 19 (modality_output), closed for describe (2026-10-08)",
+ "values": [
+  "logits",
+  "embeddings",
+  "mask",
+  "bbox",
+  "text",
+  "audio",
+  "image",
+  "video",
+  "graph",
+  "sequence",
+  "scalar",
+  "other"
+ ]
+}

@@ -1,0 +1,2 @@
+{"schema":"roster/1","name":"resnet18","zoo":"timm","variant":"","family":"resnet","domain":"vision/image","era":"2015","aliases":[],"stable_id":"m8839","found_by":[],"hint_urls":[],"state":"active"}
+{"schema":"roster/1","name":"beit_base_patch16_224","zoo":"timm","variant":"","family":"beit","domain":"vision/image","era":"2021","aliases":[],"stable_id":"m3631","found_by":[],"hint_urls":[],"state":"active"}

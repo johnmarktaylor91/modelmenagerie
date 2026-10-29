@@ -1,0 +1,326 @@
+---
+import "@fontsource/inter/latin-400.css";
+import "@fontsource/inter/latin-600.css";
+import interLatin400 from "@fontsource/inter/files/inter-latin-400-normal.woff2?url";
+import "@fontsource/source-serif-4/latin-600.css";
+import serifLatin600 from "@fontsource/source-serif-4/files/source-serif-4-latin-600-normal.woff2?url";
+import "../styles/global.css";
+import SeoHead from "@/components/SeoHead.astro";
+import SiteSearch from "@/components/SiteSearch.astro";
+import { getManifest } from "@/lib/catalog";
+import { websiteJsonLd } from "@/lib/seo";
+import { CONTENT_LICENCE, SITE_NAME, TORCHLENS } from "@/lib/site";
+
+/**
+ * "system" follows the visitor's OS setting, light when it states none; "light" or "dark" forces a default
+ * until they choose with the header switch.
+ */
+const DEFAULT_THEME = "system" as "system" | "light" | "dark";
+
+/** Diagram images come from the asset host; open its connection early. Empty for local previews. */
+const assetBase = (import.meta.env.PUBLIC_R2_BASE as string | undefined) ?? "";
+const assetOrigin = assetBase ? new URL(assetBase).origin : "";
+
+interface Props {
+  title: string;
+  description?: string;
+  /** Absolute or site-relative URL of a raster share image at least 600 px wide (`lib/seo.ts`). */
+  ogImage?: string;
+  ogImageAlt?: string;
+  ogType?: "website" | "article";
+  /** Structured data for this page, emitted as JSON-LD. */
+  jsonLd?: Record<string, unknown> | Record<string, unknown>[];
+  /** Keep the page out of search results (404 and similar). */
+  noindex?: boolean;
+}
+
+const modelCount = new Intl.NumberFormat("en").format(getManifest().counts.models ?? 0);
+const {
+  title,
+  description = `Architecture diagrams of ${modelCount} neural networks, traced with TorchLens. Browse, zoom and download.`,
+  ogImage,
+  ogImageAlt,
+  ogType,
+  jsonLd,
+  noindex = false,
+} = Astro.props;
+
+const pageTitle = title === SITE_NAME ? title : `${title} | ${SITE_NAME}`;
+const pathname = Astro.url.pathname;
+const structuredData = [pathname === "/" ? websiteJsonLd() : null, ...(Array.isArray(jsonLd) ? jsonLd : jsonLd ? [jsonLd] : [])].filter(
+  (item): item is Record<string, unknown> => item !== null,
+);
+const navItems = [
+  { href: "/models/", label: "Models" },
+  { href: "/dataset/", label: "Dataset" },
+  { href: "/about/", label: "About" },
+];
+/** The listing pages carry their own search box, so the header one is left out there. */
+const showHeaderSearch = !/^\/models\/(\d+\/)?$/.test(pathname);
+const currentState = (href: string) => (pathname === href ? "page" : pathname.startsWith(href) ? "true" : undefined);
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script is:inline define:vars={{ defaultTheme: DEFAULT_THEME }}>
+      let theme = null;
+      try {
+        const stored = localStorage.getItem("theme");
+        if (stored === "light" || stored === "dark") theme = stored;
+      } catch {}
+      if (!theme) {
+        theme =
+          defaultTheme === "system"
+            ? matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light"
+            : defaultTheme;
+      }
+      document.documentElement.dataset.theme = theme;
+    </script>
+    <title>{pageTitle}</title>
+    <link rel="icon" href="/favicon.ico" sizes="32x32" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="preload" href={interLatin400} as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href={serifLatin600} as="font" type="font/woff2" crossorigin />
+    {assetOrigin && <link rel="preconnect" href={assetOrigin} />}
+    <SeoHead
+      title={pageTitle}
+      description={description}
+      pathname={pathname}
+      noindex={noindex}
+      ogImage={ogImage}
+      ogImageAlt={ogImageAlt}
+      ogType={ogType}
+      jsonLd={structuredData}
+    />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header border-b">
+      <div class="shell header-row">
+        <div class="brand-group">
+          <a href="/" class="brand">
+            <span class="brand-prefix">TorchLens </span>Model Menagerie
+          </a>
+          <a class="preview-tag" href="/about/#status" title="Preview release: what has been checked so far">preview</a>
+        </div>
+        <nav class="site-nav" aria-label="Site">
+          <ul>
+            {
+              navItems.map((item) => (
+                <li>
+                  <a class="navlink" href={item.href} aria-current={currentState(item.href)}>
+                    {item.label}
+                  </a>
+                </li>
+              ))
+            }
+          </ul>
+        </nav>
+        {showHeaderSearch && <SiteSearch id="site-search" />}
+        <button id="theme-toggle" class="icon-button theme-toggle" type="button" aria-label="Switch theme">
+          <svg class="icon-sun" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <circle cx="12" cy="12" r="4.5" fill="none" stroke="currentColor" stroke-width="2"></circle>
+            <path
+              d="M12 2v2.5M12 19.5V22M4.2 4.2l1.8 1.8M18 18l1.8 1.8M2 12h2.5M19.5 12H22M4.2 19.8 6 18M18 6l1.8-1.8"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"></path>
+          </svg>
+          <svg class="icon-moon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path
+              d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linejoin="round"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+    <main id="main" tabindex="-1">
+      <slot />
+    </main>
+    <footer class="shell site-footer border-t">
+      <p>
+        Diagrams drawn with <a class="textlink" href={TORCHLENS.repo}>TorchLens</a>. Site text, diagrams and dataset:
+        <a class="textlink" href={CONTENT_LICENCE.url} rel="license">{CONTENT_LICENCE.short}</a>.
+      </p>
+      <ul class="footer-links">
+        <li><a class="navlink" href="/about/#cite">Cite</a></li>
+        <li><a class="navlink" href="/legal/">Privacy and licences</a></li>
+        <li><a class="navlink" href="/changelog/">Changes</a></li>
+        <li><a class="navlink" href={TORCHLENS.pypi}>PyPI</a></li>
+        <li><a class="navlink" href={TORCHLENS.repo}>GitHub</a></li>
+      </ul>
+    </footer>
+    <script>
+      const root = document.documentElement;
+      const toggle = document.getElementById("theme-toggle");
+      const darkQuery = matchMedia("(prefers-color-scheme: dark)");
+
+      function readStored(): string | null {
+        try {
+          return localStorage.getItem("theme");
+        } catch {
+          return null;
+        }
+      }
+
+      function apply(theme: "light" | "dark"): void {
+        root.dataset.theme = theme;
+        const next = theme === "light" ? "dark" : "light";
+        toggle?.setAttribute("aria-label", `Switch to ${next} theme`);
+        toggle?.setAttribute("title", `Switch to ${next} theme`);
+      }
+
+      apply(root.dataset.theme === "dark" ? "dark" : "light");
+      toggle?.addEventListener("click", () => {
+        const next = root.dataset.theme === "light" ? "dark" : "light";
+        apply(next);
+        try {
+          localStorage.setItem("theme", next);
+        } catch {
+          // Storage can be unavailable (private mode); the switch still works for this page.
+        }
+      });
+      darkQuery.addEventListener("change", (event) => {
+        const stored = readStored();
+        if (stored !== "light" && stored !== "dark") apply(event.matches ? "dark" : "light");
+      });
+    </script>
+  </body>
+</html>
+
+<style>
+  .site-header {
+    background: var(--bg);
+  }
+
+  .header-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.25rem;
+    padding-block: 0.6rem;
+  }
+
+  .brand-group {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-right: auto;
+    min-width: 0;
+  }
+
+  .brand {
+    font-family: var(--font-heading);
+    font-size: 1.125rem;
+    font-weight: 600;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  .brand-prefix {
+    color: var(--secondary);
+  }
+
+  .preview-tag {
+    padding: 0.05rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--secondary);
+    font-size: 0.75rem;
+    line-height: 1.5;
+    text-decoration: none;
+  }
+
+  .preview-tag:hover {
+    color: var(--text);
+    border-color: var(--secondary);
+  }
+
+  .site-nav ul {
+    display: flex;
+    gap: 1.25rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .header-row :global(.site-search) {
+    flex: 0 1 14rem;
+  }
+
+  :global([data-theme="light"]) .icon-moon,
+  :global([data-theme="dark"]) .icon-sun,
+  :global(html:not([data-theme])) .icon-moon {
+    display: none;
+  }
+
+  main:focus {
+    outline: none;
+  }
+
+  .site-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem 1.5rem;
+    margin-top: 2.5rem;
+    padding-block: 1.5rem 2.5rem;
+    color: var(--secondary);
+    font-size: 0.875rem;
+  }
+
+  .site-footer p {
+    margin: 0;
+  }
+
+  .footer-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.25rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  /* Phone: name and theme switch on the first row; links and search share the second. */
+  @media (max-width: 47.99rem) {
+    .header-row {
+      gap: 0.5rem 1rem;
+    }
+
+    .brand-group {
+      order: 1;
+    }
+
+    .theme-toggle {
+      order: 3;
+    }
+
+    .site-nav {
+      order: 4;
+    }
+
+    .header-row :global(.site-search) {
+      order: 5;
+      flex: 1 1 8rem;
+    }
+  }
+
+  @media (max-width: 29.99rem) {
+    .brand-prefix {
+      display: none;
+    }
+  }
+</style>

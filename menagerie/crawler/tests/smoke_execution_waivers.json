@@ -1,0 +1,21 @@
+{
+  "schema_version": "menagerie.crawler.smoke-execution-waivers.v1",
+  "comment": "Four-part waiver registry for the smoke EXECUTION floor (MENAGERIE_SMOKE_EXECUTION_FLOOR=1). A row lets one exact node id SKIP without failing the floor when the gate host provably lacks a named capability, or (no-consumer-at-production-width) when the calibrated production width makes the adjudicated behavior structurally unconstructible; it never counts the node as passed, is recomputed against the live session every run (a waived node that RUNS refuses until the row is pruned), and is disclosed in the execution-floor census. Reason codes are a closed vocabulary enforced by the conftest loader; widening it is a new waiver needing its own reviewed change.",
+  "waivers": [
+    {
+      "node_id": "menagerie/crawler/tests/test_checker_envelope_golden.py::test_golden_cap_width_batch_routes_per_item_not_per_batch",
+      "reason_code": "no-consumer-at-production-width",
+      "detail": "Per-item route independence inside one multi-item session has no consumer at METADATA_BATCH_MAX == 1: the envelope builder refuses a second item, so no recorded cap-width multi-item session can exist to adjudicate. Re-arms (and this row must be pruned) with any future width increase."
+    },
+    {
+      "node_id": "menagerie/crawler/tests/test_checker_envelope_golden.py::test_golden_mixed_batch_routes_each_item_independently",
+      "reason_code": "no-consumer-at-production-width",
+      "detail": "A session mixing accepted with non-accepted items cannot exist at METADATA_BATCH_MAX == 1; the mixed-batch class re-records and this row must be pruned with any future width increase."
+    },
+    {
+      "node_id": "menagerie/crawler/tests/test_checker_lane_failure_scoping.py::test_healthy_checker_after_downshift_gates_every_member",
+      "reason_code": "no-consumer-at-production-width",
+      "detail": "The 4 -> 2,2 halving shape needs a batch cap of at least four; at METADATA_BATCH_MAX == 1 no batch can refuse on width and the downshift ladder has no consumer. Re-arms (and this row must be pruned) with a future width increase."
+    }
+  ]
+}

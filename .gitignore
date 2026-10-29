@@ -1,0 +1,43 @@
+._*
+*.log
+*.err
+
+# Menagerie verification ledger is environment-specific append-only run state.
+menagerie/data/verification.db*
+
+# Crawler disposable runtime state (the supervisor's .crawl-local/ tree).
+# Canonical records and manifests stay tracked.
+/.crawl-local/
+
+# --- secrets (managed block, keep in every repo) ---
+.env
+.env.*
+!.env.example
+!.env.template
+!.env.sample
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+*.ppk
+secrets/
+.secrets/
+credentials.json
+*credentials*.json
+service-account*.json
+*serviceaccount*.json
+.netrc
+.npmrc
+.pypirc
+*.token
+*_token.txt
+config.env
+# --- end secrets block ---
+
+# Python bytecode: never committed (the tick commits data by name; bytecode is not data).
+__pycache__/
+*.egg-info/

@@ -1,0 +1,55 @@
+---
+/**
+ * Search and sharing tags for one page: description, canonical address, Open Graph and Twitter cards
+ * and JSON-LD. Pages set them through BaseLayout's props; the helpers are in `lib/seo.ts`.
+ */
+import { DEFAULT_SHARE_IMAGE, SHARE_IMAGE_HEIGHT, SHARE_IMAGE_WIDTH, type ShareImage } from "@/lib/seo";
+import { SITE_NAME, SITE_URL } from "@/lib/site";
+
+interface Props {
+  /** Full title, already joined with the site name. */
+  title: string;
+  description: string;
+  pathname: string;
+  noindex: boolean;
+  /** Absolute or site-relative URL of a raster image at least 600 px wide; the default card if absent. */
+  ogImage?: string;
+  ogImageAlt?: string;
+  ogType?: "website" | "article";
+  jsonLd: Record<string, unknown>[];
+}
+
+const { title, description, pathname, noindex, ogImage, ogImageAlt, ogType = "website", jsonLd } = Astro.props;
+const site = new URL(SITE_URL);
+const canonical = new URL(pathname, site).href;
+/** Generated share images are always 1200 by 630; other images get no size tags rather than wrong ones. */
+const generated = (url: string) => url.startsWith("/og/");
+const image: ShareImage = ogImage
+  ? {
+      url: ogImage,
+      alt: ogImageAlt ?? title,
+      ...(generated(ogImage) ? { width: SHARE_IMAGE_WIDTH, height: SHARE_IMAGE_HEIGHT } : {}),
+    }
+  : DEFAULT_SHARE_IMAGE;
+const imageUrl = new URL(image.url, site).href;
+---
+
+<meta name="description" content={description} />
+{noindex ? <meta name="robots" content="noindex" /> : <link rel="canonical" href={canonical} />}
+<meta property="og:site_name" content={SITE_NAME} />
+<meta property="og:locale" content="en" />
+<meta property="og:title" content={title} />
+<meta property="og:description" content={description} />
+<meta property="og:type" content={ogType} />
+{!noindex && <meta property="og:url" content={canonical} />}
+<meta property="og:image" content={imageUrl} />
+{image.url.endsWith(".png") && <meta property="og:image:type" content="image/png" />}
+{image.width && <meta property="og:image:width" content={String(image.width)} />}
+{image.height && <meta property="og:image:height" content={String(image.height)} />}
+<meta property="og:image:alt" content={image.alt} />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content={title} />
+<meta name="twitter:description" content={description} />
+<meta name="twitter:image" content={imageUrl} />
+<meta name="twitter:image:alt" content={image.alt} />
+{jsonLd.map((data) => <script type="application/ld+json" set:html={JSON.stringify(data).replace(/</g, "\\u003c")} />)}

@@ -1,0 +1,164 @@
+{
+  "schema_version": "menagerie.crawler.required-gate-set.v3",
+  "comment": "Closure-keyed certification (RC-3, overhaul ruling D.3). Every gate declares its input_closure: the ordered repo path prefixes (trailing slash) or exact tracked paths whose committed bytes the gate reads. A gate verdict is keyed by closure_sha = sha256 over the sorted (blob sha, path) pairs of every tracked file inside (input_closure + implicit_closure) minus exclude, computed from the git tree, never from a producer field. A commit that leaves a gate's closure byte-identical does not need that gate re-run: the existing green verdict for that closure_sha stays consumable. The census test asserts every tracked source path under census_roots sits inside at least one gate's closure, so nothing escapes certification by living outside every closure. Commands run through menagerie.crawler.tools.gate_runner with {python} and {junit} substituted; env is literal. Edits to this file are reviewed schema changes. Every pytest-run gate bounds each test: pytest-timeout (signal method) fails a Python-level hang named and lets the run continue, and the faulthandler exit backstop (a later, process-terminating deadline) names a native-level hang and ends the process; a hung test therefore fails fast and named instead of wedging the gate for hours (fast-tier wedge of 2026-09-02).",
+  "census_roots": ["menagerie/", "torchlens/", "tests/", "tools/", "pyproject.toml", "conftest.py"],
+  "implicit_closure": [
+    "menagerie/crawler/tools/required_gate_set.json",
+    "menagerie/crawler/tools/gate_closure.py",
+    "menagerie/crawler/tools/gate_verdicts.py",
+    "menagerie/crawler/tools/gate_runner.py",
+    "menagerie/crawler/tools/collection_gate.py",
+    "pyproject.toml"
+  ],
+  "gates": {
+    "collection": {
+      "description": "Collection gate: every corpus module collects with zero errors and at least one test; per-module counts are reported. Replaces the exact-inventory floor. Always re-run (it is the cheapest gate and the one a conflict marker fails).",
+      "always": true,
+      "input_closure": ["menagerie/crawler/tests/", "tests/crawler/", "conftest.py"],
+      "exclude": [],
+      "command": ["{python}", "-m", "menagerie.crawler.tools.collection_gate", "--python", "{python}"],
+      "env": {},
+      "junit": false,
+      "requires_armed_floor": false
+    },
+    "crawler-smoke": {
+      "description": "Crawler corpus smoke tier (per-push gate), execution floor armed, rigs excluded.",
+      "always": false,
+      "input_closure": ["menagerie/crawler/", "tests/crawler/", "torchlens/", "conftest.py"],
+      "exclude": [],
+      "command": [
+        "{python}", "-m", "pytest", "menagerie/crawler/tests", "tests/crawler",
+        "-m", "smoke and not rig", "-n", "auto", "--dist", "loadfile",
+        "--tb=short", "-q", "--junit-xml={junit}",
+        "--timeout=900", "--timeout-method=signal",
+        "-o", "faulthandler_timeout=1020", "-o", "faulthandler_exit_on_timeout=true"
+      ],
+      "env": {"MENAGERIE_SMOKE_EXECUTION_FLOOR": "1"},
+      "junit": true,
+      "requires_armed_floor": true
+    },
+    "crawler-full": {
+      "description": "Crawler corpus full tier (minus rare, minus rigs): runs when the crawler closure moved.",
+      "always": false,
+      "input_closure": ["menagerie/crawler/", "tests/crawler/", "torchlens/", "conftest.py"],
+      "exclude": [],
+      "command": [
+        "{python}", "-m", "pytest", "menagerie/crawler/tests", "tests/crawler",
+        "-m", "not rig", "-n", "auto", "--dist", "loadfile",
+        "--tb=short", "-q", "--junit-xml={junit}",
+        "--timeout=900", "--timeout-method=signal",
+        "-o", "faulthandler_timeout=1020", "-o", "faulthandler_exit_on_timeout=true"
+      ],
+      "env": {},
+      "junit": true,
+      "requires_armed_floor": false
+    },
+    "crawler-rigs": {
+      "description": "The scheduler and shard-merge rigs (the corpus giants over 99 s): run when THEIR inputs move.",
+      "always": false,
+      "input_closure": [
+        "menagerie/crawler/scheduler.py",
+        "menagerie/crawler/scheduler_parks.py",
+        "menagerie/crawler/scheduler_quarantines.py",
+        "menagerie/crawler/driver.py",
+        "menagerie/crawler/driver_admission.py",
+        "menagerie/crawler/driver_receipts.py",
+        "menagerie/crawler/campaign_merge.py",
+        "menagerie/crawler/tools/merge_host_shards.py",
+        "menagerie/crawler/tools/handoff_bundle.py",
+        "menagerie/crawler/tests/sim_rig_support.py",
+        "menagerie/crawler/tests/test_scheduler_throughput_floor.py",
+        "menagerie/crawler/tests/test_merge_pilot_shards.py",
+        "menagerie/crawler/tests/conftest.py",
+        "menagerie/crawler/tests/fixtures/",
+        "tests/crawler/"
+      ],
+      "exclude": [],
+      "command": [
+        "{python}", "-m", "pytest",
+        "menagerie/crawler/tests/test_scheduler_throughput_floor.py",
+        "menagerie/crawler/tests/test_merge_pilot_shards.py",
+        "-m", "rig", "-n", "auto", "--dist", "loadfile",
+        "--tb=short", "-q", "--junit-xml={junit}",
+        "--timeout=3600", "--timeout-method=signal",
+        "-o", "faulthandler_timeout=3720", "-o", "faulthandler_exit_on_timeout=true"
+      ],
+      "env": {},
+      "junit": true,
+      "requires_armed_floor": false
+    },
+    "tree-hygiene": {
+      "description": "Whole-source-tree hygiene rig (detect-secrets scan, fabricated-lock and runtime-artifact tripwires). Its input is the tracked source tree, so it moves with any source change; docs-only commits are covered by the detect-secrets pre-commit hook instead.",
+      "always": false,
+      "input_closure": ["menagerie/", "torchlens/", "tests/", "tools/", "conftest.py", ".secrets.baseline", ".pre-commit-config.yaml"],
+      "exclude": [],
+      "command": [
+        "{python}", "-m", "pytest", "tests/crawler/test_static_boundaries.py",
+        "-m", "rig", "--tb=short", "-q", "--junit-xml={junit}",
+        "--timeout=3600", "--timeout-method=signal",
+        "-o", "faulthandler_timeout=3720", "-o", "faulthandler_exit_on_timeout=true"
+      ],
+      "env": {},
+      "junit": true,
+      "requires_armed_floor": false
+    },
+    "fast-tier": {
+      "description": "TorchLens core fast tier (not rare, not slow, not heavy): runs when torchlens or the non-crawler menagerie moved.",
+      "always": false,
+      "input_closure": ["torchlens/", "menagerie/", "tests/", "conftest.py"],
+      "exclude": ["menagerie/crawler/", "tests/crawler/"],
+      "command": [
+        "{python}", "-m", "pytest", "tests/", "--ignore=tests/crawler",
+        "-m", "not rare and not slow and not heavy",
+        "--tb=short", "-q", "--junit-xml={junit}",
+        "--timeout=180", "--timeout-method=signal",
+        "-o", "faulthandler_timeout=300", "-o", "faulthandler_exit_on_timeout=true"
+      ],
+      "env": {},
+      "junit": true,
+      "requires_armed_floor": false
+    },
+    "tooling": {
+      "description": "Repository tooling tests (mypy ratchet, merge train, path-overlap preflight): run when tools/ moved.",
+      "always": false,
+      "input_closure": ["tools/", "conftest.py"],
+      "exclude": [],
+      "command": [
+        "{python}", "-m", "pytest", "tools/tests", "--tb=short", "-q", "--junit-xml={junit}",
+        "--timeout=180", "--timeout-method=signal",
+        "-o", "faulthandler_timeout=300", "-o", "faulthandler_exit_on_timeout=true"
+      ],
+      "env": {},
+      "junit": true,
+      "requires_armed_floor": false
+    },
+    "round21-macos-attestation": {
+      "description": "Round 21 macOS committed-lock release proof: recorded from the release attestation JSON the conftest mints under MENAGERIE_RELEASE_GATE=1 on an Apple-Silicon host with the prefix materialized from the committed lock. Runs when the locks or the registry inputs moved.",
+      "always": false,
+      "input_closure": [
+        "menagerie/crawler/envs/locks/",
+        "menagerie/crawler/tests/round21_macos_real_nodes.json",
+        "menagerie/crawler/tests/round21_linux_real_nodes.json",
+        "menagerie/crawler/tests/conftest.py",
+        "menagerie/crawler/tests/test_session_death_dry_run_rehearsal.py",
+        "menagerie/crawler/tests/test_usage_pause_wake_dry_run_rehearsal.py",
+        "menagerie/crawler/tools/release_lock.py",
+        "menagerie/crawler/tools/round21_registry_paths.py"
+      ],
+      "exclude": [],
+      "command": null,
+      "env": {},
+      "junit": false,
+      "requires_armed_floor": false
+    }
+  },
+  "required_for_invocation": [
+    "collection",
+    "crawler-smoke",
+    "crawler-full",
+    "crawler-rigs",
+    "tree-hygiene",
+    "fast-tier",
+    "round21-macos-attestation"
+  ]
+}

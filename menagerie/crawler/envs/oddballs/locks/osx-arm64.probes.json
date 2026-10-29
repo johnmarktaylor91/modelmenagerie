@@ -1,0 +1,1 @@
+{"probes":[{"detail":"ok","name":"import:torch","passed":true},{"detail":"ok","name":"import:torchvision","passed":true},{"detail":"ok","name":"import:einops","passed":true},{"detail":"ok","name":"import:numpy","passed":true},{"detail":"ok","name":"export:torch:__version__","passed":true},{"detail":"ok","name":"export:einops:rearrange","passed":true}]}

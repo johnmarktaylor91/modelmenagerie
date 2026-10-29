@@ -1,0 +1,23 @@
+{
+  "schema_version": "menagerie.crawler.width-rearm-inventory.v1",
+  "comment": "P5 fable-F9: the committed width re-arm checklist. The three SMOKE width-gated skips ride the four-part smoke_execution_waivers registry; every OTHER width-gated skip and every width-conditioned corpus retirement was disclosed only in comments, invisible to any census. This file commits the exact set. test_width_rearm_inventory.py recomputes the skip scan from live source bytes and pins production_width, so a width increase (or a new width-gated skip, or a silent removal) refuses until this inventory is walked and updated in the same reviewed change.",
+  "production_width": 1,
+  "width_gated_skips": [
+    {"file": "menagerie/crawler/tests/test_c2_gate_rehearsal.py", "threshold": 2, "count": 3},
+    {"file": "menagerie/crawler/tests/test_checker_envelope_golden.py", "threshold": 2, "count": 2},
+    {"file": "menagerie/crawler/tests/test_checker_lane_failure_scoping.py", "threshold": 4, "count": 1},
+    {"file": "menagerie/crawler/tests/test_checker_wave_concurrency.py", "threshold": 2, "count": 1},
+    {"file": "menagerie/crawler/tests/test_slice_d_checker_gates.py", "threshold": 2, "count": 3},
+    {"file": "menagerie/crawler/tests/test_slice_f_driver.py", "threshold": 2, "count": 1}
+  ],
+  "corpus_retirements": [
+    {
+      "entry": "metadata_mixed_batch",
+      "rearm": "METADATA_BATCH_MAX > 1 re-records this class and re-arms CORPUS_ENTRIES in test_checker_envelope_golden.py in the same reviewed change"
+    },
+    {
+      "entry": "metadata_mixed_disputed",
+      "rearm": "METADATA_BATCH_MAX > 1 re-records this class and re-arms CORPUS_ENTRIES in test_checker_envelope_golden.py in the same reviewed change"
+    }
+  ]
+}

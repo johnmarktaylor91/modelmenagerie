@@ -1,0 +1,556 @@
+---
+import type { Page } from "astro";
+import ModelCard from "@/components/ModelCard.astro";
+import BaseLayout from "@/layouts/BaseLayout.astro";
+import { getAllModels, getListingOrder, type ModelRecord } from "@/lib/catalog";
+import { getListingControls } from "@/lib/modelIndex";
+import { formatNumber } from "@/lib/labels";
+import { rangeText, renderPagerHtml } from "@/scripts/ListingPager";
+
+interface Props {
+  page: Page<ModelRecord>;
+}
+
+const PAGE_SIZE = 48;
+
+export function getStaticPaths({ paginate }: { paginate: (items: ModelRecord[], options: { pageSize: number }) => unknown }) {
+  // Pictures first, then name: the static pages are the default "Pictures first" sort.
+  return paginate(getListingOrder(), { pageSize: 48 });
+}
+
+const models = getAllModels();
+const total = models.length;
+const page = Astro.props.page;
+const pageHref = (pageNumber: number) => (pageNumber === 1 ? "/models/" : `/models/${pageNumber}/`);
+const pagerHtml = renderPagerHtml(page.currentPage, page.lastPage, pageHref);
+// Astro's page.start and page.end are zero-based and inclusive.
+const countText = rangeText(page.start + 1, page.end + 1, total, { one: "model", many: "models" });
+
+// Facets and sorts come from the fields the catalog actually fills; empty ones stay out.
+const { groups, sorts } = getListingControls();
+const assetBase = import.meta.env.PUBLIC_R2_BASE ?? "";
+---
+
+<BaseLayout title="Models" description={`Search and filter ${formatNumber(total)} neural network architecture diagrams traced with TorchLens.`}>
+  <section
+    class="shell listing"
+    id="listing"
+    data-page-size={PAGE_SIZE}
+    data-static-page={page.currentPage}
+    data-last-page={page.lastPage}
+    data-asset-base={assetBase}
+  >
+    <script is:inline>
+      // Apply the Cards or List view before the cards paint: ?view= first, then the remembered
+      // choice (key shared with ListingView.ts).
+      (() => {
+        let view = new URLSearchParams(location.search).get("view");
+        try {
+          if (view !== "list" && view !== "cards") view = localStorage.getItem("menagerie:listing-view");
+        } catch {}
+        if (view === "list") document.documentElement.dataset.listingView = "list";
+      })();
+    </script>
+    <div class="listing__head">
+      <div>
+        <h1 class="listing__title">Models</h1>
+        <p class="listing__lede">{formatNumber(total)} architectures. Search by name or filter by task.</p>
+      </div>
+      <form class="listing__search" id="listing-search-form" role="search" action="/models/" method="get">
+        <label class="sr-only" for="listing-search">Search models</label>
+        <input id="listing-search" name="q" type="search" placeholder="Search, e.g. ResNet-50" autocomplete="off" spellcheck="false" />
+        <button class="button" type="submit">Search</button>
+      </form>
+    </div>
+
+    <div class="listing__layout">
+      <details class="listing__filters" id="listing-filters">
+        <summary class="listing__filters-toggle">Filters <span data-filter-count></span></summary>
+        <div class="listing__filter-body">
+          {
+            groups.map((group) => (
+              <fieldset class="listing__facet">
+                <legend>{group.legend}</legend>
+                {group.facets.map((facet) => (
+                  <label class="listing__option">
+                    <input type="checkbox" data-filter={group.key} value={facet.value} />
+                    <span class="listing__option-label">{facet.label}</span>
+                    <span class="listing__option-count">{formatNumber(facet.count)}</span>
+                  </label>
+                ))}
+              </fieldset>
+            ))
+          }
+          <button class="button listing__clear" type="button" data-clear-filters>Clear filters</button>
+        </div>
+      </details>
+      <script is:inline>
+        // Filters start open beside the results on wide screens and folded away on phones.
+        (() => {
+          const wide = window.matchMedia("(min-width: 1024px)");
+          const filters = document.getElementById("listing-filters");
+          if (wide.matches) filters.open = true;
+          wide.addEventListener("change", (event) => {
+            if (event.matches) filters.open = true;
+          });
+        })();
+      </script>
+
+      <div class="listing__results">
+        <div class="listing__toolbar">
+          <p id="listing-count" class="listing__count" role="status" aria-live="polite">{countText}</p>
+          <div class="listing__controls">
+            <div class="listing__view" role="group" aria-label="Show models as">
+              <button class="listing__view-button" type="button" data-listing-view="cards" aria-pressed="true">Cards</button>
+              <button class="listing__view-button" type="button" data-listing-view="list" aria-pressed="false">List</button>
+            </div>
+            <label class="listing__sort">
+              <span>Sort</span>
+              <select id="listing-sort">
+                {sorts.map((sort) => <option value={sort.key} selected={sort.key === "preview"}>{sort.label}</option>)}
+              </select>
+            </label>
+          </div>
+        </div>
+        <p id="listing-family" class="listing__active" hidden>
+          <span>Family: <strong data-family-name></strong></span>
+          <button class="button listing__active-clear" type="button" data-clear-family>Show all families</button>
+        </p>
+        <p id="listing-note" class="listing__note" role="status" hidden></p>
+        <div id="listing-error" class="listing__notice" role="alert" hidden>
+          <p id="listing-error-text">The model list could not be loaded. Retry, or browse the pages below.</p>
+          <button id="listing-retry" class="button" type="button">Retry</button>
+        </div>
+        <div id="listing-grid" class="listing__grid">
+          {page.data.map((model: ModelRecord) => <ModelCard model={model} />)}
+        </div>
+        <div id="listing-empty" class="listing__notice" hidden>
+          <p>No models match. Try a shorter search or fewer filters.</p>
+          <button class="button" type="button" data-clear-filters>Clear search and filters</button>
+        </div>
+        <nav id="listing-pager" class="pager" aria-label="Pages" set:html={pagerHtml} />
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<script>
+  import { initListing } from "@/scripts/ListingController";
+
+  const root = document.getElementById("listing");
+  if (root) initListing(root);
+</script>
+
+<style>
+  .listing {
+    padding-block: 2.5rem;
+  }
+
+  .listing__head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .listing__title {
+    margin: 0;
+    font-size: 2.25rem;
+    font-weight: 600;
+    line-height: 1.15;
+  }
+
+  .listing__lede {
+    margin: 0.4rem 0 0;
+    color: var(--secondary);
+  }
+
+  .listing__search {
+    display: flex;
+    flex: 1 1 18rem;
+    gap: 0.5rem;
+    max-width: 28rem;
+  }
+
+  .listing__search input {
+    flex: 1;
+    min-width: 0;
+    padding: 0.55rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--surface);
+    color: var(--text);
+  }
+
+  .listing__layout {
+    display: grid;
+    gap: 1.5rem;
+  }
+
+  .listing__filters {
+    align-self: start;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--surface) 90%, transparent);
+  }
+
+  .listing__filters-toggle {
+    padding: 0.7rem 1rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .listing__filter-body {
+    display: grid;
+    gap: 1.25rem;
+    padding: 0 1rem 1rem;
+  }
+
+  .listing__facet {
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  .listing__facet legend {
+    margin-bottom: 0.4rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+  }
+
+  .listing__option {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding-block: 0.2rem;
+    font-size: 0.875rem;
+    cursor: pointer;
+  }
+
+  .listing__option-label {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .listing__option-count {
+    color: var(--secondary);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .listing__toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    scroll-margin-top: 1rem;
+  }
+
+  .listing__count {
+    margin: 0;
+    color: var(--secondary);
+    font-size: 0.875rem;
+  }
+
+  .listing__sort {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--secondary);
+    font-size: 0.875rem;
+  }
+
+  .listing__sort select {
+    padding: 0.4rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--surface);
+    color: var(--text);
+  }
+
+  .listing__controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem 1.25rem;
+  }
+
+  .listing__view {
+    display: inline-flex;
+    padding: 2px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+  }
+
+  .listing__view-button {
+    min-height: 2rem;
+    padding: 0.25rem 0.8rem;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--secondary);
+    font: inherit;
+    font-size: 0.875rem;
+    cursor: pointer;
+  }
+
+  .listing__view-button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  /* The pressed look follows the root attribute set before first paint, so it never flickers. */
+  :global(:root:not([data-listing-view="list"])) .listing__view-button[data-listing-view="cards"],
+  :global(:root[data-listing-view="list"]) .listing__view-button[data-listing-view="list"] {
+    background: var(--text);
+    color: var(--bg);
+    font-weight: 600;
+  }
+
+  /*
+   * Cards view. A picture card spans two row tracks and a text card (no preview) one, and dense
+   * packing pairs text cards in one picture card's slot, so the grid has no stretched blank cards.
+   */
+  .listing__grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 15.5rem), 1fr));
+    grid-auto-flow: row dense;
+    gap: 1rem;
+    transition: opacity 150ms ease;
+  }
+
+  .listing__grid :global(.model-card) {
+    grid-row: span 2;
+  }
+
+  .listing__grid :global(.model-card--text) {
+    grid-row: span 1;
+  }
+
+  /* Phones: one picture card per row, text cards two to a row. */
+  @media (max-width: 559px) {
+    .listing__grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.75rem;
+    }
+
+    .listing__grid :global(.model-card) {
+      grid-column: span 2;
+      grid-row: auto;
+    }
+
+    .listing__grid :global(.model-card--text) {
+      grid-column: span 1;
+    }
+  }
+
+  /* List view: one dense row per model, small picture, facts in columns on wide screens. */
+  :global(:root[data-listing-view="list"]) .listing__grid {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card) {
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    border-radius: 0;
+    background: transparent;
+  }
+
+  :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card:hover),
+  :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card:focus-within) {
+    background: var(--surface);
+  }
+
+  :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__link) {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.85rem;
+    padding: 0.45rem 0.5rem;
+  }
+
+  :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__frame) {
+    display: flex;
+    flex: none;
+    width: 4rem;
+    aspect-ratio: 4 / 3;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+
+  :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__frame::after),
+  :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__no-preview),
+  :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__chips) {
+    display: none;
+  }
+
+  :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__body) {
+    gap: 0.1rem;
+    padding: 0;
+    border-top: 0;
+  }
+
+  :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__title) {
+    -webkit-line-clamp: 1;
+    line-clamp: 1;
+  }
+
+  /*
+   * Wide screens: the rows share one grid (subgrid), so the task, operations and parameters
+   * columns line up and a column no model fills (parameters, today) takes no width.
+   */
+  @media (min-width: 800px) {
+    :global(:root[data-listing-view="list"]) .listing__grid {
+      display: grid;
+      grid-template-columns: 4rem minmax(0, 1fr) fit-content(14rem) auto auto;
+      column-gap: 1rem;
+    }
+
+    :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card),
+    :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__link) {
+      display: grid;
+      grid-column: 1 / -1;
+      grid-template-columns: subgrid;
+      align-items: center;
+    }
+
+    :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__body) {
+      display: grid;
+      grid-column: 2 / -1;
+      grid-template-columns: subgrid;
+      column-gap: 1rem;
+      align-items: baseline;
+    }
+
+    :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__facts) {
+      display: contents;
+    }
+
+    :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__fact) {
+      color: var(--secondary);
+      font-size: 0.85rem;
+    }
+
+    :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__fact--ops),
+    :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__fact--params) {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__fact::before) {
+      content: none;
+    }
+
+    /* Unknown facts keep their (empty) cell so the columns line up. */
+    :global(:root[data-listing-view="list"]) .listing__grid :global(.model-card__fact:empty) {
+      display: block;
+    }
+  }
+
+  .listing__grid[aria-busy="true"] {
+    opacity: 0.6;
+  }
+
+  .listing__active {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 0.75rem;
+    margin: 0 0 1rem;
+    font-size: 0.9rem;
+  }
+
+  .listing__active[hidden],
+  .listing__note[hidden] {
+    display: none;
+  }
+
+  .listing__note {
+    margin: 0 0 1rem;
+    color: var(--secondary);
+    font-size: 0.9rem;
+  }
+
+  .listing__notice {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    padding: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+  }
+
+  .listing__notice p {
+    margin: 0;
+  }
+
+  .listing__notice[hidden] {
+    display: none;
+  }
+
+  .pager {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 1.5rem;
+  }
+
+  .pager :global(.pager__gap) {
+    color: var(--secondary);
+  }
+
+  .pager :global(.pager__summary) {
+    display: none;
+    color: var(--secondary);
+    font-size: 0.875rem;
+  }
+
+  @media (max-width: 639px) {
+    .pager {
+      justify-content: space-between;
+    }
+
+    .pager :global(.pager__number),
+    .pager :global(.pager__gap) {
+      display: none;
+    }
+
+    .pager :global(.pager__summary) {
+      display: inline;
+    }
+  }
+
+  @media (min-width: 1024px) {
+    .listing__layout {
+      grid-template-columns: 16rem minmax(0, 1fr);
+    }
+
+    .listing__filters {
+      position: sticky;
+      top: 1rem;
+      max-height: calc(100vh - 2rem);
+      overflow-y: auto;
+    }
+
+    .listing__filters-toggle {
+      display: none;
+    }
+
+    .listing__filter-body {
+      padding-top: 1rem;
+    }
+  }
+</style>

@@ -1,0 +1,288 @@
+{
+ "pins": {
+  "C-01": {
+   "nodes": [
+    "menagerie/crawler/tests/test_operational_identity.py::test_operational_event_identity_registry_is_exhaustive_and_pinned",
+    "menagerie/crawler/tests/test_operational_identity.py::test_raw_operational_stable_hash_mints_are_interdicted",
+    "menagerie/crawler/tests/test_operational_identity.py::test_typed_constructor_fails_closed_on_unknown_or_wrong_class"
+   ],
+   "source": "audit_register:C-01"
+  },
+  "C-02": {
+   "nodes": [
+    "menagerie/crawler/tests/test_award_custody.py::test_close_time_custody_reconciles_every_raw_head_transition",
+    "menagerie/crawler/tests/test_fidelity_waiver_kernel.py",
+    "menagerie/crawler/tests/test_pd1_continuation_ruling.py::test_n8_the_v4_differential_is_exactly_the_marker_only_cell",
+    "menagerie/crawler/tests/test_waiver_disclosures.py::test_the_waiver_registry_is_closed_at_exactly_the_three_doctrine_instances"
+   ],
+   "source": "audit_register:C-02"
+  },
+  "C-03": {
+   "nodes": [
+    "menagerie/crawler/tests/test_award_custody.py::test_a_remint_is_censused_not_refused",
+    "menagerie/crawler/tests/test_award_custody.py::test_close_time_custody_reconciles_every_raw_head_transition",
+    "menagerie/crawler/tests/test_award_restoration.py",
+    "menagerie/crawler/tests/test_misrouted_model_defers_and_is_not_destroyed.py",
+    "menagerie/crawler/tests/test_rotation_transaction.py"
+   ],
+   "source": "audit_register:C-03"
+  },
+  "C-04": {
+   "nodes": [
+    "menagerie/crawler/tests/test_subset_rung_requeue_grants.py",
+    "menagerie/crawler/tests/test_warm_redrive_economics.py",
+    "menagerie/crawler/tests/test_work_selection_policy.py::test_five_row_fixture_schedules_exactly_the_never_recorded_member",
+    "menagerie/crawler/tests/test_work_selection_policy.py::test_only_unsettled_cut_is_absolute_even_for_capability_reopens",
+    "menagerie/crawler/tests/test_work_selection_policy.py::test_selection_predicate_is_pure_and_mode_invariant_to_invocation_origin"
+   ],
+   "source": "audit_register:C-04"
+  },
+  "C-05": {
+   "nodes": [
+    "menagerie/crawler/tests/test_close_contradiction_pins.py::test_an_in_window_head_with_a_live_in_window_quarantine_refuses_the_close",
+    "menagerie/crawler/tests/test_close_licenses_successor.py::test_close_licenses_its_own_successor_with_live_parks",
+    "menagerie/crawler/tests/test_close_v2_contract.py",
+    "menagerie/crawler/tests/test_rung_carried_tip_succession.py::test_composition_adding_nothing_beyond_the_tip_refuses",
+    "menagerie/crawler/tests/test_rung_carried_tip_succession.py::test_first_rung_carries_nothing_and_may_claim_nothing"
+   ],
+   "source": "audit_register:C-05"
+  },
+  "C-06": {
+   "nodes": [
+    "menagerie/crawler/tests/test_close_object.py::test_a_close_for_another_campaign_or_digest_licenses_nothing",
+    "menagerie/crawler/tests/test_close_read_scale.py::test_close_ledger_corruption_refuses_on_every_call",
+    "menagerie/crawler/tests/test_close_read_scale.py::test_held_derivation_refuses_a_shrunk_ledger",
+    "menagerie/crawler/tests/test_close_v2_contract.py::test_a_layout_may_not_change_presence_during_a_leg",
+    "menagerie/crawler/tests/test_read_authority_agreement.py"
+   ],
+   "source": "audit_register:C-06"
+  },
+  "C-07": {
+   "nodes": [
+    "menagerie/crawler/tests/test_append_only_ledger_census.py::test_scanner_detects_a_new_hand_rolled_append",
+    "menagerie/crawler/tests/test_close_read_scale.py::test_held_derivation_refuses_a_rewritten_prefix",
+    "menagerie/crawler/tests/test_ledger_chain_content_address.py::test_no_added_field_can_pin_the_address_across_a_body_edit",
+    "menagerie/crawler/tests/test_ledger_chain_poison_refusal.py::test_an_unaddressable_line_refuses_typed_at_every_authority",
+    "menagerie/crawler/tests/test_torn_chain_resume.py"
+   ],
+   "source": "audit_register:C-07"
+  },
+  "C-08": {
+   "nodes": [
+    "menagerie/crawler/tests/test_backfill_close.py::test_backfill_refuses_the_exhibit_a_shape_per_member",
+    "menagerie/crawler/tests/test_gate_citation_era_pin.py",
+    "menagerie/crawler/tests/test_migrate_legacy.py",
+    "menagerie/crawler/tests/test_pd1_continuation_ruling.py::test_attack_d_the_era_is_not_producer_choosable_at_the_door",
+    "menagerie/crawler/tests/test_rehydration_era_sweep.py"
+   ],
+   "source": "audit_register:C-08"
+  },
+  "C-09": {
+   "nodes": [
+    "menagerie/crawler/tests/test_close_v2_contract.py::test_a_forged_in_window_head_recorded_under_an_ancestor_contradicts",
+    "menagerie/crawler/tests/test_close_v2_contract.py::test_a_layout_may_not_change_presence_during_a_leg",
+    "menagerie/crawler/tests/test_close_v2_contract.py::test_a_stale_park_row_cannot_corroborate_a_withholding"
+   ],
+   "source": "audit_register:C-09"
+  },
+  "C-10": {
+   "nodes": [
+    "menagerie/crawler/tests/test_claim_vocabulary_and_absence.py",
+    "menagerie/crawler/tests/test_host_capability_terminal.py::test_a_tampered_claim_refuses_fail_closed",
+    "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_tensor_magic_payload_poisons",
+    "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_weight_format_suffix_poisons_even_when_absent",
+    "menagerie/crawler/tests/test_rung_staging.py"
+   ],
+   "source": "audit_register:C-10"
+  },
+  "C-11": {
+   "nodes": [
+    "menagerie/crawler/tests/test_append_only_ledger_census.py::test_append_site_inventory_matches_committed_closed_set",
+    "menagerie/crawler/tests/test_close_read_scale.py::test_no_unsanctioned_whole_file_ledger_read_on_the_close_path",
+    "menagerie/crawler/tests/test_close_read_scale.py::test_staging_gate_cost_does_not_grow_with_the_number_of_prior_closes",
+    "menagerie/crawler/tests/test_close_read_scale.py::test_twenty_thousand_rung_projection_stays_under_its_derived_ceiling",
+    "menagerie/crawler/tests/test_ledger_open_streaming.py"
+   ],
+   "source": "audit_register:C-11"
+  },
+  "C-12": {
+   "nodes": [
+    "menagerie/crawler/tests/test_env_turn_effort_and_park_bounds.py::test_env_generation_blast_radius_is_bounded",
+    "menagerie/crawler/tests/test_scheduler_blast_radius.py::test_blast_radius_census_every_containment_site_is_wired",
+    "menagerie/crawler/tests/test_scheduler_blast_radius.py::test_member_unroutable_refusal_leaves_the_leg_running",
+    "menagerie/crawler/tests/test_scheduler_blast_radius.py::test_no_progress_tripwire_quarantines_the_member_not_the_leg"
+   ],
+   "source": "audit_register:C-12"
+  },
+  "C-13": {
+   "nodes": [
+    "menagerie/crawler/tests/test_checker_park_release_predicate.py::test_row_holds_after_recidivism_cap_under_unchanged_identity",
+    "menagerie/crawler/tests/test_clear_environment_quarantine_tool.py::test_clearance_receipt_is_honored_by_the_admission_predicate",
+    "menagerie/crawler/tests/test_env_turn_effort_and_park_bounds.py::test_clearance_recordable_while_leg_runs",
+    "menagerie/crawler/tests/test_env_turn_effort_and_park_bounds.py::test_park_lifecycle_inventory_names_release_and_drain",
+    "menagerie/crawler/tests/test_park_release.py"
+   ],
+   "source": "audit_register:C-13"
+  },
+  "C-14": {
+   "nodes": [
+    "menagerie/crawler/tests/test_derived_constants_census.py::test_new_derivations_join_the_census",
+    "menagerie/crawler/tests/test_disk_floor_trigger.py::test_floor_probes_every_write_destination",
+    "menagerie/crawler/tests/test_launch_preflight.py::test_asserted_state_root_must_be_the_one_the_operator_will_resolve",
+    "menagerie/crawler/tests/test_launch_preflight.py::test_disk_floor_is_asserted_against_every_lane_write_destination",
+    "menagerie/crawler/tests/test_records_root_guard.py::test_a_foreign_last_writer_refuses_until_claimed"
+   ],
+   "source": "audit_register:C-14"
+  },
+  "C-15": {
+   "nodes": [
+    "menagerie/crawler/tests/test_deadman_watchdog.py::test_stale_heartbeat_pages",
+    "menagerie/crawler/tests/test_usage_pause_wake_dry_run_rehearsal.py::test_injected_backoff_pauses_the_composed_dry_run_with_durable_wake_records",
+    "menagerie/crawler/tests/test_usage_pause_wake_dry_run_rehearsal.py::test_usage_pause_wake_cycle_survives_the_real_subprocess_dry_run",
+    "menagerie/crawler/tests/test_wakeup_os_scheduler.py::test_real_launchd_bootstrap_verify_and_bootout_roundtrip",
+    "menagerie/crawler/tests/test_work_selection_policy.py::test_wake_callback_argv_carries_the_complete_launching_config"
+   ],
+   "source": "audit_register:C-15"
+  },
+  "C-16": {
+   "nodes": [
+    "menagerie/crawler/tests/test_backend_parity_classification.py::test_every_no_lane_framework_mints_the_parity_deferral",
+    "menagerie/crawler/tests/test_infra_terminal_grant_release.py",
+    "menagerie/crawler/tests/test_terminal_owner_census.py::test_every_minted_reason_names_a_closed_owner",
+    "menagerie/crawler/tests/test_terminal_owner_census.py::test_host_caused_reasons_can_never_read_as_model_terminals",
+    "menagerie/crawler/tests/test_terminal_owner_census.py::test_owner_vocabulary_is_closed"
+   ],
+   "source": "audit_register:C-16"
+  },
+  "C-17": {
+   "nodes": [
+    "menagerie/crawler/tests/test_envelope_completeness.py",
+    "menagerie/crawler/tests/test_failure_evidence_completeness.py::test_attestation_mismatch_is_published_typed_not_as_forward_failure",
+    "menagerie/crawler/tests/test_failure_evidence_completeness.py::test_failure_evidence_completeness_census",
+    "menagerie/crawler/tests/test_failure_evidence_completeness.py::test_forward_mode_run_requires_worker_error_evidence",
+    "menagerie/crawler/tests/test_failure_evidence_completeness.py::test_systemexit_in_constructor_still_writes_receipt_with_evidence"
+   ],
+   "source": "audit_register:C-17"
+  },
+  "C-18": {
+   "nodes": [
+    "menagerie/crawler/tests/test_author_spend.py",
+    "menagerie/crawler/tests/test_cache_inventory.py::test_inventory_rows_are_complete_and_authority_bearing",
+    "menagerie/crawler/tests/test_cache_inventory.py::test_lru_census_matches_inventory_exactly",
+    "menagerie/crawler/tests/test_w18_funnel.py::test_uninstrumented_spend_reads_width_as_unknown_never_zero",
+    "menagerie/crawler/tests/test_w9_cache_invalidation.py"
+   ],
+   "source": "audit_register:C-18"
+  },
+  "C-19": {
+   "nodes": [
+    "menagerie/crawler/tests/test_bounded_wait_inventory.py::test_census_actually_detects_an_unbounded_wait",
+    "menagerie/crawler/tests/test_bounded_wait_inventory.py::test_no_unbounded_waits_in_worker_area_owner_modules",
+    "menagerie/crawler/tests/test_scheduler_blast_radius.py::test_wrapper_parent_deadline_group_kills_and_stays_typed"
+   ],
+   "source": "audit_register:C-19"
+  },
+  "C-20": {
+   "nodes": [
+    "menagerie/crawler/tests/test_deadman_watchdog.py::test_stale_heartbeat_pages",
+    "menagerie/crawler/tests/test_notification_transport_truth.py::test_critical_send_settles_only_on_echo",
+    "menagerie/crawler/tests/test_notification_transport_truth.py::test_silent_exit_zero_transport_writes_unechoed_receipt",
+    "menagerie/crawler/tests/test_w18_funnel.py::test_not_instrumented_until_the_driver_emits",
+    "menagerie/crawler/tests/test_w18_funnel.py::test_uninstrumented_spend_reads_width_as_unknown_never_zero"
+   ],
+   "source": "audit_register:C-20"
+  },
+  "C-21": {
+   "nodes": [
+    "menagerie/crawler/tests/test_backend_parity_classification.py::test_every_no_lane_framework_mints_the_parity_deferral",
+    "menagerie/crawler/tests/test_backend_parity_classification.py::test_non_torch_award_requires_closed_vocabulary_dtypes",
+    "menagerie/crawler/tests/test_framework_dispatch_arm_census.py::test_adapter_dispatch_is_exhaustive_over_the_enum",
+    "menagerie/crawler/tests/test_framework_dispatch_arm_census.py::test_free_text_is_refused_not_silently_defaulted",
+    "menagerie/crawler/tests/test_framework_dispatch_arm_census.py::test_no_lane_frameworks_are_typed_not_defaulted_to_torch"
+   ],
+   "source": "audit_register:C-21"
+  },
+  "C-22": {
+   "nodes": [
+    "menagerie/crawler/tests/test_producer_field_dispatch_census.py::test_every_inventory_row_names_a_validator_that_refuses_free_text",
+    "menagerie/crawler/tests/test_producer_field_dispatch_census.py::test_the_census_would_have_caught_the_b1_instance",
+    "menagerie/crawler/tests/test_producer_field_dispatch_census.py::test_the_inventory_is_complete_over_every_sink_call"
+   ],
+   "source": "audit_register:C-22"
+  },
+  "C-23": {
+   "nodes": [
+    "menagerie/crawler/tests/test_checker_identity_flip.py::test_checker_model_flip_does_not_brick_catalog_entry_points",
+    "menagerie/crawler/tests/test_checker_prompt_leg_pin.py::test_mid_leg_rotation_is_a_typed_refusal",
+    "menagerie/crawler/tests/test_checker_prompt_leg_pin.py::test_prompt_reads_census",
+    "menagerie/crawler/tests/test_explicit_wins_config.py::test_the_frozen_value_wins_only_absent_any_explicit_source",
+    "menagerie/crawler/tests/test_leg_config_event.py::test_config_event_records_the_effective_leg_shape"
+   ],
+   "source": "audit_register:C-23"
+  },
+  "C-24": {
+   "nodes": [
+    "menagerie/crawler/tests/test_work_selection_policy.py::test_five_row_fixture_schedules_exactly_the_never_recorded_member"
+   ],
+   "source": "audit_register:C-24"
+  },
+  "C-25": {
+   "nodes": [
+    "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_in_child_tripwire_never_stricter_than_parent_classifier",
+    "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_pilot_benign_shapes_do_not_poison",
+    "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_tensor_magic_payload_poisons",
+    "menagerie/crawler/tests/test_positive_checkpoint_identification.py::test_unforeseen_benign_basename_refuses_without_poison"
+   ],
+   "source": "audit_register:C-25"
+  },
+  "C-26": {
+   "nodes": [
+    "menagerie/crawler/tests/test_author_attempts.py::test_new_attempt_creates_durable_record_and_dirs",
+    "menagerie/crawler/tests/test_env_read_census.py::test_wake_required_secrets_are_classified_secrets",
+    "menagerie/crawler/tests/test_gate_verdicts.py::test_secret_redaction_in_stored_logs",
+    "menagerie/crawler/tests/test_source_broker_forge_credential.py::test_the_credential_is_dropped_when_a_redirect_leaves_the_api",
+    "tests/crawler/test_static_boundaries.py::test_git_tree_ships_no_runtime_solve_or_secret_artifacts"
+   ],
+   "source": "audit_register:C-26"
+  },
+  "C-27": {
+   "nodes": [
+    "menagerie/crawler/tests/test_close_object.py::test_a_close_for_another_campaign_or_digest_licenses_nothing",
+    "menagerie/crawler/tests/test_membership_census_scope.py::test_durable_ledger_is_campaign_scoped_and_tamper_refusing",
+    "menagerie/crawler/tests/test_membership_census_scope.py::test_foreign_record_holder_refuses_without_acknowledgment",
+    "menagerie/crawler/tests/test_merge_pilot_shards.py::test_real_pilot_unaccounted_model_still_refuses",
+    "menagerie/crawler/tests/test_valve_campaign_identity.py"
+   ],
+   "source": "audit_register:C-27"
+  },
+  "C-28": {
+   "nodes": [
+    "menagerie/crawler/tests/test_close_meta_ledger_torn_tail_recovery.py::test_a_torn_close_meta_ledger_read_recovers_with_evidence",
+    "menagerie/crawler/tests/test_durable_fsync_census.py::test_durable_fsync_issues_the_platform_power_loss_barrier",
+    "menagerie/crawler/tests/test_durable_fsync_census.py::test_the_darwin_barrier_command_is_the_real_kernel_constant",
+    "menagerie/crawler/tests/test_durable_fsync_runtime.py::test_each_named_writer_issues_a_data_barrier_at_runtime",
+    "menagerie/crawler/tests/test_uncatchable_kill_durability_matrix.py::test_sigkill_between_publication_and_model_append_resumes_exactly_once"
+   ],
+   "source": "audit_register:C-28"
+  },
+  "C-29": {
+   "nodes": [
+    "menagerie/crawler/tests/test_custody_deadline_reaper.py::test_bound_dead_custody_force_settles_typed_at_admission_boundary",
+    "menagerie/crawler/tests/test_disk_floor_trigger.py::test_floor_probes_every_write_destination",
+    "menagerie/crawler/tests/test_disk_reaper.py::test_manifest_protects_every_load_bearing_class",
+    "menagerie/crawler/tests/test_environment_orphan_gc.py"
+   ],
+   "source": "audit_register:C-29"
+  },
+  "C-30": {
+   "nodes": [
+    "menagerie/crawler/tests/test_committed_locks_as_inputs.py::test_runtime_probe_drift_cannot_write_a_sealed_generation",
+    "menagerie/crawler/tests/test_committed_locks_as_inputs.py::test_superseded_family_is_refused_not_silently_resolved",
+    "menagerie/crawler/tests/test_env_read_census.py::test_every_environment_write_is_isolation_classified",
+    "menagerie/crawler/tests/test_seal_churn_stability.py::test_semantic_member_change_and_forbidden_entries_never_retry"
+   ],
+   "source": "audit_register:C-30"
+  }
+ },
+ "schema_version": "menagerie.crawler.regression-pins.v1"
+}

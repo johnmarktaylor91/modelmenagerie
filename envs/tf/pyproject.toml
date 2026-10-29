@@ -1,0 +1,39 @@
+# tf: Python 3.11, TensorFlow 2.16 or newer with Keras 3 (the TorchLens TF preview), CPU torch 2.6
+# (the worker imports torch for its records) and TorchLens at the project pin with its tf extra.
+# Built by `menagerie-pipeline envs build tf` from uv.lock; the build runs canary.py.
+[project]
+name = "menagerie-env-tf"
+version = "0"
+requires-python = "==3.11.*"
+dependencies = [
+    "tensorflow>=2.16",
+    "keras>=3",
+    "torch==2.6.*",
+    "torchlens[tf]==2.36.0",
+    # Menagerie's runtime dependencies, so the worker runs here without installing anything.
+    "numpy",
+    "packaging",
+    "tqdm",
+    "psutil>=5.9",
+    "pydantic>=2.0",
+    "PyYAML>=6.0",
+    "jsonschema>=4.18",
+    "referencing>=0.28",
+    "pillow",
+    # The renderer's packages (render.EXTRAS; declared non-trace roots).
+    "pyvips[binary]==3.2.0",
+    "pyvips-binary==8.18.7",
+]
+
+[tool.uv]
+package = false
+# Linux x86_64 only: the worker and the cluster.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

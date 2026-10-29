@@ -1,0 +1,428 @@
+---
+import {
+  formatBytes,
+  getDefaultVariant,
+  getDiagramFocus,
+  getStandInShareCount,
+  hasUsablePreview,
+  isHeavyVariant,
+  variantLabel,
+  type ModelRecord,
+  type ModelVariant,
+} from "@/lib/catalog";
+import { formatNumber } from "@/lib/labels";
+import type { ViewerPayload, ViewerVariant } from "@/scripts/viewer-types";
+
+interface Props {
+  model: ModelRecord;
+}
+
+const { model } = Astro.props;
+const initial = getDefaultVariant(model);
+
+/** Sentence shown before a heavy diagram loads. */
+function heavyNote(variant: ModelVariant): string {
+  const size = formatBytes(variant.svg.bytes);
+  const graph = variant.monster && model.n_ops !== null ? `This graph has ${formatNumber(model.n_ops)} operations. The` : "The";
+  return `${graph} full diagram is a ${size} file and can be slow to open on a phone.`;
+}
+
+/** Sentence warning that many unrelated entries share this exact diagram; empty when they do not. */
+function standInNote(variant: ModelVariant): string {
+  const count = getStandInShareCount(variant);
+  return count > 0
+    ? `${formatNumber(count)} models in this catalog share this exact diagram, so it probably shows a small stand-in model rather than ${model.display_name} itself.`
+    : "";
+}
+
+function toViewerVariant(variant: ModelVariant): ViewerVariant {
+  return {
+    key: variant.key,
+    label: variantLabel(variant),
+    svgUrl: variant.svg.url,
+    svgSize: formatBytes(variant.svg.bytes),
+    svgFileName: `${model.slug}-${variant.key}.svg`,
+    thumbUrl: hasUsablePreview(variant.thumb.bytes) ? variant.thumb.url : null,
+    pdfUrl: variant.pdf?.url ?? null,
+    pdfSize: variant.pdf ? formatBytes(variant.pdf.bytes) : null,
+    heavy: isHeavyVariant(variant),
+    heavyNote: heavyNote(variant),
+    standInNote: standInNote(variant),
+    focusX: getDiagramFocus(variant),
+  };
+}
+
+const variants = model.variants.map(toViewerVariant);
+const first = variants.find((variant) => variant.key === initial.key) ?? variants[0];
+const payload: ViewerPayload = { modelName: model.display_name, defaultKey: initial.key, variants };
+// Escape "<" so the JSON can never close the script element it sits in.
+const payloadJson = JSON.stringify(payload).replace(/</g, "\\u003c");
+---
+
+<section class="viewer panel" data-viewer data-state={first.heavy ? "idle" : "loading"} data-mode="readable">
+  <div class="viewer-bar">
+    {variants.length > 1 && (
+      <div class="viewer-variants" role="group" aria-label="Diagram version">
+        {variants.map((variant) => (
+          <button class="button" type="button" data-variant-key={variant.key} aria-pressed={variant.key === first.key ? "true" : "false"}>
+            {variant.label}
+          </button>
+        ))}
+      </div>
+    )}
+    <div class="viewer-controls" data-viewer-controls>
+      <button class="button viewer-icon" type="button" data-viewer-part="zoom-out" aria-label="Zoom out">−</button>
+      <output class="viewer-readout mono" data-viewer-part="zoom-readout" aria-label="Zoom level">100%</output>
+      <button class="button viewer-icon" type="button" data-viewer-part="zoom-in" aria-label="Zoom in">+</button>
+      <button class="button" type="button" data-viewer-part="mode">Whole graph</button>
+      <button class="button" type="button" data-viewer-part="expand">Full screen</button>
+    </div>
+    <p class="viewer-bar-note">Large diagram, not loaded yet</p>
+    <a class="button viewer-open" href={first.svgUrl} data-asset="svg" target="_blank" rel="noopener">Open SVG</a>
+  </div>
+  <p class="viewer-stand-in" data-viewer-part="stand-in" hidden={first.standInNote === ""}>{first.standInNote}</p>
+  <div class="viewer-frame">
+    <div class="viewer-stage" data-viewer-part="stage" tabindex="0" role="region" aria-label={`${model.display_name} diagram`} aria-describedby="viewer-hint">
+      <div class="viewer-canvas" data-viewer-part="canvas">
+        <img class="viewer-preview" data-viewer-part="preview" src={first.thumbUrl ?? undefined} alt="" decoding="async" hidden={first.thumbUrl === null} />
+        <img
+          class="viewer-diagram"
+          data-viewer-part="diagram"
+          src={first.heavy ? undefined : first.svgUrl}
+          alt={`${model.display_name} architecture diagram`}
+          decoding="async"
+          fetchpriority="high"
+          draggable="false"
+          hidden
+        />
+        <noscript>
+          {first.heavy ? (
+            <p class="viewer-noscript-note"><a href={first.svgUrl}>Open the full diagram ({first.svgSize})</a></p>
+          ) : (
+            <img class="viewer-noscript" src={first.svgUrl} alt={`${model.display_name} architecture diagram`} />
+          )}
+        </noscript>
+      </div>
+    </div>
+    <div class="viewer-overlay" data-viewer-part="overlay">
+      <div class="viewer-card">
+        <p data-viewer-part="status" role="status">{first.heavy ? first.heavyNote : `Loading diagram (${first.svgSize})`}</p>
+        <div class="viewer-card-actions">
+          <button class="button primary" type="button" data-viewer-part="load" hidden={!first.heavy}>Load full diagram ({first.svgSize})</button>
+          <button class="button primary" type="button" data-viewer-part="retry" hidden>Try again</button>
+          <a class="button" href={first.svgUrl} data-asset="svg" target="_blank" rel="noopener">Open in a new tab</a>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="viewer-hint" id="viewer-hint">
+    <span class="viewer-hint-whole">Click or tap a spot to read it up close.</span>
+    <span class="viewer-hint-pointer">Scroll or drag inside the diagram to move through it. Zoom with + and − or Ctrl and scroll. Press 0 for the whole graph.</span>
+    <span class="viewer-hint-touch">Swipe inside the diagram to move through it. Use + and − to zoom.</span>
+  </p>
+</section>
+<script type="application/json" id="viewer-data" is:inline set:html={payloadJson}></script>
+
+<script>
+  import "../scripts/viewer-page";
+</script>
+
+<style>
+  .viewer {
+    --viewer-pad: 16px;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .viewer-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.6rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .viewer-variants,
+  .viewer-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .viewer-bar .button {
+    min-height: 2.1rem;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.875rem;
+  }
+
+  .viewer-bar-note {
+    display: none;
+    margin: 0;
+    color: var(--secondary);
+    font-size: 0.875rem;
+  }
+
+  /* A heavy diagram that has not been requested has nothing to zoom: no dead controls. */
+  .viewer[data-state="idle"] .viewer-controls {
+    display: none;
+  }
+
+  .viewer[data-state="idle"] .viewer-bar-note {
+    display: block;
+  }
+
+  .viewer-variants .button[aria-pressed="true"] {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .viewer-controls {
+    visibility: hidden;
+  }
+
+  .viewer[data-state="ready"] .viewer-controls,
+  .viewer[data-state="ready"] .viewer-hint {
+    visibility: visible;
+  }
+
+  .viewer-bar .viewer-icon {
+    min-width: 2.1rem;
+    padding-inline: 0.4rem;
+    font-size: 1.05rem;
+  }
+
+  .viewer-bar .viewer-icon[aria-disabled="true"] {
+    color: var(--secondary);
+    opacity: 0.55;
+  }
+
+  .viewer-readout {
+    min-width: 3.4rem;
+    color: var(--secondary);
+    font-size: 0.8rem;
+    text-align: center;
+  }
+
+  .viewer-open {
+    margin-left: auto;
+  }
+
+  .viewer-stand-in {
+    margin: 0;
+    padding: 0.6rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+    color: var(--secondary);
+    font-size: 0.85rem;
+  }
+
+  .viewer-frame {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .viewer-stage {
+    height: clamp(320px, 72vh, 820px);
+    overflow: auto;
+    overscroll-behavior: auto;
+    background: var(--surface-2);
+    outline-offset: -3px;
+  }
+
+  .viewer-canvas {
+    display: grid;
+    place-items: center;
+    box-sizing: border-box;
+    width: max-content;
+    min-width: 100%;
+    min-height: 100%;
+    padding: var(--viewer-pad);
+  }
+
+  /* Thumbnails are 400 px wide; a fixed width keeps the preview's left edge still while it loads (no layout shift). */
+  .viewer-preview {
+    width: min(100%, 400px);
+  }
+
+  .viewer-preview,
+  .viewer-noscript {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    background: var(--diagram-paper);
+    box-shadow: 0 0 0 1px var(--border);
+  }
+
+  .viewer-noscript-note a {
+    color: var(--accent);
+  }
+
+  .viewer-diagram {
+    display: block;
+    max-width: none;
+    background: var(--diagram-paper);
+    box-shadow: 0 0 0 1px var(--border);
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .viewer-diagram[hidden],
+  .viewer-preview[hidden] {
+    display: none;
+  }
+
+  .viewer[data-mode="whole"] .viewer-diagram {
+    cursor: zoom-in;
+  }
+
+  .viewer[data-state="ready"] .viewer-stage {
+    cursor: grab;
+  }
+
+  .viewer[data-dragging] .viewer-stage,
+  .viewer[data-dragging] .viewer-diagram {
+    cursor: grabbing;
+  }
+
+  /* The message sits at the top of the stage, where it is always on screen; the preview starts below it. */
+  .viewer-overlay {
+    position: absolute;
+    inset: 0 0 auto;
+    display: flex;
+    justify-content: center;
+    padding: 1rem;
+    pointer-events: none;
+  }
+
+  .viewer-overlay[hidden] {
+    display: none;
+  }
+
+  .viewer[data-state="loading"] .viewer-canvas {
+    padding-top: calc(var(--viewer-pad) + 4.5rem);
+  }
+
+  .viewer[data-state="idle"] .viewer-canvas,
+  .viewer[data-state="error"] .viewer-canvas {
+    padding-top: calc(var(--viewer-pad) + 10rem);
+  }
+
+  .viewer:not([data-state="ready"]) .viewer-canvas {
+    place-items: start center;
+  }
+
+  .viewer-card {
+    max-width: 30rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 0.9rem;
+    text-align: center;
+    pointer-events: auto;
+  }
+
+  .viewer-card p {
+    margin: 0;
+  }
+
+  .viewer-card-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0.5rem;
+  }
+
+  .viewer-card-actions:has(.button:not([hidden])) {
+    margin-top: 0.75rem;
+  }
+
+  .viewer[data-state="loading"] .viewer-card-actions {
+    display: none;
+  }
+
+  .viewer-hint {
+    visibility: hidden;
+    margin: 0;
+    padding: 0.5rem 0.75rem;
+    border-top: 1px solid var(--border);
+    color: var(--secondary);
+    font-size: 0.8rem;
+  }
+
+  .viewer-hint-touch,
+  .viewer-hint-whole {
+    display: none;
+  }
+
+  .viewer[data-mode="whole"] .viewer-hint-whole {
+    display: inline;
+  }
+
+  @media (hover: none) and (pointer: coarse) {
+    .viewer-hint-pointer {
+      display: none;
+    }
+
+    .viewer-hint-touch {
+      display: inline;
+    }
+  }
+
+  @media (max-width: 640px) {
+    .viewer-stage {
+      height: clamp(300px, 62vh, 640px);
+    }
+
+    .viewer-variants {
+      flex-basis: 100%;
+    }
+
+    .viewer-bar {
+      padding-inline: 0.5rem;
+    }
+
+    .viewer-controls {
+      gap: 0.25rem;
+    }
+
+    .viewer-bar .button {
+      padding-inline: 0.5rem;
+    }
+
+    .viewer-readout {
+      min-width: 2.6rem;
+    }
+
+    .viewer[data-state="idle"] .viewer-canvas,
+    .viewer[data-state="error"] .viewer-canvas {
+      padding-top: calc(var(--viewer-pad) + 13rem);
+    }
+
+    /* On a phone the toolbar keeps to one row; the file links stay in the status card and the Files box. */
+    .viewer-open {
+      display: none;
+    }
+  }
+
+  .viewer[data-expanded] {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    border-radius: 0;
+    background: var(--bg);
+  }
+
+  .viewer[data-expanded] .viewer-stage {
+    height: 100%;
+  }
+
+  :global(html.viewer-expanded) {
+    overflow: hidden;
+  }
+</style>

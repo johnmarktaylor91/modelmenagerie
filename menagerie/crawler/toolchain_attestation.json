@@ -1,0 +1,38 @@
+{
+  "checker_claude_cli_version": "2.1.257",
+  "claude_cli_version": "2.1.257",
+  "codex_cli_version": "0.144.5",
+  "fuse_tables": {
+    "c1-mech": {
+      "author_model": "claude-fable-5-1",
+      "digest": "sha256:5c92e975b04ce18e37319b2221bfad76084d40ccaed75c8f64db68522b94ea9a",
+      "distinct_models": 5,
+      "wall_seconds": 1800.0,
+      "window_seconds": 5400.0
+    },
+    "c2-disco": {
+      "author_model": "claude-sonnet",
+      "digest": "sha256:b244a681f72e9462add9f221d728d73d67548c24cba2a5fd7ab877200079844c",
+      "distinct_models": 5,
+      "wall_seconds": 1800.0,
+      "window_seconds": 5400.0
+    },
+    "c3-classics": {
+      "author_model": "claude-opus-5",
+      "digest": "sha256:bf5b74ee07a9f467b078136d928235c34db4695f6ba6eab57a77b4c70e54e237",
+      "distinct_models": 5,
+      "wall_seconds": 3600.0,
+      "window_seconds": 10800.0
+    },
+    "c4-native": {
+      "author_model": "claude-sonnet",
+      "digest": "sha256:e87848a711b6f3dd7ae779315d8bc4435581a10827efbdc55891eb7299580881",
+      "distinct_models": 5,
+      "wall_seconds": 1800.0,
+      "window_seconds": 5400.0
+    }
+  },
+  "harness_envelope_fixture": "v2.1.257.json",
+  "schema_version": "menagerie.crawler.toolchain-attestation.v1",
+  "toolchain_identity": "sha256:331668ebd81f401354bed4ef03f569d5838fcbce863416fa8d1db1cc4f464fd0"
+}

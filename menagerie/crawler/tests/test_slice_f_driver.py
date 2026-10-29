@@ -1,0 +1,10598 @@
+"""Slice F single-writer driver, award, pause, and notification tests."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+import json
+import multiprocessing
+import os
+import shlex
+import signal
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any, Callable, Iterator, Mapping, Optional, Sequence, cast
+
+import pytest
+
+import menagerie.crawler.cli as cli_module
+import menagerie.crawler.discovery as discovery_module
+import menagerie.crawler.driver as driver_module
+import menagerie.crawler.driver_admission as driver_admission_module
+import menagerie.crawler.driver_models as driver_models_module
+import menagerie.crawler.driver_receipts as driver_receipts_module
+import menagerie.crawler.reducer as reducer_module
+from menagerie.crawler.driver import (
+    TERMINAL_UNRECORDABLE_STREAK_LIMIT,
+    TerminalRecordingUnavailable,
+)
+from menagerie.crawler.campaign_merge import resolve_promotion_supersession
+from menagerie.crawler.artifact_transactions import (
+    ArtifactBindingError,
+    ArtifactCheckpointError,
+    ArtifactEventKind,
+    SourceManifestBindingError,
+    StagedArtifact,
+)
+from menagerie.crawler.author_dispatch import (
+    AuthorEffortGrant,
+    BlockedRecommendation,
+    DeferRecommendation,
+    HandoffExecution,
+    ProposedAuthorResult,
+    SkipRecommendation,
+    build_author_envelope,
+    derive_terminal_evidence_pack,
+    derive_terminal_license_disposition,
+    validate_author_result,
+)
+from menagerie.crawler.authority import (
+    AuthorityContext,
+    EnvironmentAuthorityCache,
+    build_authority_context,
+    completion_line_for_raw_award_receipt,
+    derive_parent_attestation,
+)
+from menagerie.crawler.checker_dispatch import CheckerBackoffSignal
+from menagerie.crawler.checker_lane import checker_lane_deferral_path
+from menagerie.crawler.gates import GateRoutingError
+from menagerie.crawler.campaign_config import load_campaign_config
+from menagerie.crawler.census_ack import (
+    award_holds_ack_digest,
+)
+from menagerie.crawler.checkpoint import (
+    _externally_controlled_record_text,
+    append_canonical_requeue_grant,
+    build_canonical_requeue_grant,
+    canonical_operational_ledger_path,
+    canonical_requeue_grants_path,
+)
+from menagerie.crawler.cli import build_parser, main as cli_main
+from menagerie.crawler.constants import (
+    CLAUDE_CLI_VERSION,
+    CHECKER_LANE_PARK_STREAK_LIMIT,
+    METADATA_BATCH_MAX,
+    CheckerPauseReason,
+    DEFERRED_TERMINAL_GRANT_STAGE,
+    EnvironmentPhase,
+    FAILURE_REASON_CODES,
+    MODEL_SCHEMA_VERSION_V3,
+    NO_RUNG_SELECTED,
+    OPERATIONAL_EVENT_SCHEMA_VERSION,
+    OperationalEventKind,
+    TERMINAL_DISPOSITION_REJECTED_REASON_CODE,
+    TERMINAL_STATUS_CODES,
+)
+from menagerie.crawler.driver_admission import (
+    CHECKER_LANE_BACKOFF_SLACK_SECONDS,
+    AdmissionEnvironmentMixin,
+    _author_lane_failure,
+    _checker_wall_bound,
+    classify_author_exit,
+)
+from menagerie.crawler.author_dispatch import (
+    AuthorEffortExhaustionClaim,
+    AuthorExecutorContractError,
+)
+from menagerie.crawler.driver_contracts import (
+    GateBatchUnusableError,
+    ResearchToolsUnavailableError,
+    RetryableOperatorError,
+    StaleGateBindingError,
+)
+from menagerie.crawler.driver_contracts import AuthorEffortCapExceeded
+from menagerie.crawler.discovery import (
+    AccessBlockedDiscovery,
+    DiscoveryError,
+    candidate_probe_findings,
+    FoundDiscovery,
+    HigherTierDiscovery,
+    NegativeDiscovery,
+    RetryableToolFailureDiscovery,
+    materialize_discovery_artifact,
+    validate_source_discovery,
+)
+from menagerie.crawler.driver import (
+    AuthorArtifact,
+    AuthorLane,
+    CheckerLane,
+    CheckerOutcome,
+    CommandAuthorLane,
+    CommandCheckerLane,
+    CommandNotifier,
+    CrawlerDriver,
+    DriverConfig,
+    DriverDependencies,
+    DriverIntegrationError,
+    DriverLock,
+    DriverPaths,
+    EnvironmentLane,
+    EnvironmentBinding,
+    ForwardLane,
+    Notifier,
+    SupervisedForwardLane,
+    UsageBackoffSignal,
+    UsagePauseScheduler,
+    WorkItem,
+    _execution_identity,
+    _environment_binding,
+    _parent_cache_read_attempted,
+    _RUNNER_EXECUTION_CLOSURE,
+    _runner_identity,
+    _receipt_envelope_error,
+    _worker_request,
+)
+from menagerie.crawler.envs import (
+    EnvironmentIntent,
+    EnvironmentRegistry,
+    IntentProbes,
+    LockArtifacts,
+    load_environment_registry,
+)
+from menagerie.crawler.env_lifecycle import (
+    DiskRecoveryError,
+    EnvironmentProbeError,
+    EnvironmentSolveError,
+    ProbeResult,
+    expected_probe_names,
+)
+from menagerie.crawler.driver_progress import (
+    _ENVIRONMENT_FAILURE_ROUTES,
+    _environment_failure,
+    _resolve_notify_command,
+)
+from menagerie.crawler.environment_rebuild import (
+    load_rebuild_deferral_rows,
+    rebuild_deferral_path,
+)
+from menagerie.crawler.intake import (
+    IntakeSnapshot,
+    create_intake_snapshot,
+    load_intake_snapshot,
+    trusted_identity_fields,
+)
+from menagerie.crawler.paid_session_lifecycle import (
+    BudgetPolicy,
+    PaidSessionAuthority,
+    ProviderReconciliation,
+    authorized_paid_dispatch,
+    load_paid_session_rows,
+)
+from menagerie.crawler.identity import canonical_json_bytes, hash_bytes, stable_hash, utc_now
+from menagerie.crawler.fetcher import (
+    FetchHashMismatchError,
+    FetchRetrievalError,
+    UnpinnedTargetError,
+    cas_path as source_cas_object_path,
+    fetch_targets as controlled_fetch_targets,
+)
+from menagerie.crawler.metadata import recompute_accepted_identities
+from menagerie.crawler.models import LedgerPaths
+from menagerie.crawler.mirrors import MirrorStore
+from menagerie.crawler.policy import SandboxUnavailableError
+from menagerie.crawler.proposal import (
+    DEFAULT_GATED_CLAIMS,
+    model_code_manifest,
+    required_metadata_field_checks,
+)
+from menagerie.crawler.promotion import (
+    materialize_promotion_intake,
+    promotion_records_root,
+)
+from menagerie.crawler.recordio import JsonlLedger, payload_hash, scan_jsonl
+from menagerie.crawler.reducer import (
+    CanonicalReducer,
+    default_ledger_paths,
+    project_dependency_current,
+)
+from menagerie.crawler.status import (
+    assert_partition,
+    completeness_report,
+    record_is_release_eligible,
+)
+from menagerie.crawler.source_broker import BrokerOutcome, BrokerPack, TransportResponse
+from menagerie.crawler.tests.conftest import (
+    HASH,
+    NOW,
+    RealEnvironmentFixture,
+    RealEnvironmentLane,
+    attach_paper_evidence,
+    make_attempt,
+    make_author_proposal,
+    make_gate,
+    make_model,
+    make_proposed_artifact,
+    make_supervised_worker_result_v3,
+    rebind_attempt_raw_proof,
+    real_environment_registry,
+)
+from menagerie.crawler.wakeup import (
+    OperationalContext,
+    WakeupBackend,
+    WakeupManager,
+    reduce_wake_episodes,
+)
+from menagerie.crawler.worker_supervisor import (
+    SupervisedResult,
+    SupervisorObservation,
+    build_parent_attestation,
+)
+
+
+class InjectedKill(BaseException):
+    """Simulate an uncatchable process boundary failure in a deterministic test.
+
+    BL-8 (a): deliberately a ``BaseException``, not ``RuntimeError``. This class
+    models a process death (SIGKILL at a boundary), and the scheduler's
+    per-member blast-radius containment now catches ``Exception`` on member
+    facts -- a simulated kill must stay uncatchable there, exactly like the
+    real signal it stands in for.
+    """
+
+
+def assert_known_event_kinds(*event_kinds: str) -> None:
+    """Fail when a test assertion names a nonexistent artifact event kind.
+
+    Parameters
+    ----------
+    event_kinds:
+        Positive or negative event-kind names asserted by a test.
+    """
+
+    known = {kind.value for kind in ArtifactEventKind}
+    unknown = set(event_kinds) - known
+    assert not unknown, f"test names unknown artifact event kinds: {sorted(unknown)}"
+
+
+def _refresh_proposal_identities(
+    proposal: dict[str, Any],
+    *,
+    checker_model: str = DriverConfig().checker_model,
+    checker_version: str = "current",
+) -> None:
+    """Rebind a mutated synthetic proposal to exact facts and current checker bytes."""
+
+    facts = proposal["proposed_facts"]
+    identities = recompute_accepted_identities(
+        facts,
+        checker_prompt_hash=driver_module._checker_prompt_hash(),
+        checker_model=checker_model,
+        checker_version=checker_version,
+        schema_version=MODEL_SCHEMA_VERSION_V3,
+    )
+    facts["evidence"]["evidence_identity"] = identities.evidence
+    facts["implementation"]["recipe_revision"] = identities.recipe
+    if facts.get("fidelity", {}).get("required"):
+        facts["fidelity"]["fidelity_identity"] = identities.fidelity
+    identities = recompute_accepted_identities(
+        facts,
+        checker_prompt_hash=driver_module._checker_prompt_hash(),
+        checker_model=checker_model,
+        checker_version=checker_version,
+        schema_version=MODEL_SCHEMA_VERSION_V3,
+    )
+    proposal.update(
+        {
+            "source_identity": identities.source,
+            "evidence_identity": identities.evidence,
+            "recipe_revision": identities.recipe,
+            "fidelity_identity": identities.fidelity,
+            "vet_identity": identities.vet,
+        }
+    )
+    # The verified_hashes bind the SAME mutated facts: a compliant author's
+    # ``evidence`` digest is the excerpt identity and ``source_to_code_map`` is
+    # the map's canonical hash (the machine digest attestation recomputes both
+    # at envelope build), so a refresh that re-derived the identities but left
+    # the pre-mutation digests behind described a pack no author could emit.
+    proposal["verified_hashes"]["evidence"] = identities.evidence
+    proposal["verified_hashes"]["source_to_code_map"] = stable_hash(
+        list(facts["implementation"].get("source_to_code_map") or [])
+    )
+    proposal["proposal_sha256"] = stable_hash(
+        {key: value for key, value in proposal.items() if key != "proposal_sha256"}
+    )
+
+
+def _rebind_fake_author_result(artifact: AuthorArtifact) -> AuthorArtifact:
+    """Rebind a deliberately mutated fake proposal into its typed v3 result envelope."""
+
+    result = artifact.author_result
+    assert isinstance(result, driver_module.ProposedAuthorResult)
+    manifest_identity = stable_hash(artifact.source_manifest["sources"])
+    artifact.source_manifest["manifest_sha256"] = manifest_identity
+    artifact.proposal["source_manifest_identity"] = manifest_identity
+    artifact.proposal["verified_hashes"]["source_manifest"] = manifest_identity
+    artifact.proposal["proposal_sha256"] = stable_hash(
+        {key: value for key, value in artifact.proposal.items() if key != "proposal_sha256"}
+    )
+    raw_result = dict(result.binding.raw_result)
+    raw_result["result_id"] = stable_hash(
+        {
+            "stable_id": artifact.proposal["stable_id"],
+            "proposal_sha256": artifact.proposal["proposal_sha256"],
+        }
+    )
+    raw_result["work_id"] = artifact.proposal["work_id"]
+    raw_result["campaign_id"] = artifact.proposal["campaign_id"]
+    raw_result["source_manifest_identity"] = manifest_identity
+    raw_result["payload"] = {"arm": "PROPOSED", "proposal": artifact.proposal}
+    raw_result["result_sha256"] = stable_hash(
+        {key: value for key, value in raw_result.items() if key != "result_sha256"}
+    )
+    binding = replace(
+        result.binding,
+        result_id=str(raw_result["result_id"]),
+        result_sha256=str(raw_result["result_sha256"]),
+        work_id=str(artifact.proposal["work_id"]),
+        campaign_id=str(artifact.proposal["campaign_id"]),
+        source_manifest_identity=manifest_identity,
+        raw_result=raw_result,
+    )
+    return replace(
+        artifact,
+        author_result=driver_module.ProposedAuthorResult(
+            binding, artifact.proposal, result.validation_report
+        ),
+    )
+
+
+def _terminal_fake_author_result(
+    artifact: AuthorArtifact, *, platform: Optional[str] = None, status_code: Optional[str] = None
+) -> AuthorArtifact:
+    """Convert a proposed fake result into one schema-valid terminal union arm."""
+
+    result = artifact.author_result
+    assert isinstance(result, ProposedAuthorResult)
+    source_ids = ["source-1", "source-paper"]
+    payload: dict[str, Any]
+    if platform is not None:
+        evidence_identity = stable_hash(
+            [
+                {
+                    "evidence_id": "evidence-1",
+                    "source_id": source_ids[0],
+                    "supports": [f"needs-{platform}"],
+                }
+            ]
+        )
+        license_identity = stable_hash(artifact.proposal["proposed_facts"]["licenses"])
+        handoff = {
+            "proposal": artifact.proposal,
+            "proposal_sha256": artifact.proposal["proposal_sha256"],
+            "code_manifest_identity": stable_hash(
+                artifact.proposal["proposed_facts"]["implementation"].get("code_manifest", [])
+            ),
+            "source_manifest_identity": artifact.proposal["source_manifest_identity"],
+        }
+        handoff["handoff_sha256"] = stable_hash(handoff)
+        payload = {
+            "arm": "DEFER_RECOMMENDATION",
+            "platform": platform,
+            "source_ids": source_ids,
+            "evidence_ids": ["evidence-1"],
+            "evidence_identity": evidence_identity,
+            "license_identity": license_identity,
+            "handoff_execution": handoff,
+            "recommendation_sha256": HASH,
+        }
+    else:
+        assert status_code is not None
+        predicate = status_code.removeprefix("skipped:")
+        evidence_identity = stable_hash(
+            [
+                {
+                    "evidence_id": "evidence-1",
+                    "source_id": source_ids[0],
+                    "supports": [predicate],
+                }
+            ]
+        )
+        license_identity = stable_hash(
+            {
+                "arm": "SKIP_RECOMMENDATION",
+                "disposition": "not-applicable-no-license-claim",
+                "source_manifest_identity": artifact.proposal["source_manifest_identity"],
+            }
+        )
+        payload = {
+            "arm": "SKIP_RECOMMENDATION",
+            "status_code": status_code,
+            "source_ids": source_ids,
+            "evidence_ids": ["evidence-1"],
+            "evidence_identity": evidence_identity,
+            "search_report_identity": stable_hash({"search": "bounded-complete"}),
+            "license_identity": license_identity,
+            "recommendation_sha256": HASH,
+        }
+    payload["recommendation_sha256"] = stable_hash(
+        {key: value for key, value in payload.items() if key != "recommendation_sha256"}
+    )
+    raw_result = dict(result.binding.raw_result)
+    raw_result["kind"] = payload["arm"]
+    raw_result["payload"] = payload
+    raw_result["result_sha256"] = stable_hash(
+        {key: value for key, value in raw_result.items() if key != "result_sha256"}
+    )
+    binding = replace(
+        result.binding,
+        result_sha256=str(raw_result["result_sha256"]),
+        raw_result=raw_result,
+    )
+    recommendation = (
+        DeferRecommendation(
+            binding,
+            str(platform),
+            ("source-1", "source-paper"),
+            ("evidence-1",),
+            evidence_identity,
+            license_identity,
+            str(payload["recommendation_sha256"]),
+            # By KEYWORD deliberately. This argument was positional and silently
+            # rebound onto ``evidence_records`` when that field was inserted ahead
+            # of ``handoff_execution``, leaving the deferral with no handoff and no
+            # license disposition.
+            handoff_execution=HandoffExecution(
+                proposal=artifact.proposal,
+                proposal_sha256=str(handoff["proposal_sha256"]),
+                code_manifest_identity=str(handoff["code_manifest_identity"]),
+                source_manifest_identity=str(handoff["source_manifest_identity"]),
+                handoff_sha256=str(handoff["handoff_sha256"]),
+            ),
+        )
+        if platform is not None
+        else SkipRecommendation(
+            binding,
+            str(status_code),
+            ("source-1", "source-paper"),
+            ("evidence-1",),
+            evidence_identity,
+            str(payload["search_report_identity"]),
+            license_identity,
+            str(payload["recommendation_sha256"]),
+        )
+    )
+    return replace(artifact, author_result=recommendation)
+
+
+@dataclass(frozen=True)
+class AuthorScript:
+    """Typed deviations applied around the canonical synthetic author result."""
+
+    failed_id: Optional[str] = None
+    failure_message: str = "synthetic author command failure"
+    failed_call: Optional[int] = None
+    invalid_modes_id: Optional[str] = None
+    terminal_outcomes: tuple[tuple[str, str], ...] = ()
+    #: Restrict ``terminal_outcomes`` to ONE model and ONE invocation number.
+    #: Unset (the default) keeps the historical behavior of applying the outcome
+    #: script to every author call. Setting them is how a REPAIR generation --
+    #: author call 2 for one model, after its gate came back inaccurate -- is made
+    #: to answer terminally while its siblings stay ordinary proposals.
+    terminal_id: Optional[str] = None
+    terminal_call: Optional[int] = None
+
+
+class ScriptedAuthor(AuthorLane):
+    """Return canonical synthetic proposals with explicit scripted deviations."""
+
+    def __init__(self, script: AuthorScript = AuthorScript()) -> None:
+        """Initialize per-model invocation counts and the immutable script."""
+
+        self.script = script
+        self.calls: dict[str, int] = {}
+        self._script_index = 0
+
+    def author(
+        self,
+        item: WorkItem,
+        work_root: Path,
+        config: DriverConfig,
+        context: AuthorityContext,
+    ) -> AuthorArtifact:
+        """Return one accepted two-mode proposal."""
+
+        next_call = self.calls.get(item.stable_id, 0) + 1
+        if item.stable_id == self.script.failed_id and self.script.failed_call in {
+            None,
+            next_call,
+        }:
+            raise RuntimeError(self.script.failure_message)
+        self.calls[item.stable_id] = next_call
+        proposal = make_author_proposal(item.stable_id)
+        proposal["work_id"] = item.active_work_id
+        proposal["campaign_id"] = (
+            f"campaign-{item.active_work_id}"
+            if item.requeue_work_id is not None or item.refresh_work_id is not None
+            else f"campaign-{item.stable_id}"
+        )
+        proposal["intake_snapshot_id"] = context.active_intake_snapshot_id
+        proposal["intake_snapshot_sha256"] = context.active_intake_snapshot_sha256
+        proposal["intake_item_sha256"] = stable_hash(context.intake_by_stable_id[item.stable_id])
+        proposal["dispatcher_identity"] = context.author_dispatcher_identity
+        proposal["author"].update(
+            {
+                "model": config.author_model,
+                "version": config.author_version,
+                "prompt_sha256": context.author_prompt_identity,
+            }
+        )
+        facts = proposal["proposed_facts"]
+        facts["identity"].update(
+            {
+                "canonical_name": item.intake.name,
+                **trusted_identity_fields(item.intake),
+            }
+        )
+        facts["modes"]["meaningful_modes"] = ["train", "eval"]
+        facts["external_metadata"]["modes"]["meaningful_modes"] = ["train", "eval"]
+        # Step-100 rank 4 (BN-TRAIN-BATCH1): declaring train meaningful now
+        # requires a probe batch >= 2 on rank >= 3 tensor leaves, so this
+        # train-declaring fixture probes batch 2. Receipts derive their input
+        # signatures from the contract, so the shape propagates everywhere.
+        facts["input_contract"]["args"][0]["shape"] = [2, 3, 8, 8]
+        facts["evidence"]["excerpts"][0]["supports"] = sorted(
+            set(facts["evidence"]["excerpts"][0]["supports"])
+            | set(DEFAULT_GATED_CLAIMS)
+            | {"external_metadata.citation"}
+        )
+        evidence_text = (
+            "Example Model introduced ExampleNet in TestConf 2020 by A. Author at Example Lab "
+            "in the US. ExampleNet is an official PyTorch library CNN architecture for supervised "
+            "computer vision classification in machine learning. This modern ExampleNet family "
+            "uses vision modality and has the example and cnn keywords. It is a small "
+            "source-grounded example network whose grounded contribution uses the Apache-2.0 "
+            "license. It runs in PyTorch train and eval modes with no train eval divergence. "
+            "The input contract is one small RGB image and the output is class scores."
+        )
+        excerpt = facts["evidence"]["excerpts"][0]
+        excerpt.update(
+            {
+                "locator": f"bytes:0-{len(evidence_text.encode())}",
+                "text": evidence_text,
+                "text_sha256": hash_bytes(evidence_text.encode()),
+            }
+        )
+        # The staged model dir lives INSIDE the author root, beside the frozen
+        # source-cas, exactly like the production round layout
+        # (driver_admission: root/"model" + root/"source-cas") -- the checker
+        # envelope derives its source-cas read root as model_dir's sibling and
+        # (AG-9) refuses pre-purchase when either root does not dereference.
+        model_dir = work_root / item.stable_id / "author" / "fake-model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        source_bytes = evidence_text.encode()
+        source_path = work_root / item.stable_id / "author" / "source-cas" / "source.bin"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_bytes(source_bytes)
+        source = facts["source_resolution"]["sources"][0]
+        source.update(
+            {
+                "content_sha256": hash_bytes(source_bytes),
+                "byte_count": len(source_bytes),
+            }
+        )
+        source_manifest_row = dict(source)
+        source_manifest_row["cas_path"] = str(source_path)
+        source_manifest: dict[str, Any] = {"sources": [source_manifest_row]}
+        attach_paper_evidence(proposal, source_manifest, source_path.parent)
+        # The validator resolves reads digest-derived under the cas_root it is
+        # handed (recorded cas_path values are metadata, not read authority), so
+        # the fake attempt mirrors every manifest object into the real layout.
+        for manifest_row in source_manifest["sources"]:
+            cas_object = source_cas_object_path(
+                source_path.parent, str(manifest_row["content_sha256"])
+            )
+            cas_object.parent.mkdir(parents=True, exist_ok=True)
+            if not cas_object.exists():
+                cas_object.write_bytes(Path(str(manifest_row["cas_path"])).read_bytes())
+        source_manifest["manifest_sha256"] = stable_hash(source_manifest["sources"])
+        proposal["source_manifest_identity"] = source_manifest["manifest_sha256"]
+        proposal["verified_hashes"]["source_manifest"] = source_manifest["manifest_sha256"]
+        _refresh_proposal_identities(
+            proposal,
+            checker_model=config.checker_model,
+            checker_version=config.checker_version,
+        )
+        raw_result = {
+            "schema_version": "menagerie.crawler.author-result.v4",
+            "result_id": stable_hash(
+                {
+                    "stable_id": item.stable_id,
+                    "proposal_sha256": proposal["proposal_sha256"],
+                }
+            ),
+            "result_sha256": HASH,
+            "kind": "PROPOSED",
+            "stable_id": item.stable_id,
+            "work_id": proposal["work_id"],
+            "campaign_id": proposal["campaign_id"],
+            "created_at": NOW,
+            "author_identity": context.author_model_identity,
+            "prompt_identity": context.author_prompt_identity,
+            "dispatcher_identity": context.author_dispatcher_identity,
+            "source_manifest_identity": source_manifest["manifest_sha256"],
+            "intake_snapshot_id": context.active_intake_snapshot_id,
+            "intake_snapshot_sha256": context.active_intake_snapshot_sha256,
+            "intake_item_sha256": proposal["intake_item_sha256"],
+            "payload": {"arm": "PROPOSED", "proposal": proposal},
+        }
+        raw_result["result_sha256"] = stable_hash(
+            {key: value for key, value in raw_result.items() if key != "result_sha256"}
+        )
+        result_path = work_root / item.stable_id / "author" / "result.json"
+        result_path.write_bytes(canonical_json_bytes(raw_result) + b"\n")
+        envelope = build_author_envelope(
+            context=context,
+            work_id=str(proposal["work_id"]),
+            stable_id=item.stable_id,
+            campaign_id=str(proposal["campaign_id"]),
+            created_at=NOW,
+            untrusted_hints=item.intake.to_dict(),
+            source_manifest=source_manifest,
+            allowed_model_dir=model_dir,
+            output_path=result_path,
+        )
+        result = validate_author_result(result_path, envelope, cas_root=source_path.parent)
+        artifact = AuthorArtifact(result, source_manifest, model_dir)
+        if item.stable_id == self.script.invalid_modes_id:
+            artifact.proposal["proposed_facts"]["modes"]["meaningful_modes"] = ["invalid"]
+            artifact = _rebind_fake_author_result(artifact)
+        terminal_due = self.script.terminal_id is None or (
+            item.stable_id == self.script.terminal_id
+            and self.script.terminal_call in {None, next_call}
+        )
+        if self.script.terminal_outcomes and terminal_due:
+            outcome_kind, outcome = self.script.terminal_outcomes[
+                min(self._script_index, len(self.script.terminal_outcomes) - 1)
+            ]
+            self._script_index += 1
+            if outcome_kind == "platform":
+                return _terminal_fake_author_result(artifact, platform=outcome)
+            if outcome_kind == "status":
+                return _terminal_fake_author_result(artifact, status_code=outcome)
+            raise AssertionError(f"unknown author script outcome: {outcome_kind!r}")
+        return artifact
+
+
+class FakeAuthor(ScriptedAuthor):
+    """Compatibility name for the canonical unscripted synthetic author."""
+
+
+class NeedsOpusAuthor(AuthorLane):
+    """Return the typed stage-1 higher-tier arm for every scheduled model."""
+
+    def author(
+        self,
+        item: WorkItem,
+        work_root: Path,
+        config: DriverConfig,
+        context: AuthorityContext,
+    ) -> AuthorArtifact:
+        """Materialize a byte-backed typed Opus promotion."""
+
+        del config
+
+        def probe_transport(url: str, *, max_bytes: int, timeout: float) -> TransportResponse:
+            """Return a deterministic typed miss for the retained candidate."""
+
+            del max_bytes, timeout
+            return TransportResponse(
+                status=404,
+                final_url=url,
+                redirect_chain=(url,),
+                body=b"",
+                truncated=False,
+                error="fixture candidate rejected",
+            )
+
+        raw = {
+            "schema_version": "menagerie.crawler.source-discovery.v1",
+            "stable_id": item.stable_id,
+            "work_id": item.active_work_id,
+            "arm": "NEEDS_HIGHER_TIER",
+            "payload": {
+                "arm": "NEEDS_HIGHER_TIER",
+                "research_summary": {
+                    "queries": ["ExampleNet architecture implementation"],
+                    "places": ["upstream repositories", "introducing paper"],
+                    "candidate_links": [
+                        {
+                            "url": "https://example.com/model.txt",
+                            "why_rejected": "The source needs higher-tier adjudication.",
+                            "rejection_class": "no-material-detail",
+                        }
+                    ],
+                    "languages": ["English"],
+                    "conclusion": (
+                        "The source is real, but faithful authoring requires the Opus tier."
+                    ),
+                },
+            },
+        }
+        discovery = validate_source_discovery(
+            raw,
+            stable_id=item.stable_id,
+            work_id=item.active_work_id,
+        )
+        assert isinstance(discovery, HigherTierDiscovery)
+        return materialize_discovery_artifact(
+            discovery,
+            item=item,
+            context=context,
+            root=work_root / item.stable_id / "author",
+            probe_transport=probe_transport,
+        )
+
+
+_TERMINAL_OUTCOME_SCRIPT = AuthorScript(
+    terminal_outcomes=(
+        ("platform", "cuda"),
+        ("status", "skipped:no-description"),
+    )
+)
+_BOTH_DEFERRED_SCRIPT = AuthorScript(terminal_outcomes=(("platform", "cuda"), ("platform", "x86")))
+
+
+class DisabledAuthor(AuthorLane):
+    """Fail if a reconstruction-capable path re-enters authoring."""
+
+    def __init__(self) -> None:
+        """Initialize the forbidden author-call counter."""
+
+        self.calls = 0
+
+    def author(
+        self, item: WorkItem, work_root: Path, config: DriverConfig, context: AuthorityContext
+    ) -> AuthorArtifact:
+        """Raise because canonical handoff facts must be consumed first."""
+
+        del item, work_root, config, context
+        self.calls += 1
+        raise AssertionError("author lane must remain disabled")
+
+
+_HANDOFF_ADAPTER = """from __future__ import annotations
+
+import torch
+
+
+class Tiny(torch.nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value + 1
+
+
+def build_model() -> object:
+    return Tiny()
+
+
+def make_dummy_call(seed: int, device: str) -> tuple[tuple[object, ...], dict[str, object]]:
+    del seed
+    return ((torch.zeros(1, 2, device=device),), {})
+"""
+
+
+@dataclass(frozen=True)
+class TypedAdapterPatch:
+    """Describe a schema-valid typed-adapter projection for a test artifact."""
+
+    source: str
+    input_shape: tuple[int, ...] = (1, 2)
+    modes: tuple[str, ...] = ("eval",)
+    evidence_supports: tuple[str, ...] = (
+        "implementation.code_manifest[].path",
+        "implementation.code_manifest[].sha256",
+    )
+
+
+def apply_typed_adapter_patch(artifact: AuthorArtifact, patch: TypedAdapterPatch) -> None:
+    """Apply common schema-owned typed-adapter fields without binding identities."""
+
+    adapter_path = artifact.model_dir / "adapter.py"
+    adapter_path.write_text(patch.source, encoding="utf-8")
+    adapter_digest = hash_bytes(adapter_path.read_bytes())
+    code_manifest = [dict(row) for row in model_code_manifest(adapter_path, artifact.model_dir)]
+    proposal = artifact.proposal
+    facts = proposal["proposed_facts"]
+    facts["implementation"].update(
+        {
+            "recipe_type": "typed-adapter",
+            "code_path": "adapter.py",
+            "code_sha256": adapter_digest,
+            "builder_symbol": "build_model",
+            "dummy_call_symbol": "make_dummy_call",
+            "library_recipe": None,
+            "code_manifest": code_manifest,
+        }
+    )
+    facts["input_contract"]["args"][0]["shape"] = list(patch.input_shape)
+    facts["modes"]["meaningful_modes"] = list(patch.modes)
+    facts["external_metadata"]["modes"]["meaningful_modes"] = list(patch.modes)
+    facts["evidence"]["excerpts"][0]["supports"] = sorted(
+        set(facts["evidence"]["excerpts"][0]["supports"]) | set(patch.evidence_supports)
+    )
+    proposal["verified_hashes"]["code"] = adapter_digest
+    proposal["verified_hashes"]["code_manifest"] = stable_hash(code_manifest)
+
+
+def finalize_typed_adapter_patch(artifact: AuthorArtifact, config: DriverConfig) -> AuthorArtifact:
+    """Bind proposal identities after all typed-adapter patches are complete."""
+
+    _refresh_proposal_identities(
+        artifact.proposal,
+        checker_model=config.checker_model,
+        checker_version=config.checker_version,
+    )
+    return _rebind_fake_author_result(artifact)
+
+
+class BothDeferredRealAuthor(FakeAuthor):
+    """Retain one real typed adapter in each durable platform handoff."""
+
+    def author(
+        self,
+        item: WorkItem,
+        work_root: Path,
+        config: DriverConfig,
+        context: AuthorityContext,
+    ) -> AuthorArtifact:
+        """Return a deferral whose nested proposal runs in the real worker."""
+
+        artifact = super().author(item, work_root, config, context)
+        apply_typed_adapter_patch(artifact, TypedAdapterPatch(source=_HANDOFF_ADAPTER))
+        rebound = finalize_typed_adapter_patch(artifact, config)
+        # Derived from the ITEM, never from the shared call census: under
+        # pooled author concurrency two sessions can both insert into
+        # ``self.calls`` before either reads its length, which handed BOTH
+        # models the same platform and lost one deferred status.
+        platform = "cuda" if item.intake.name == "Example0" else "x86"
+        return _terminal_fake_author_result(rebound, platform=platform)
+
+
+@dataclass(frozen=True)
+class CheckerScript:
+    """Describe one synthetic checker deviation from accurate gates."""
+
+    metadata_verdict: Optional[str] = None
+    selected_id: Optional[str] = None
+    required_repair: Optional[str] = None
+    field_repair: Optional[str] = None
+    mixed_tail: bool = False
+    lineage_repairs: bool = False
+    reject_fidelity: bool = False
+    metadata_error: Optional[str] = None
+    #: Non-accepted ``terminal_disposition`` verdict the checker should return, with
+    #: the findings that carry its refusal. The production shape the pilot actually
+    #: produced: the checker reads the frozen sources, verifies every hash, and still
+    #: refuses the authored terminal predicate.
+    terminal_verdict: Optional[str] = None
+    terminal_findings: tuple[str, ...] = (
+        "every declared excerpt resolves and verifies, and none supports the predicate",
+    )
+
+
+class ScriptedChecker(CheckerLane):
+    """Return accurate synthetic gates with optional scripted deviations."""
+
+    def __init__(self, *, quota: bool = False, script: Optional[CheckerScript] = None) -> None:
+        """Configure quota exhaustion and synthetic checker deviations."""
+
+        self.quota = quota
+        self.script = script or CheckerScript()
+        self.metadata_calls = 0
+        self.fidelity_calls = 0
+        # Every real dispatch mints a fresh request envelope (nonce, deadline,
+        # output path), so gate_identity differs per session; the fake mirrors
+        # that or the K=2 duplicate-accept row builder rightly refuses the
+        # confirmation as self-witnessing (P5 fable-F16). The index is PER
+        # QUESTION (gate kind + item set), never a global call counter:
+        # identity must be a function of the work (this question's Nth
+        # session), not of cross-item scheduling, or a concurrent sweep's gate
+        # ledger diverges from the serial sweep's -- the exact defect the
+        # canonical-projection equality tests catch.
+        self._gate_sessions: dict[tuple[str, tuple[str, ...]], int] = {}
+        # The checker pool dispatches these fakes from worker threads, so the
+        # call counters the tests assert on must be guarded to stay exact.
+        self._call_count_lock = threading.Lock()
+
+    def _fresh_gate_identity(self, gate_kind: str, stable_ids: Sequence[str]) -> str:
+        """Mint one question's next per-session gate identity.
+
+        Distinct across repeat sessions over the same question (the K=2
+        independence the production nonce provides) while staying a pure
+        function of the work, so concurrent and serial dispatch orders record
+        identical gate ledgers.
+        """
+
+        key = (gate_kind, tuple(stable_ids))
+        with self._call_count_lock:
+            session_index = self._gate_sessions.get(key, 0) + 1
+            self._gate_sessions[key] = session_index
+        return stable_hash(
+            {
+                "fake_gate_envelope": gate_kind,
+                "stable_ids": list(stable_ids),
+                "session_index": session_index,
+            }
+        )
+
+    def check_metadata(
+        self, artifacts: Sequence[AuthorArtifact], work_root: Path, config: DriverConfig
+    ) -> CheckerOutcome:
+        """Return one exhaustive accurate metadata gate."""
+
+        del work_root
+        if self.script.metadata_error is not None:
+            raise RuntimeError(self.script.metadata_error)
+        with self._call_count_lock:
+            self.metadata_calls += 1
+        if self.quota:
+            return CheckerOutcome(
+                backoff=CheckerBackoffSignal(
+                    CheckerPauseReason.QUOTA_EXHAUSTED,
+                    None,
+                    "2026-07-14T13:00:00Z",
+                    "quota exhausted",
+                )
+            )
+        stable_ids = [str(artifact.proposal["stable_id"]) for artifact in artifacts]
+        gate = make_gate(stable_ids, gate_id=f"gate-metadata-{stable_ids[0]}")
+        gate.pop("ledger_seq", None)
+        gate.pop("payload_sha256", None)
+        gate["gate_identity"] = self._fresh_gate_identity("metadata_batch", stable_ids)
+        for item in gate["items"]:
+            artifact = next(
+                value for value in artifacts if value.proposal["stable_id"] == item["stable_id"]
+            )
+            proposal = artifact.proposal
+            item["work_id"] = proposal["work_id"]
+            item["campaign_root_work_id"] = artifact.campaign_root_work_id or proposal["work_id"]
+            item["vet_identity"] = proposal["vet_identity"]
+            # Echo the proposal's own fidelity identity exactly like the real
+            # checker protocol: the driver's item pack carries it and the
+            # operator hands it back. Hard-coding ``None`` here encoded the
+            # same wrong assumption the binding matcher used to hold and let
+            # fidelity-required proposals pass a check the production echo
+            # failed (pilot 2026-08-04: m4334, m7362, m9304).
+            item["fidelity_identity"] = proposal.get("fidelity_identity")
+            item["verified_hashes"] = {
+                "proposal": proposal["proposal_sha256"],
+                **proposal["verified_hashes"],
+            }
+            selected_rung = proposal["proposed_facts"]["source_resolution"]["rung"]
+            item["rung_check"]["selected_rung"] = selected_rung
+            item["rung_check"]["highest_applicable"] = selected_rung
+            item["field_checks"] = [
+                {
+                    "field": field,
+                    "verdict": "accurate",
+                    "evidence_ids": ["evidence-1"],
+                    "checked_source_ids": ["source-1"],
+                    "reason": "supported",
+                    "required_repair": None,
+                }
+                for field in required_metadata_field_checks(proposal["proposed_facts"])
+            ]
+        gate["checker"].update(
+            {
+                "model": config.checker_model,
+                "version": config.checker_version,
+                "prompt_sha256": driver_module._checker_prompt_hash(),
+            }
+        )
+        gate["result_envelope_sha256"] = stable_hash(
+            {
+                key: value
+                for key, value in gate.items()
+                if key not in {"result_envelope_sha256", "payload_sha256", "ledger_seq"}
+            }
+        )
+        self._apply_metadata_script(gate, artifacts)
+        return CheckerOutcome(gate=gate)
+
+    def _apply_metadata_script(
+        self, gate: dict[str, Any], artifacts: Sequence[AuthorArtifact]
+    ) -> None:
+        """Apply configured metadata findings after the synthetic envelope is bound."""
+
+        verdict = self.script.metadata_verdict
+        for item in gate["items"]:
+            selected = (
+                self.script.selected_id is None or item["stable_id"] == self.script.selected_id
+            )
+            if verdict is None or not selected:
+                continue
+            repair = self.script.required_repair or (
+                "correct the unsupported metadata claim"
+                if verdict == "inaccurate"
+                else "supply missing primary evidence"
+            )
+            field_repair = self.script.field_repair or (
+                "correct the claim" if verdict == "inaccurate" else "supply primary evidence"
+            )
+            item["verdict"] = verdict
+            item["required_repairs"] = [repair]
+            item["field_checks"][0]["verdict"] = verdict
+            item["field_checks"][0]["required_repair"] = field_repair
+        if self.script.mixed_tail and len(artifacts) > 1:
+            item = gate["items"][-1]
+            item["verdict"] = "inaccurate"
+            item["required_repairs"] = ["repair the final item"]
+            item["field_checks"][0]["verdict"] = "inaccurate"
+            item["field_checks"][0]["required_repair"] = "repair the final item"
+        if self.script.lineage_repairs:
+            for item in gate["items"]:
+                repair = f"repair-generation-{self.metadata_calls}"
+                item["required_repairs"] = [repair]
+                item["field_checks"][0]["reason"] = repair
+                item["field_checks"][0]["required_repair"] = repair
+
+    def check_fidelity(
+        self, artifact: AuthorArtifact, work_root: Path, config: DriverConfig
+    ) -> CheckerOutcome:
+        """Return an accurate match fidelity gate."""
+
+        del work_root
+        with self._call_count_lock:
+            self.fidelity_calls += 1
+        stable_id = str(artifact.proposal["stable_id"])
+        gate = make_gate(
+            [stable_id],
+            gate_id=f"gate-fidelity-{stable_id}",
+            gate_kind="fidelity",
+            fidelity_identity=str(artifact.proposal["fidelity_identity"]),
+        )
+        gate.pop("ledger_seq", None)
+        gate.pop("payload_sha256", None)
+        gate["gate_identity"] = self._fresh_gate_identity("fidelity", [stable_id])
+        item = gate["items"][0]
+        item["work_id"] = artifact.proposal["work_id"]
+        item["campaign_root_work_id"] = (
+            artifact.campaign_root_work_id or artifact.proposal["work_id"]
+        )
+        item["vet_identity"] = artifact.proposal["vet_identity"]
+        item["verified_hashes"] = {
+            "proposal": artifact.proposal["proposal_sha256"],
+            **artifact.proposal["verified_hashes"],
+        }
+        selected_rung = artifact.proposal["proposed_facts"]["source_resolution"]["rung"]
+        item["rung_check"]["selected_rung"] = selected_rung
+        item["rung_check"]["highest_applicable"] = selected_rung
+        gate["checker"].update(
+            {
+                "model": config.checker_model,
+                "version": config.checker_version,
+                "prompt_sha256": driver_module._checker_prompt_hash(),
+            }
+        )
+        gate["result_envelope_sha256"] = stable_hash(
+            {
+                key: value
+                for key, value in gate.items()
+                if key not in {"result_envelope_sha256", "payload_sha256", "ledger_seq"}
+            }
+        )
+        if self.script.reject_fidelity:
+            item["verdict"] = "inaccurate"
+            item["fidelity"]["verdict"] = "major-drift"
+            item["fidelity"]["contradictions"] = ["material topology mismatch"]
+        return CheckerOutcome(gate=gate)
+
+    def check_terminal(
+        self, artifact: AuthorArtifact, work_root: Path, config: DriverConfig
+    ) -> CheckerOutcome:
+        """Return one exact accepted terminal-disposition gate."""
+
+        del work_root
+        result = artifact.author_result
+        assert isinstance(result, (DeferRecommendation, SkipRecommendation, BlockedRecommendation))
+        binding = result.binding
+        predicate = (
+            f"needs-{result.platform}"
+            if isinstance(result, DeferRecommendation)
+            else "blocked-prerequisite"
+            if isinstance(result, BlockedRecommendation)
+            else result.status_code.split(":", 1)[1]
+        )
+        kind = (
+            "DEFER_RECOMMENDATION"
+            if isinstance(result, DeferRecommendation)
+            else "BLOCKED"
+            if isinstance(result, BlockedRecommendation)
+            else "SKIP_RECOMMENDATION"
+        )
+        if isinstance(result, BlockedRecommendation):
+            terminal_source_ids = [
+                str(source["source_id"]) for source in artifact.source_manifest["sources"]
+            ]
+            if self.script.terminal_verdict is not None:
+                evidence_source_by_id = {
+                    str(record["evidence_id"]): str(record["source_id"])
+                    for record in result.evidence_records
+                }
+                terminal_source_ids = sorted(
+                    {evidence_source_by_id[evidence_id] for evidence_id in result.evidence_ids}
+                )
+        else:
+            terminal_source_ids = list(result.source_ids)
+        gate = make_gate(
+            [binding.stable_id],
+            gate_id=f"gate-terminal-{binding.stable_id}",
+            gate_kind="terminal_disposition",
+        )
+        gate.pop("ledger_seq", None)
+        gate.pop("payload_sha256", None)
+        gate["gate_identity"] = self._fresh_gate_identity(
+            "terminal_disposition", [binding.stable_id]
+        )
+        gate["dispatcher_identity"] = binding.dispatcher_identity
+        item = gate["items"][0]
+        item["work_id"] = binding.work_id
+        item["campaign_root_work_id"] = binding.campaign_id
+        if isinstance(result, SkipRecommendation):
+            item["rung_check"]["selected_rung"] = "R5_SKIP"
+            item["rung_check"]["highest_applicable"] = "R5_SKIP"
+        item["terminal_disposition"] = {
+            "author_result_id": binding.result_id,
+            "author_result_sha256": binding.result_sha256,
+            "handoff_proposal_id": (
+                result.handoff_execution.proposal["proposal_id"]
+                if isinstance(result, DeferRecommendation) and result.handoff_execution is not None
+                else None
+            ),
+            "handoff_sha256": (
+                result.handoff_execution.handoff_sha256
+                if isinstance(result, DeferRecommendation) and result.handoff_execution is not None
+                else None
+            ),
+            "kind": kind,
+            "predicate": predicate,
+            "verdict": self.script.terminal_verdict or "accepted",
+            "source_manifest_identity": binding.source_manifest_identity,
+            "source_ids": terminal_source_ids,
+            "evidence_identity": result.evidence_identity,
+            "evidence_ids": list(result.evidence_ids),
+            "license_identity": result.license_identity,
+            "findings": (
+                list(self.script.terminal_findings) if self.script.terminal_verdict else []
+            ),
+        }
+        if self.script.terminal_verdict is not None:
+            # A refusal on the merits is an ITEM-level rejection too. Integrity stays
+            # ACCURATE on purpose: the terminal integrity rule is monotone rather than
+            # equality-bound, so a correctly-rejected item may carry honest integrity,
+            # and the routing under test must not secretly depend on a degraded one.
+            item["verdict"] = "inaccurate"
+        gate["checker"].update(
+            {
+                "model": config.checker_model,
+                "version": config.checker_version,
+                "prompt_sha256": driver_module._checker_prompt_hash(),
+            }
+        )
+        gate["result_envelope_sha256"] = stable_hash(
+            {
+                key: value
+                for key, value in gate.items()
+                if key not in {"result_envelope_sha256", "payload_sha256", "ledger_seq"}
+            }
+        )
+        return CheckerOutcome(gate=gate)
+
+
+class FakeChecker(ScriptedChecker):
+    """Retain the default synthetic checker spelling used across tests."""
+
+
+class FailingMetadataChecker(ScriptedChecker):
+    """Raise a checker-contract error for every metadata batch."""
+
+    def __init__(self) -> None:
+        """Configure a checker process that returns no valid envelope."""
+
+        super().__init__(script=CheckerScript(metadata_error="synthetic invalid checker envelope"))
+
+
+@dataclass(frozen=True)
+class ForwardScript:
+    """Describe synthetic forward deviations from clean dual-mode attempts."""
+
+    parameter_counts: Optional[Mapping[str, int]] = None
+    failed_id: Optional[str] = None
+    expanded_id: Optional[str] = None
+    sandbox_unavailable: bool = False
+
+
+class ScriptedForward(ForwardLane):
+    """Return schema-valid attempts with optional scripted deviations."""
+
+    def __init__(self, script: Optional[ForwardScript] = None) -> None:
+        """Initialize per-model invocation counts and scripted deviations."""
+
+        self.script = script or ForwardScript()
+        self.calls: dict[str, int] = {}
+
+    def forward(
+        self,
+        artifact: AuthorArtifact,
+        environment: EnvironmentBinding,
+        cold_runs: int,
+        work_root: Path,
+    ) -> Sequence[Mapping[str, Any]]:
+        """Build clean train/eval attempts with complete model output signatures."""
+
+        del work_root
+        if self.script.sandbox_unavailable:
+            raise SandboxUnavailableError("failed:sandbox-unavailable")
+        stable_id = str(artifact.proposal["stable_id"])
+        self.calls[stable_id] = self.calls.get(stable_id, 0) + 1
+        execution_identity = _execution_identity(
+            artifact, environment, closure_identity=driver_module._INJECTED_FORWARD_CLOSURE_IDENTITY
+        )
+        output_signature = make_model()["observed"]["output_signature"]
+        attempts: list[dict[str, Any]] = []
+        attempt_no = 0
+        for cold in range(cold_runs):
+            for mode in ("train", "eval"):
+                attempt_no += 1
+                attempt = make_attempt(
+                    stable_id,
+                    attempt_id=stable_hash(
+                        {
+                            "work_id": artifact.proposal["work_id"],
+                            "execution_identity": execution_identity,
+                            "cold_index": cold,
+                            "mode": mode,
+                        }
+                    ),
+                    mode=mode,
+                )
+                attempt["attempt_no"] = attempt_no
+                attempt["retries"]["stage_attempt"] = cold + 1
+                attempt["work_id"] = artifact.proposal["work_id"]
+                attempt.pop("ledger_seq", None)
+                attempt.pop("payload_sha256", None)
+                attempt["worker_receipt"]["output_signature"] = output_signature
+                contract_leaf = artifact.proposal["proposed_facts"]["input_contract"]["args"][0]
+                attempt["worker_receipt"]["input_signature"]["leaves"][0].update(
+                    {
+                        "shape": contract_leaf["shape"],
+                        "dtype": contract_leaf["dtype"],
+                    }
+                )
+                attempt["identities"].update(
+                    {
+                        "source": artifact.proposal["source_identity"],
+                        "evidence": artifact.proposal["evidence_identity"],
+                        "recipe": artifact.proposal["recipe_revision"],
+                        "environment": environment.env_generation,
+                        "execution": execution_identity,
+                        "runner": _runner_identity(
+                            artifact.proposal["proposed_facts"]["external_metadata"]["modality"]
+                        ),
+                        "author_prompt": artifact.proposal["author"]["prompt_sha256"],
+                    }
+                )
+                attempt["worker_receipt"]["observed_recipe_revision"] = artifact.proposal[
+                    "recipe_revision"
+                ]
+                attempt["worker_receipt"]["observed_adapter_sha256"] = (
+                    driver_module._expected_adapter_sha256(artifact.proposal)
+                )
+                attempt["worker_receipt"]["observed_code_manifest_sha256"] = (
+                    driver_module._expected_code_manifest_sha256(artifact.proposal)
+                )
+                attempt["environment"].update(
+                    {
+                        "family": environment.family,
+                        "target": environment.target,
+                        "env_id": str(environment.prefix),
+                        "lock_sha256": environment.lock_sha256,
+                        "resolved_export_sha256": environment.resolved_export_sha256,
+                        "packages_manifest_sha256": environment.packages_manifest_sha256,
+                        "python": environment.python_version,
+                        "compiler_identity": environment.compiler_identity,
+                        "sdk_identity": environment.sdk_identity,
+                    }
+                )
+                attempt["invocation"]["argv"] = [
+                    "python",
+                    f"/scratch/cold-{cold + 1}/{mode}/request.json",
+                ]
+                rebind_attempt_raw_proof(attempt)
+                attempts.append(attempt)
+        self._apply_script(stable_id, attempts)
+        if self.script.expanded_id is not None and stable_id != self.script.expanded_id:
+            return [attempt for attempt in attempts if attempt["mode"] == "eval"]
+        return attempts
+
+    def _apply_script(self, stable_id: str, attempts: list[dict[str, Any]]) -> None:
+        """Apply configured receipt values and failures to generated attempts."""
+
+        if self.script.parameter_counts is not None:
+            count = self.script.parameter_counts[stable_id]
+            for attempt in attempts:
+                attempt["worker_receipt"]["parameter_count_total"] = count
+                attempt["worker_receipt"]["parameter_count_trainable"] = count
+                rebind_attempt_raw_proof(attempt)
+        if stable_id != self.script.failed_id:
+            return
+        failed = attempts[0]
+        failed["result"] = "failed"
+        failed["worker_receipt"] = dict(failed["worker_receipt"])
+        failed["worker_receipt"]["forward_completed"] = False
+        failed["error"] = {
+            "stage": "forward",
+            "reason_code": "mode-run",
+            "exception_type": "builtins.RuntimeError",
+            "message": "synthetic forward failure",
+            "traceback": "Traceback: synthetic forward failure",
+            "no_traceback_reason": None,
+            "native_crash": False,
+            "root_cause_fingerprint": HASH,
+            "details": {"mode": failed["mode"]},
+        }
+        failed["raw_award_receipt"] = None
+        failed["raw_award_receipt_sha256"] = None
+        parent_attestation = dict(failed["parent_attestation"])
+        parent_attestation["completion_line_sha256"] = None
+        parent_attestation["named_raw_award_receipt_sha256"] = None
+        parent_attestation["attestation_sha256"] = stable_hash(
+            {key: value for key, value in parent_attestation.items() if key != "attestation_sha256"}
+        )
+        failed["parent_attestation"] = parent_attestation
+        failed["unattested_partial"] = {
+            "state": "unattested-partial",
+            "stage": "forward",
+            "reason_code": "mode-run",
+            "diagnostic_sha256": None,
+        }
+
+
+class FakeForward(ScriptedForward):
+    """Retain the default synthetic forward spelling used across tests."""
+
+
+class EvalOnlyAuthor(FakeAuthor):
+    """Declare one canonical eval-only recipe for every synthetic model."""
+
+    def author(
+        self, item: WorkItem, work_root: Path, config: DriverConfig, context: AuthorityContext
+    ) -> AuthorArtifact:
+        """Return an eval-only proposal with all dependent identities rebound."""
+
+        artifact = super().author(item, work_root, config, context)
+        facts = artifact.proposal["proposed_facts"]
+        facts["modes"]["meaningful_modes"] = ["eval"]
+        facts["external_metadata"]["modes"]["meaningful_modes"] = ["eval"]
+        _refresh_proposal_identities(
+            artifact.proposal,
+            checker_model=config.checker_model,
+            checker_version=config.checker_version,
+        )
+        return _rebind_fake_author_result(artifact)
+
+
+class DetectedModeRepairAuthor(FakeAuthor):
+    """Revise an eval-only first proposal to the complete detected mode set.
+
+    The repair generation returns its dual-mode revision under the SAME
+    envelope-bound work identity, because that is the only shape the production
+    lane can produce: ``_author_from_frozen_sources`` stamps
+    ``item.active_work_id`` into the envelope and ``_validate_proposal_binding``
+    pins the proposal to it. An earlier version of this fixture forged a fresh
+    ``work_id`` (and a matching envelope) on repair generations -- something no
+    real author session can do -- which blessed an unsatisfiable driver rule and
+    let rung 11's m10949 burn its whole repair cap on correct revisions.
+    """
+
+    def author(
+        self, item: WorkItem, work_root: Path, config: DriverConfig, context: AuthorityContext
+    ) -> AuthorArtifact:
+        """Return eval-only initially and the dual-mode revision on repair."""
+
+        artifact = super().author(item, work_root, config, context)
+        generation = self.calls[item.stable_id]
+        facts = artifact.proposal["proposed_facts"]
+        if generation == 1:
+            facts["modes"]["meaningful_modes"] = ["eval"]
+            facts["external_metadata"]["modes"]["meaningful_modes"] = ["eval"]
+        _refresh_proposal_identities(
+            artifact.proposal,
+            checker_model=config.checker_model,
+            checker_version=config.checker_version,
+        )
+        return _rebind_fake_author_result(artifact)
+
+
+class ForgedWorkIdentityModeRepairAuthor(DetectedModeRepairAuthor):
+    """Cover the detected modes but hand back a forged repair work identity.
+
+    Models the one corruption the drift tripwire exists for: a lane returning an
+    artifact bound to a DIFFERENT work generation than the one it was asked to
+    repair. The production result validator makes this unreachable for an honest
+    lane, so the fake forges its own self-consistent envelope the way the old
+    ``DetectedModeRepairAuthor`` did.
+    """
+
+    def author(
+        self, item: WorkItem, work_root: Path, config: DriverConfig, context: AuthorityContext
+    ) -> AuthorArtifact:
+        """Return a dual-mode revision rebound onto a forged work identity."""
+
+        artifact = super().author(item, work_root, config, context)
+        generation = self.calls[item.stable_id]
+        if generation > 1:
+            artifact.proposal["work_id"] = f"work-{item.stable_id}-forged-{generation}"
+            _refresh_proposal_identities(
+                artifact.proposal,
+                checker_model=config.checker_model,
+                checker_version=config.checker_version,
+            )
+            artifact = _rebind_fake_author_result(artifact)
+        return artifact
+
+
+class ModeRepairTerminalAuthor(FakeAuthor):
+    """Eval-only first proposal; the detected-mode repair generation answers terminally.
+
+    Call 1 declares eval-only so the worker's dual-mode observation triggers the
+    bounded ``run_modes`` repair; call 2 -- the AGENTIC repair generation -- comes
+    back with a typed platform deferral instead of a revised proposal.
+    """
+
+    def __init__(self, stable_id: str) -> None:
+        """Script the terminal answer onto exactly the repair generation."""
+
+        super().__init__(
+            AuthorScript(
+                terminal_outcomes=(("platform", "cuda"),),
+                terminal_id=stable_id,
+                terminal_call=2,
+            )
+        )
+
+    def author(
+        self, item: WorkItem, work_root: Path, config: DriverConfig, context: AuthorityContext
+    ) -> AuthorArtifact:
+        """Return an eval-only proposal first and the scripted terminal on repair."""
+
+        artifact = super().author(item, work_root, config, context)
+        if not isinstance(artifact.author_result, ProposedAuthorResult):
+            return artifact
+        facts = artifact.proposal["proposed_facts"]
+        facts["modes"]["meaningful_modes"] = ["eval"]
+        facts["external_metadata"]["modes"]["meaningful_modes"] = ["eval"]
+        _refresh_proposal_identities(
+            artifact.proposal,
+            checker_model=config.checker_model,
+            checker_version=config.checker_version,
+        )
+        return _rebind_fake_author_result(artifact)
+
+
+class ModeRepairCapAuthor(EvalOnlyAuthor):
+    """Answer every bounded repair generation with a still-eval-only revision.
+
+    A genuinely failing repair: the author completes each generation but never
+    covers the detected ``train`` mode, so every revision is honestly rejected
+    and charged against the cap. Like the production lane, every generation
+    returns under the same envelope-bound work identity.
+    """
+
+    def author(
+        self, item: WorkItem, work_root: Path, config: DriverConfig, context: AuthorityContext
+    ) -> AuthorArtifact:
+        """Return a completed eval-only proposal for every bounded repair generation."""
+
+        return super().author(item, work_root, config, context)
+
+
+class ReverseModeAuthor(FakeAuthor):
+    """Author the complete mode set in noncanonical eval/train order."""
+
+    def author(
+        self, item: WorkItem, work_root: Path, config: DriverConfig, context: AuthorityContext
+    ) -> AuthorArtifact:
+        """Return a reverse-ordered proposal for driver canonicalization."""
+
+        artifact = super().author(item, work_root, config, context)
+        facts = artifact.proposal["proposed_facts"]
+        facts["modes"]["meaningful_modes"] = ["eval", "train"]
+        facts["external_metadata"]["modes"]["meaningful_modes"] = ["eval", "train"]
+        _refresh_proposal_identities(
+            artifact.proposal,
+            checker_model=config.checker_model,
+            checker_version=config.checker_version,
+        )
+        return _rebind_fake_author_result(artifact)
+
+
+class InaccurateChecker(ScriptedChecker):
+    """Return the same inaccurate root cause until the driver terminalizes it."""
+
+    def __init__(self) -> None:
+        """Configure complete inaccurate metadata gates."""
+
+        super().__init__(script=CheckerScript(metadata_verdict="inaccurate"))
+
+
+class CannotVerifyChecker(ScriptedChecker):
+    """Return one repeated cannot-verify metadata finding per item."""
+
+    def __init__(self) -> None:
+        """Configure complete cannot-verify metadata gates."""
+
+        super().__init__(script=CheckerScript(metadata_verdict="cannot-verify"))
+
+
+class RepairingIdentityAuthor(FakeAuthor):
+    """Issue a new exact proposal/work identity on every bounded repair."""
+
+    def author(
+        self, item: WorkItem, work_root: Path, config: DriverConfig, context: AuthorityContext
+    ) -> AuthorArtifact:
+        """Change authored bytes and proposal identity while preserving the model campaign."""
+
+        artifact = super().author(item, work_root, config, context)
+        generation = self.calls[item.stable_id]
+        if generation > 1:
+            artifact.proposal["work_id"] = f"work-{item.stable_id}-generation-{generation}"
+        artifact.proposal["proposed_facts"]["website"]["description"] += (
+            f" Repair generation {generation}."
+        )
+        _refresh_proposal_identities(artifact.proposal)
+        return _rebind_fake_author_result(artifact)
+
+
+class FidelityAuthor(FakeAuthor):
+    """Mark every proposal as an R3 port requiring fidelity review."""
+
+    def author(
+        self, item: WorkItem, work_root: Path, config: DriverConfig, context: AuthorityContext
+    ) -> AuthorArtifact:
+        """Return a complete proposal with required fidelity enabled."""
+
+        artifact = super().author(item, work_root, config, context)
+        fidelity_identity = HASH
+        artifact.proposal["fidelity_identity"] = fidelity_identity
+        facts = artifact.proposal["proposed_facts"]
+        facts["source_resolution"]["rung"] = "R3_PORT"
+        facts["fidelity"].update(
+            {
+                "required": True,
+                "reason": "synthetic R3 port",
+                "verdict": None,
+                "fidelity_identity": fidelity_identity,
+                "gate_id": None,
+                "current": False,
+            }
+        )
+        repair_generation = self.calls[item.stable_id]
+        if repair_generation > 1:
+            # A fidelity repair must mint distinct proposal authority; replaying an
+            # identical checker item would correctly trip F-6 ambiguous membership.
+            facts["input_contract"]["args"][0]["shape"] = [
+                1,
+                3,
+                7 + repair_generation,
+                7 + repair_generation,
+            ]
+        _refresh_proposal_identities(artifact.proposal)
+        return _rebind_fake_author_result(artifact)
+
+
+class ChangedInputAuthor(FakeAuthor):
+    """Return a new source/input-bound recipe generation for resume tests."""
+
+    def author(
+        self, item: WorkItem, work_root: Path, config: DriverConfig, context: AuthorityContext
+    ) -> AuthorArtifact:
+        """Change source, recipe, and dummy-input dependencies together."""
+
+        artifact = super().author(item, work_root, config, context)
+        facts = artifact.proposal["proposed_facts"]
+        facts["source_resolution"]["sources"][0]["revision"] = "changed-revision"
+        artifact.source_manifest["sources"][0]["revision"] = "changed-revision"
+        facts["input_contract"]["args"][0]["shape"] = [1, 3, 9, 9]
+        _refresh_proposal_identities(artifact.proposal)
+        return _rebind_fake_author_result(artifact)
+
+
+class FailingNotifier(Notifier):
+    """Record attempted messages while reporting delivery failure."""
+
+    def __init__(self) -> None:
+        """Initialize attempted messages."""
+
+        self.messages: list[str] = []
+
+    def notify(
+        self,
+        summary: str,
+        *,
+        idempotency_key: str,
+        notification_class: Optional[str] = None,
+    ) -> bool:
+        """Record one call and report that delivery failed."""
+
+        del notification_class
+        assert idempotency_key.startswith("sha256:")
+        self.messages.append(summary)
+        return False
+
+
+class FakeEnvironments(EnvironmentLane):
+    """Exercise environment callbacks sequentially without conda."""
+
+    def __init__(self, root: Path) -> None:
+        """Store the fake prefix root and lifecycle event log."""
+
+        self.root = root
+        self.events: list[str] = []
+        self.active = 0
+
+    def run(self, intent: EnvironmentIntent, *, use: Any) -> object:
+        """Call use under one active fake prefix and always tear down."""
+
+        assert self.active == 0
+        self.active += 1
+        self.events.append(f"create:{intent.name}")
+        prefix = self.root / intent.name
+        prefix.mkdir(parents=True, exist_ok=True)
+        try:
+            use(
+                prefix,
+                tuple(
+                    ProbeResult(name, True, "ok") for name in expected_probe_names(intent.probes)
+                ),
+            )
+        finally:
+            self.events.append(f"remove:{intent.name}")
+            self.active -= 1
+        return object()
+
+
+class FailingEnvironments(FakeEnvironments):
+    """Fail one intent before any model callback begins."""
+
+    def run(self, intent: EnvironmentIntent, *, use: Any) -> object:
+        """Raise a typed probe failure instead of invoking the model callback."""
+
+        del intent, use
+        raise EnvironmentProbeError("synthetic environment probe failure")
+
+
+class FakeNotifier(Notifier):
+    """Capture ASCII summaries without external messaging."""
+
+    def __init__(self) -> None:
+        """Initialize the delivered message list."""
+
+        self.messages: list[str] = []
+        self.idempotency_keys: list[str] = []
+
+    def notify(
+        self,
+        summary: str,
+        *,
+        idempotency_key: str,
+        notification_class: Optional[str] = None,
+    ) -> bool:
+        """Capture one summary and report success."""
+
+        del notification_class
+        summary.encode("ascii")
+        self.messages.append(summary)
+        self.idempotency_keys.append(idempotency_key)
+        return True
+
+
+class FakePauseScheduler(UsagePauseScheduler):
+    """Use the real idempotent wakeup records with a no-op OS installer."""
+
+    def __init__(self, root: Path) -> None:
+        """Store the fake wakeup definition root and call count."""
+
+        self.root = root
+        self.calls = 0
+
+    def schedule(
+        self,
+        signal: UsageBackoffSignal,
+        operational: JsonlLedger,
+        context: OperationalContext,
+        created_at: str,
+        reset_at: str,
+        reset_observation: str,
+    ) -> None:
+        """Record pause/wakeup events without installing an OS scheduler."""
+
+        self.calls += 1
+        manager = WakeupManager(
+            self.root,
+            operational,
+            ["python", "-m", "menagerie.crawler", "run", "--resume"],
+            backend=WakeupBackend.CRON,
+            installer=lambda _spec: None,
+            verifier=lambda _spec: True,
+        )
+        manager.record_pause_and_schedule(
+            provider=signal.provider,
+            observed_response=signal.response_excerpt,
+            reset_at=reset_at,
+            reset_observation=reset_observation,
+            context=context,
+            created_at=created_at,
+        )
+
+
+def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    """Write small discovery inputs for an intake snapshot."""
+
+    path.write_text("".join(json.dumps(dict(row)) + "\n" for row in rows), encoding="utf-8")
+
+
+def _snapshot(tmp_path: Path, count: int = 10) -> IntakeSnapshot:
+    """Create one immutable synthetic intake snapshot."""
+
+    master = tmp_path / "master.jsonl"
+    deferred = tmp_path / "deferred.jsonl"
+    _write_jsonl(
+        master,
+        [
+            {"name": f"Example{index}", "zoo": "fixtures", "variant": "base"}
+            for index in range(count)
+        ],
+    )
+    _write_jsonl(deferred, [])
+    return create_intake_snapshot(master, deferred, tmp_path / "intake")
+
+
+def _test_authority_context(snapshot: IntakeSnapshot, config: DriverConfig) -> AuthorityContext:
+    """Build the exact authority context used by a synthetic driver run."""
+
+    return build_authority_context(
+        active_intake_snapshot_id=snapshot.snapshot_id,
+        active_intake_snapshot_sha256=snapshot.snapshot_sha256,
+        intake_rows=(item.to_dict() for item in snapshot.items),
+        author_model=config.author_model,
+        author_version=config.author_version,
+        checker_model=config.checker_model,
+        checker_version=config.checker_version,
+        environment_generations={"env-test": HASH},
+    )
+
+
+def _family_snapshot(tmp_path: Path) -> tuple[IntakeSnapshot, str, tuple[str, ...]]:
+    """Create one representative and two explicitly designated size variants.
+
+    Returns
+    -------
+    tuple[IntakeSnapshot, str, tuple[str, ...]]
+        Snapshot, representative ID, and ordered variant IDs.
+    """
+
+    def stable_id(variant: str) -> str:
+        """Return the deterministic intake ID for one family variant."""
+
+        digest = stable_hash(
+            {
+                "namespace": "menagerie-crawler-v1",
+                "natural_key": ["FamilyNet", "fixtures", variant],
+            }
+        )
+        return f"m_{digest.removeprefix('sha256:')[:20]}"
+
+    representative_id = stable_id("base")
+    variant_ids = (stable_id("small"), stable_id("large"))
+    master = tmp_path / "family-master.jsonl"
+    deferred = tmp_path / "family-deferred.jsonl"
+    rows = [
+        {
+            "name": "FamilyNet",
+            "zoo": "fixtures",
+            "variant": variant,
+            "variant_scope": "family",
+            "family_representative_id": representative_id,
+        }
+        for variant in ("base", "small", "large")
+    ]
+    _write_jsonl(master, rows)
+    _write_jsonl(deferred, [])
+    snapshot = create_intake_snapshot(master, deferred, tmp_path / "family-intake")
+    return snapshot, representative_id, variant_ids
+
+
+def _mixed_phase_snapshot(tmp_path: Path) -> IntakeSnapshot:
+    """Create ten PyTorch rows and one unprocessed native-tail row."""
+
+    master = tmp_path / "master.jsonl"
+    deferred = tmp_path / "deferred.jsonl"
+    rows = [
+        {"name": f"Example{index}", "zoo": "fixtures", "variant": "base"} for index in range(10)
+    ]
+    rows.append({"name": "TensorFlowNativeExample", "zoo": "tensorflow", "variant": "base"})
+    _write_jsonl(master, rows)
+    _write_jsonl(deferred, [])
+    return create_intake_snapshot(master, deferred, tmp_path / "intake")
+
+
+def _paths(tmp_path: Path, snapshot: IntakeSnapshot) -> DriverPaths:
+    """Return isolated runtime and canonical ledger paths.
+
+    SHARDED production layout on purpose (close-object v2): the flat rig
+    layout (``records/models.jsonl``) made ``models.parent.parent`` and
+    ``canonical_records_root`` disagree about the records root, splitting the
+    valve/park ledgers and the close machinery across two roots -- exactly
+    the resolver-fork disease the one source census exists to kill. Under the
+    sharded layout every convention lands on ``tmp_path/records`` and every
+    ledger sits on a census slot.
+    """
+
+    return DriverPaths(
+        tmp_path / "runtime",
+        snapshot.root,
+        LedgerPaths(
+            tmp_path / "records" / "models" / "current-shard.jsonl",
+            tmp_path / "records" / "attempts" / "local.jsonl",
+            tmp_path / "records" / "gates" / "current-shard.jsonl",
+        ),
+    )
+
+
+@contextmanager
+def _authorized_direct_paid_dispatch(root: Path, *, lane: str) -> Iterator[None]:
+    """Mint, bind, and settle authorization for a direct command-lane test."""
+
+    authority = PaidSessionAuthority(
+        root / "direct-paid-sessions.jsonl",
+        runtime_root=root / "direct-paid-runtime",
+        clock=utc_now,
+    )
+    reservation = authority.reserve(
+        scope={
+            "campaign_id": "direct-command-lane-tests",
+            "generation_id": "direct-command-lane-generation",
+            "lane": lane,
+            "dispatch_kind": "direct-test",
+            "work_generations": (("m_direct_command", "work-direct-command"),),
+            "machine_id": "test-machine",
+        },
+        policy=BudgetPolicy(
+            quota_sessions=16,
+            quota_wall_seconds=160000.0,
+            runaway_sessions=16,
+            runaway_wall_seconds=160000.0,
+            reservation_wall_seconds=10000.0,
+        ),
+    )
+    started = time.monotonic()
+    completed = False
+    try:
+        with authorized_paid_dispatch(reservation):
+            yield
+        completed = True
+    finally:
+        authority.settle(
+            reservation,
+            provider_query=lambda _key: ProviderReconciliation(
+                True,
+                min(time.monotonic() - started, reservation.reserved_wall_seconds),
+                "sha256:direct-command-provider",
+            ),
+            custody_outcome="test-complete" if completed else "test-error",
+        )
+
+
+def _copy_clean_clone_handoff_authority(
+    source_paths: DriverPaths,
+    source_snapshot: IntakeSnapshot,
+    clone_root: Path,
+) -> tuple[IntakeSnapshot, DriverPaths]:
+    """Copy only canonical handoff authority and authorized private objects.
+
+    Parameters
+    ----------
+    source_paths:
+        Source campaign paths containing finalized deferral transactions.
+    source_snapshot:
+        Exact immutable intake authority used by the source campaign.
+    clone_root:
+        Fresh campaign root that receives no disposable source state.
+
+    Returns
+    -------
+    tuple[IntakeSnapshot, DriverPaths]
+        Reloaded clone snapshot and paths rooted entirely in the clone.
+    """
+
+    from menagerie.crawler.checkpoint import canonical_records_root
+
+    clone_intake = clone_root / "intake"
+    shutil.copytree(source_snapshot.root, clone_intake)
+    # SHARDED layout: the canonical records root carries models/, attempts/,
+    # gates/, artifacts/, intake-extensions/, and reconstruction/ -- copying
+    # only ``models.parent`` (the flat-rig spelling) dropped every sibling
+    # ledger from the clone.
+    source_records = canonical_records_root(source_paths.ledgers.models)
+    shutil.copytree(source_records, clone_root / "records")
+    # The reconstruction store is transaction-addressed under the CANONICAL
+    # CRAWLER ROOT (the records root's parent -- _reconstruction_path writes
+    # `<canonical_root>/reconstruction/...`), never inside records/. BL-8
+    # (8568097c7) mistakenly read `records/reconstruction`, so every clean
+    # clone since silently dropped the committed reconstruction bytes and the
+    # resumed handoff leg refused rehydration with "committed reconstruction
+    # bytes are missing". Terminal-disposition finals with no reconstruction
+    # transactions may still legitimately hold none.
+    source_reconstruction = source_records.parent / "reconstruction"
+    if source_reconstruction.is_dir():
+        shutil.copytree(source_reconstruction, clone_root / "reconstruction")
+
+    final_events = tuple(
+        event
+        for event in scan_jsonl(source_paths.ledgers.artifacts)
+        if event["event_kind"] == ArtifactEventKind.PRIVATE_COMMITTED.value
+    )
+    object_keys = {
+        str(row["object_key"])
+        for event in final_events
+        for row in event["objects"]
+        if row["mirror_class"] == "private"
+    }
+    source_private = source_paths.runtime_root / "mirrors" / "private"
+    clone_private = clone_root / "runtime" / "mirrors" / "private"
+    for object_key in sorted(object_keys):
+        source = source_private / object_key
+        destination = clone_private / object_key
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+    clone_snapshot = load_intake_snapshot(clone_intake)
+    return clone_snapshot, _paths(clone_root, clone_snapshot)
+
+
+def _make_final_transaction_proposal_less(artifact_ledger: Path) -> None:
+    """Persist one schema-valid legacy event chain without handoff proposal fields.
+
+    Parameters
+    ----------
+    artifact_ledger:
+        Fresh-clone artifact ledger containing exactly one finalized transaction.
+    """
+
+    rows = scan_jsonl(artifact_ledger)
+    predecessor_by_transaction: dict[str, str] = {}
+    rewritten: list[dict[str, Any]] = []
+    for source in rows:
+        event = deepcopy(source)
+        transaction_id = str(event["transaction_id"])
+        event["predecessor_event_id"] = predecessor_by_transaction.get(transaction_id)
+        event["handoff_proposal_id"] = None
+        event["handoff_sha256"] = None
+        event["artifact_event_id"] = stable_hash(
+            {
+                key: value
+                for key, value in event.items()
+                if key not in {"artifact_event_id", "created_at", "ledger_seq", "payload_sha256"}
+            }
+        )
+        predecessor_by_transaction[transaction_id] = str(event["artifact_event_id"])
+        event["payload_sha256"] = payload_hash(event)
+        rewritten.append(event)
+    artifact_ledger.write_bytes(
+        b"".join(canonical_json_bytes(event) + b"\n" for event in rewritten)
+    )
+
+
+def _test_environment(prefix: Path) -> EnvironmentBinding:
+    """Build exact synthetic byte identities for a fake active environment."""
+
+    return EnvironmentBinding(
+        prefix=prefix,
+        python_executable=Path(sys.executable),
+        family="core",
+        target="test",
+        env_generation=HASH,
+        lock_sha256=HASH,
+        resolved_export_sha256=HASH,
+        packages_manifest_sha256=HASH,
+        python_version="3.11",
+        compiler_identity="test-compiler",
+        sdk_identity="test-sdk",
+    )
+
+
+def test_runner_execution_manifest_is_compositional_by_selected_modality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only semantic runtime behavior and the one selected asset stale a runner."""
+
+    assert _RUNNER_EXECUTION_CLOSURE == {
+        "worker.py": ("main",),
+        "worker_supervisor.py": ("run_isolated_subprocess",),
+    }
+
+    original_read_bytes = Path.read_bytes
+    original_read_text = Path.read_text
+
+    def changed_unselected_assets(path: Path) -> bytes:
+        """Change assets not selected by vision precedence."""
+
+        value = original_read_bytes(path)
+        return value + b"changed" if path.name in {"audio.csv", "text.txt"} else value
+
+    def comment_only_source_change(
+        path: Path, encoding: Optional[str] = None, errors: Optional[str] = None
+    ) -> str:
+        """Append a non-behavioral comment to formerly whole-file-hashed modules."""
+
+        value = original_read_text(path, encoding=encoding, errors=errors)
+        if path.name in {"constants.py", "models.py", "worker_supervisor.py"}:
+            return f"{value}\n# unrelated review comment\n"
+        return value
+
+    vision_before = _runner_identity(["vision", "text"])
+    audio_before = _runner_identity("audio")
+    monkeypatch.setattr(Path, "read_bytes", changed_unselected_assets)
+    monkeypatch.setattr(Path, "read_text", comment_only_source_change)
+    assert _runner_identity(["vision", "text"]) == vision_before
+    assert _runner_identity("audio") != audio_before
+
+
+@pytest.mark.parametrize(
+    ("relative", "old", "new"),
+    (
+        (
+            "family_templates.py",
+            b'VETTED_TEXT_FIELDS = ("tagline", "description", "key_contribution", "voice_version")',
+            b'VETTED_TEXT_FIELDS = ("tagline", "description", "key_contribution", "voice_v2")',
+        ),
+        (
+            "metadata.py",
+            b'_CANONICAL_MODE_ORDER = ("train", "eval")',
+            b'_CANONICAL_MODE_ORDER = ("eval", "train")',
+        ),
+        (
+            "reducer.py",
+            b'    "fidelity",\n)',
+            b'    "fidelity_changed",\n)',
+        ),
+        (
+            "reducer.py",
+            b'    "audio": "audio.csv",',
+            b'    "audio": "changed-audio.csv",',
+        ),
+        (
+            "reducer.py",
+            b'                raise ReductionError("model environment generation contradicts its attempt proof")',
+            b'                raise ReductionError("model environment generation contradicts replayed attempt proof")',
+        ),
+        (
+            "schema.py",
+            b'SCHEMA_DIRECTORY = Path(__file__).with_name("schemas")',
+            b'SCHEMA_DIRECTORY = Path(__file__).with_name("changed-schemas")',
+        ),
+        (
+            "identity.py",
+            b'_HASH_PREFIX = "sha256:"',
+            b'_HASH_PREFIX = "sha257:"',
+        ),
+        (
+            "identity.py",
+            b"    return hash_bytes(canonical_json_bytes(value))\n",
+            b"    return hash_bytes(canonical_json_bytes([value]))\n",
+        ),
+        (
+            "recordio.py",
+            b'        return (version, record.get("attempt_id"))',
+            b'        return (version, "attempt", record.get("attempt_id"))',
+        ),
+        (
+            "intake.py",
+            b'for token in ("classic", "faithful", "fidelity", "slop")',
+            b'for token in ("classic", "faithful", "fidelity", "slop", "audit")',
+        ),
+        (
+            "constants.py",
+            b'MODEL_SCHEMA_VERSION = "menagerie.crawler.model.v2"',
+            b'MODEL_SCHEMA_VERSION = "menagerie.crawler.model.v3"',
+        ),
+        (
+            "proposal.py",
+            b"    _validate_structural_slop(facts, code_paths)\n",
+            b"    _validate_structural_slop(facts, tuple(code_paths))\n",
+        ),
+        # `checkpoint.py` no longer appears here: its only award-closure root was
+        # the retired `_reconstruction_has_canonical_anchor`, so the module never
+        # contributed a live binding to track. Reconstruction authority is proven
+        # by the artifact ledger, not by the award closure.
+        (
+            "reducer.py",
+            b"    raw_current = _select_current(models)\n",
+            b"    raw_current = dict(_select_current(models))\n",
+        ),
+    ),
+)
+def test_award_closure_tracks_transitive_loaded_award_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+    old: bytes,
+    new: bytes,
+) -> None:
+    """Every load-bearing binding class changes the semantic closure identity."""
+
+    before = driver_module._award_closure_identity()
+    original_read_bytes = Path.read_bytes
+
+    def changed_binding(path: Path) -> bytes:
+        """Mutate exactly one transitive award binding in the byte snapshot."""
+
+        value = original_read_bytes(path)
+        if path.name != relative:
+            return value
+        assert old in value
+        return value.replace(old, new, 1)
+
+    monkeypatch.setattr(Path, "read_bytes", changed_binding)
+    assert driver_module._award_closure_identity() != before
+
+
+def test_award_closure_ignores_comments_docstrings_and_formatting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-behavioral source text does not stale the award closure."""
+
+    before = driver_module._award_closure_identity()
+    original_read_bytes = Path.read_bytes
+
+    def nonsemantic_edit(path: Path) -> bytes:
+        """Apply comment, docstring, and whitespace-only edits to award code."""
+
+        value = original_read_bytes(path)
+        if path.name != "reducer.py":
+            return value
+        old = b'        """Enforce attempt/receipt and meaningful-mode rules for run awards.\n'
+        new = b'        """Document the run-award validator with different wording.\n'
+        assert old in value
+        return value.replace(old, new, 1) + b"\n# award review comment only\n"
+
+    monkeypatch.setattr(Path, "read_bytes", nonsemantic_edit)
+    assert driver_module._award_closure_identity() == before
+
+
+def test_env_observation_binding_changes_award_closure_and_execution_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parent package observation semantics are load-bearing award authority."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    driver = _driver(tmp_path, snapshot)
+    item = driver._ordered_work(snapshot, {})[0]
+    artifact = FakeAuthor().author(
+        item,
+        driver.paths.work_root,
+        driver.config,
+        _test_authority_context(snapshot, driver.config),
+    )
+    environment = _test_environment(tmp_path / "env")
+    before_closure = driver_module._award_closure_identity()
+    before_execution = _execution_identity(
+        artifact, environment, closure_identity=driver_module._INJECTED_FORWARD_CLOSURE_IDENTITY
+    )
+    original_read_bytes = Path.read_bytes
+
+    def changed_environment_observer(path: Path) -> bytes:
+        """Mutate one loaded parent-side installed-package observation binding."""
+
+        value = original_read_bytes(path)
+        if path.name != "driver_admission.py":
+            return value
+        old = b"    package_bytes = _installed_package_manifest_bytes(prefix, strict=strict)\n"
+        new = (
+            b"    package_bytes = _installed_package_manifest_bytes(prefix, strict=strict) "
+            b"+ b'changed'\n"
+        )
+        assert old in value
+        return value.replace(old, new, 1)
+
+    monkeypatch.setattr(Path, "read_bytes", changed_environment_observer)
+    assert driver_module._award_closure_identity() != before_closure
+    assert (
+        _execution_identity(
+            artifact, environment, closure_identity=driver_module._INJECTED_FORWARD_CLOSURE_IDENTITY
+        )
+        != before_execution
+    )
+
+
+def test_award_validator_behavior_change_changes_closure_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing a formerly omitted receipt validator stales the award closure."""
+
+    before = driver_module._award_closure_identity()
+    original_read_bytes = Path.read_bytes
+
+    def changed_metadata_validator(path: Path) -> bytes:
+        """Tighten one included metadata validator in its immutable source snapshot."""
+
+        value = original_read_bytes(path)
+        if path.name != "metadata.py":
+            return value
+        old = (
+            b'    if not isinstance(signature, Mapping) or "tree" not in signature:\n'
+            b"        return False\n"
+        )
+        new = (
+            b'    if not isinstance(signature, Mapping) or "tree" not in signature:\n'
+            b"        return bool(signature)\n"
+        )
+        assert old in value
+        return value.replace(old, new, 1)
+
+    monkeypatch.setattr(Path, "read_bytes", changed_metadata_validator)
+    assert driver_module._award_closure_identity() != before
+
+
+def test_parent_read_telemetry_sets_cache_attempt_for_closed_roots() -> None:
+    """A successful read below a forbidden cache root is recognized parent-side."""
+
+    assert _parent_cache_read_attempted(
+        {"checkpoint_paths": ["/var/test/.cache/huggingface/model.bin"]}
+    )
+    assert not _parent_cache_read_attempted({"checkpoint_paths": ["/usr/lib/python3.11/site.py"]})
+
+
+def test_mode_requests_reuse_one_accepted_input_seed_and_manifest(
+    tmp_path: Path,
+    real_environment_fixture: RealEnvironmentFixture,
+) -> None:
+    """Cold confirmations vary process identity, never accepted dummy-input bytes."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    driver = _driver(tmp_path, snapshot)
+    item = driver._ordered_work(snapshot, {})[0]
+    artifact = FakeAuthor().author(
+        item,
+        driver.paths.work_root,
+        driver.config,
+        _test_authority_context(snapshot, driver.config),
+    )
+    execution_manifest = driver_module._compile_worker_read_manifest(
+        artifact, real_environment_fixture.binding, HASH
+    )
+    requests = [
+        _worker_request(
+            artifact,
+            tmp_path / f"scratch-{cold}-{mode}",
+            tmp_path / f"receipt-{cold}-{mode}.json",
+            HASH,
+            execution_manifest,
+            cold,
+            mode,
+        )
+        for cold in range(2)
+        for mode in ("train", "eval")
+    ]
+    assert {request["mode"] for request in requests} == {"train", "eval"}
+    assert {request["seed"] for request in requests} == {0}
+    assert {request["input_seed"] for request in requests} == {0}
+    assert len({request["input_identity"] for request in requests}) == 1
+    assert len({request["execution_read_manifest_identity"] for request in requests}) == 1
+    assert all("code_path" not in request["input_contract"] for request in requests)
+
+
+def test_environment_binding_hashes_real_bytes_and_launches_prefix_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runtime provenance and sandbox argv use the verified environment itself."""
+
+    artifact_sha256 = "sha256:" + "a" * 64
+    package_row = {
+        "name": "python",
+        "version": "3.11",
+        "build": "h1_0",
+        "url": "https://conda.example.test/python.conda",
+        "sha256": artifact_sha256,
+    }
+    lock_bytes = f"{package_row['url']}#{artifact_sha256.removeprefix('sha256:')}\n".encode()
+    package_bytes = canonical_json_bytes({"packages": [package_row]}) + b"\n"
+    export_bytes = package_bytes
+    lock_path = tmp_path / "target.lock"
+    export_path = tmp_path / "target.resolved.json"
+    lock_path.write_bytes(lock_bytes)
+    export_path.write_bytes(export_bytes)
+    (tmp_path / "target.sha256").write_text(f"{hash_bytes(export_bytes)}\n", encoding="utf-8")
+    probe_receipt_path = tmp_path / "linux-64.probes.json"
+    probe_result = ProbeResult("import:canary", True, "observed")
+    probe_receipt_path.write_bytes(
+        canonical_json_bytes(
+            {
+                "probes": [
+                    {
+                        "name": probe_result.name,
+                        "passed": probe_result.passed,
+                        "detail": probe_result.detail,
+                    }
+                ]
+            }
+        )
+        + b"\n"
+    )
+    prefix = tmp_path / "env-prefix"
+    (prefix / "bin").mkdir(parents=True)
+    (prefix / "bin" / "python").write_bytes(Path(sys.executable).read_bytes())
+    (prefix / "bin" / "python").chmod(0o755)
+    (prefix / "conda-meta").mkdir()
+    (prefix / "conda-meta" / "python.json").write_bytes(canonical_json_bytes(package_row))
+    (prefix / "packages-manifest.json").write_bytes(b"fabricated package claims")
+    intent = EnvironmentIntent(
+        name="core",
+        phase=EnvironmentPhase.PYTORCH,
+        framework="pytorch",
+        description="test",
+        split_guidance="test",
+        channels=("conda-forge",),
+        dependencies=("python",),
+        probes=IntentProbes(("canary",), (), ()),
+        lock=LockArtifacts(
+            target="linux-64",
+            lock_path=lock_path,
+            export_path=export_path,
+            export_hash_path=tmp_path / "target.sha256",
+            lock_bytes=lock_bytes,
+            export_bytes=export_bytes,
+            declared_export_hash=hash_bytes(export_bytes),
+        ),
+        generation=None,
+    )
+    binding = _environment_binding(
+        intent,
+        prefix,
+        (probe_result,),
+        strict=True,
+        authority_cache=EnvironmentAuthorityCache(),
+    )
+    assert binding.lock_sha256 == hash_bytes(lock_bytes)
+    assert binding.resolved_export_sha256 == hash_bytes(export_bytes)
+    assert binding.packages_manifest_sha256 == hash_bytes(package_bytes)
+    changed_result = ProbeResult("import:canary", True, "different observed result")
+    probe_receipt_path.write_bytes(
+        canonical_json_bytes(
+            {
+                "probes": [
+                    {
+                        "name": changed_result.name,
+                        "passed": changed_result.passed,
+                        "detail": changed_result.detail,
+                    }
+                ]
+            }
+        )
+        + b"\n"
+    )
+    changed_probe = _environment_binding(
+        intent,
+        prefix,
+        (changed_result,),
+        strict=True,
+        authority_cache=EnvironmentAuthorityCache(),
+    )
+    assert changed_probe.env_generation != binding.env_generation
+
+    interpreter = prefix / "bin" / "python"
+    interpreter.unlink()
+    interpreter.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "print(json.dumps({"
+        "'python_version': 'prefix-python-9.9', "
+        "'compiler_identity': 'prefix-compiler', "
+        "'sdk_identity': 'prefix-sdk'}, sort_keys=True, separators=(',', ':')))\n",
+        encoding="utf-8",
+    )
+    interpreter.chmod(0o755)
+    probe_receipt_path.write_bytes(
+        canonical_json_bytes(
+            {
+                "probes": [
+                    {
+                        "name": probe_result.name,
+                        "passed": probe_result.passed,
+                        "detail": probe_result.detail,
+                    }
+                ]
+            }
+        )
+        + b"\n"
+    )
+    prefix_observed = _environment_binding(
+        intent,
+        prefix,
+        (probe_result,),
+        strict=True,
+        authority_cache=EnvironmentAuthorityCache(),
+    )
+    assert prefix_observed.python_version == "prefix-python-9.9"
+    assert prefix_observed.compiler_identity == "prefix-compiler"
+    assert prefix_observed.sdk_identity == "prefix-sdk"
+    assert prefix_observed.env_generation != binding.env_generation
+
+
+def test_author_source_handshake_freezes_nonempty_cas_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Author pins are controlled-fetched before the evidence envelope is frozen."""
+
+    snapshot = _snapshot(tmp_path)
+    driver = _driver(tmp_path, snapshot)
+    item = driver._ordered_work(snapshot, {})[0]
+    content = b"ExampleNet is a source-grounded architecture."
+    digest = hash_bytes(content)
+
+    def fake_run(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """Write the author-requested exact source target."""
+
+        del kwargs
+        request = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        output = Path(request["required_output_path"])
+        discovery = {
+            "schema_version": "menagerie.crawler.source-discovery.v1",
+            "stable_id": request["stable_id"],
+            "work_id": request["work_id"],
+            "arm": "FOUND",
+            "payload": {
+                "arm": "FOUND",
+                "sources": [
+                    {
+                        "source_id": "source-1",
+                        "kind": "raw-url",
+                        "url": "https://example.com/model.py",
+                        "requested_role": "implementation",
+                        "basis": "Fixture implementation source.",
+                    }
+                ],
+            },
+        }
+        output.write_text(
+            json.dumps(
+                {
+                    "pack_version": "menagerie.crawler.source-broker-pack.v1",
+                    "sources": [
+                        {
+                            "source_id": "source-1",
+                            "url": "https://example.com/model.py",
+                            "final_url": "https://example.com/model.py",
+                            "revision": digest,
+                            "expected_sha256": digest,
+                            "media_type": "text/x-python",
+                            "media_type_method": "path-extension",
+                            "broker_role": "implementation",
+                        }
+                    ],
+                    "broker": {"outcomes": [], "derived_citations": [], "total_bytes": 0},
+                    "discovery": discovery,
+                    "discovery_sha256": stable_hash(discovery),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    monkeypatch.setattr(driver_admission_module, "_run_operator_command", fake_run)
+    monkeypatch.setattr(
+        driver_module,
+        "fetch_targets",
+        lambda targets, root: controlled_fetch_targets(
+            targets, root, fetch_bytes=lambda _url: content
+        ),
+    )
+    lane = CommandAuthorLane(("fake-author",))
+    manifest = lane._fetch_author_sources(item, tmp_path / "author")
+    assert isinstance(manifest, dict)
+    assert manifest["sources"]
+    assert Path(manifest["sources"][0]["cas_path"]).read_bytes() == content
+
+    def empty_run(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """Write an invalid empty author source request."""
+
+        del kwargs
+        request = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        discovery = {
+            "schema_version": "menagerie.crawler.source-discovery.v1",
+            "stable_id": request["stable_id"],
+            "work_id": request["work_id"],
+            "arm": "FOUND",
+            "payload": {
+                "arm": "FOUND",
+                "sources": [
+                    {
+                        "source_id": "source-1",
+                        "kind": "raw-url",
+                        "url": "https://example.com/model.py",
+                        "requested_role": "implementation",
+                        "basis": "Fixture implementation source.",
+                    }
+                ],
+            },
+        }
+        Path(request["required_output_path"]).write_text(
+            json.dumps(
+                {
+                    "pack_version": "menagerie.crawler.source-broker-pack.v1",
+                    "sources": [],
+                    "broker": {"outcomes": [], "derived_citations": [], "total_bytes": 0},
+                    "discovery": discovery,
+                    "discovery_sha256": stable_hash(discovery),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    monkeypatch.setattr(driver_admission_module, "_run_operator_command", empty_run)
+    with pytest.raises(DriverIntegrationError, match="at least one fetched source"):
+        lane._fetch_author_sources(item, tmp_path / "empty-author")
+
+
+def test_true_no_source_reaches_checked_r5_without_fetch_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bounded negative discovery bypasses fetch and becomes a checked R5 record."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    fetch_calls = 0
+
+    def forbidden_fetch(targets: Any, root: Path) -> dict[str, object]:
+        """Fail if a non-FIND discovery arm enters controlled fetch."""
+
+        del targets, root
+        nonlocal fetch_calls
+        fetch_calls += 1
+        raise AssertionError("negative discovery must not invent a fetch target")
+
+    def publish_negative(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """Publish the registered negative discovery envelope as the executor would."""
+
+        del kwargs
+        request = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        Path(request["required_output_path"]).write_text(
+            json.dumps(
+                {
+                    "schema_version": "menagerie.crawler.source-discovery.v1",
+                    "stable_id": request["stable_id"],
+                    "work_id": request["work_id"],
+                    "arm": "NO_USABLE_SOURCE",
+                    "payload": {
+                        "arm": "NO_USABLE_SOURCE",
+                        "search_evidence": {
+                            "queries": [
+                                "ExampleNet architecture",
+                                '"ExampleNet" neural network',
+                            ],
+                            "places": ["publisher index", "code hosts", "web archive"],
+                            # An absence claim must name the locators it looked at:
+                            # zero candidates means zero machine probe receipts, so
+                            # nothing could ever contradict the claim.
+                            "candidate_links": [
+                                {
+                                    "url": "https://example.com/examplenet",
+                                    "why_rejected": "The page describes a different model.",
+                                    "rejection_class": "not-this-model",
+                                }
+                            ],
+                            "languages": ["en", "zh"],
+                            "conclusion": (
+                                "No usable architecture source exists after the bounded search."
+                            ),
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    def deterministic_probe_transport() -> Any:
+        """Return a hermetic transport for the machine's candidate-link probes."""
+
+        def probe(url: str, *, max_bytes: int, timeout: float) -> TransportResponse:
+            """Return a deterministic typed miss without touching the network."""
+
+            del max_bytes, timeout
+            return TransportResponse(
+                status=404,
+                final_url=url,
+                redirect_chain=(url,),
+                body=b"",
+                truncated=False,
+                error="fixture candidate rejected",
+            )
+
+        return probe
+
+    monkeypatch.setattr(driver_admission_module, "_run_operator_command", publish_negative)
+    monkeypatch.setattr(discovery_module, "default_transport", deterministic_probe_transport)
+    monkeypatch.setattr(driver_module, "fetch_targets", forbidden_fetch)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+    ).run()
+
+    assert result.status == "terminal-partition-complete"
+    assert fetch_calls == 0
+    paths = _paths(tmp_path, snapshot)
+    model = scan_jsonl(paths.ledgers.models)[0]
+    assert model["status"]["code"] == "skipped:no-description"
+    assert model["source_resolution"]["rung"] == "R5_SKIP"
+    assert model["source_resolution"]["mandatory_link_status"] == "failed"
+    assert model["source_resolution"]["sources"][0]["kind"] == "discovery-evidence"
+    assert model["source_resolution"]["sources"][0]["url"].startswith(
+        "urn:menagerie:source-discovery:"
+    )
+    # The machine's own dereference of the author's locator reaches the record.
+    # It was computed and frozen before this change and read by nothing, so the
+    # only independent check on a negative discovery was invisible.
+    probes = model["discovery_probes"]
+    assert len(probes) == 1
+    probe = probes[0]
+    assert probe["locator"] == "https://example.com/examplenet"
+    assert probe["author_claimed_class"] == "not-this-model"
+    # 404 from the injected transport: the machine reports what it saw, and does
+    # not quietly reconcile it with what the author claimed.
+    assert probe["probe_outcome"] == "unreachable"
+    assert probe["http_status"] == 404
+    assert probe["identifier_kind"] is None
+    assert probe["identifier"] is None
+    assert probe["attempted_at"]
+    gates = scan_jsonl(paths.ledgers.gates)
+    assert gates[0]["gate_kind"] == "terminal_disposition"
+    assert gates[0]["items"][0]["terminal_disposition"]["verdict"] == "accepted"
+
+
+def test_a_paywalled_paper_reaches_its_own_terminal_not_a_false_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point: an unreadable paper stops being recorded as a missing one.
+
+    A paywall yields no bytes to quote, so ``skipped:insufficient-description`` was
+    unreachable and the model collapsed into ``skipped:no-description`` -- "no
+    descriptive text after bounded search" -- which is FALSE about a paper sitting
+    behind a publisher gate, and terminal on a campaign that runs once.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    monkeypatch:
+        Fixture used to publish the synthetic discovery envelope.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+
+    def publish_access_blocked(
+        argv: Sequence[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        """Publish the registered access-blocked discovery envelope."""
+
+        del kwargs
+        request = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        Path(request["required_output_path"]).write_text(
+            json.dumps(
+                {
+                    "schema_version": "menagerie.crawler.source-discovery.v1",
+                    "stable_id": request["stable_id"],
+                    "work_id": request["work_id"],
+                    "arm": "NEEDS_SOURCE_ACCESS",
+                    "payload": {
+                        "arm": "NEEDS_SOURCE_ACCESS",
+                        "research_summary": {
+                            "queries": ["ExampleNet architecture"],
+                            "places": ["publisher index", "thesis repositories"],
+                            "candidate_links": [
+                                {
+                                    "url": "https://doi.org/10.1109/5.726791",
+                                    "why_rejected": (
+                                        "The publisher gate serves only the abstract."
+                                    ),
+                                    "rejection_class": "access-barrier",
+                                }
+                            ],
+                            "languages": ["en"],
+                            "conclusion": ("The specifying paper exists and is behind a paywall."),
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    def deterministic_probe_transport() -> Any:
+        """Return a hermetic transport reporting the publisher's own refusal."""
+
+        def probe(url: str, *, max_bytes: int, timeout: float) -> TransportResponse:
+            """Return a deterministic 403 without touching the network."""
+
+            del max_bytes, timeout
+            return TransportResponse(
+                status=403,
+                final_url=url,
+                redirect_chain=(url,),
+                body=b"",
+                truncated=False,
+                error="forbidden",
+            )
+
+        return probe
+
+    monkeypatch.setattr(driver_admission_module, "_run_operator_command", publish_access_blocked)
+    monkeypatch.setattr(discovery_module, "default_transport", deterministic_probe_transport)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+    ).run()
+
+    assert result.status == "terminal-partition-complete"
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[0]
+    assert model["status"]["code"] == "deferred:needs-source-access"
+    # `deferred:`, never `failed:` -- the pipeline worked perfectly; the world said no.
+    assert model["status"]["kind"] == "deferred"
+    # NOT `R5_SKIP`. That rung certifies "no faithful source path exists", and here we
+    # can point straight at the source we were refused.
+    assert model["source_resolution"]["rung"] == "NO_RUNG_SELECTED"
+    probes = model["discovery_probes"]
+    assert [probe["author_claimed_class"] for probe in probes] == ["access-barrier"]
+    # The machine derived the DOI the author was never asked to read off a paywall.
+    assert probes[0]["identifier_kind"] == "doi"
+    assert probes[0]["identifier"] == "10.1109/5.726791"
+    assert probes[0]["http_status"] == 403
+
+
+@pytest.mark.parametrize(
+    ("arm", "payload", "expected_type"),
+    [
+        (
+            "FOUND",
+            {
+                "arm": "FOUND",
+                "sources": [
+                    {
+                        "source_id": "source-1",
+                        "kind": "forge-file",
+                        "repo": "github.com/example/model",
+                        "path": "model.py",
+                        "ref": "v1",
+                        "requested_role": "implementation",
+                        "basis": "The repository owns the model implementation.",
+                    }
+                ],
+            },
+            FoundDiscovery,
+        ),
+        (
+            "NO_USABLE_SOURCE",
+            {
+                "arm": "NO_USABLE_SOURCE",
+                "search_evidence": {
+                    "queries": ["model architecture"],
+                    "places": ["code hosts"],
+                    "candidate_links": [],
+                    "languages": ["en"],
+                    "conclusion": "No source exists.",
+                },
+            },
+            NegativeDiscovery,
+        ),
+        (
+            "INSUFFICIENT_DESCRIPTION",
+            {
+                "arm": "INSUFFICIENT_DESCRIPTION",
+                "search_evidence": {
+                    "queries": ["model paper"],
+                    "places": ["publisher"],
+                    "candidate_links": [
+                        {
+                            "url": "https://example.com/abstract",
+                            "why_rejected": "Only an abstract is available.",
+                            "rejection_class": "no-material-detail",
+                        }
+                    ],
+                    "languages": ["en"],
+                    "conclusion": "Only an abstract was found.",
+                },
+                "retained_vague_text": "We use a novel neural architecture.",
+            },
+            NegativeDiscovery,
+        ),
+        (
+            "NOT_A_MODEL",
+            {
+                "arm": "NOT_A_MODEL",
+                "search_evidence": {
+                    "queries": ["named item"],
+                    "places": ["project site"],
+                    "candidate_links": [
+                        {
+                            "url": "https://example.com/tool",
+                            "why_rejected": "The item is a dataset tool.",
+                            "rejection_class": "not-a-nn",
+                        }
+                    ],
+                    "languages": ["en"],
+                    "conclusion": "The item is a dataset, not a neural model.",
+                },
+            },
+            NegativeDiscovery,
+        ),
+        (
+            "NEEDS_HIGHER_TIER",
+            {
+                "arm": "NEEDS_HIGHER_TIER",
+                "research_summary": {
+                    "queries": ["ambiguous historical model"],
+                    "places": ["archives"],
+                    "candidate_links": [],
+                    "languages": ["en", "de"],
+                    "conclusion": "The identity requires deeper adjudication.",
+                },
+            },
+            HigherTierDiscovery,
+        ),
+        (
+            "RETRYABLE_TOOL_FAILURE",
+            {
+                "arm": "RETRYABLE_TOOL_FAILURE",
+                "tool_name": "web_search_exa",
+                "tool_spelling": "mcp__exa__web_search_exa",
+                "error": "connection reset",
+            },
+            RetryableToolFailureDiscovery,
+        ),
+    ],
+)
+def test_typed_source_discovery_union_accepts_each_closed_arm(
+    arm: str,
+    payload: dict[str, Any],
+    expected_type: type[object],
+) -> None:
+    """Every governed stage-1 arm is schema-valid and retains its discriminator."""
+
+    value = {
+        "schema_version": "menagerie.crawler.source-discovery.v1",
+        "stable_id": "m_discovery",
+        "work_id": "work-m_discovery",
+        "arm": arm,
+        "payload": payload,
+    }
+    result = validate_source_discovery(
+        value,
+        stable_id="m_discovery",
+        work_id="work-m_discovery",
+    )
+    assert isinstance(result, expected_type)
+
+
+def _candidate_link_discovery(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Build a minimal NO_USABLE_SOURCE envelope around exactly one candidate link."""
+
+    return {
+        "schema_version": "menagerie.crawler.source-discovery.v1",
+        "stable_id": "m_discovery",
+        "work_id": "work-m_discovery",
+        "arm": "NO_USABLE_SOURCE",
+        "payload": {
+            "arm": "NO_USABLE_SOURCE",
+            "search_evidence": {
+                "queries": ["model architecture"],
+                "places": ["publisher index"],
+                "candidate_links": [candidate],
+                "languages": ["en"],
+                "conclusion": "No usable architecture source exists.",
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "rejection_class",
+    ["not-this-model", "no-material-detail", "access-barrier", "dead-link", "not-a-nn"],
+)
+def test_candidate_link_accepts_every_closed_rejection_class(rejection_class: str) -> None:
+    """The vocabulary is exactly these five; each must round-trip."""
+
+    result = validate_source_discovery(
+        _candidate_link_discovery(
+            {
+                "url": "https://example.com/paper",
+                "why_rejected": "The publisher page never exposes the architecture.",
+                "rejection_class": rejection_class,
+            }
+        ),
+        stable_id="m_discovery",
+        work_id="work-m_discovery",
+    )
+    assert isinstance(result, NegativeDiscovery)
+    assert result.search_evidence["candidate_links"][0]["rejection_class"] == rejection_class
+
+
+def test_a_plain_http_barrier_locator_survives_into_the_terminal_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An observed `http://` locator must not make an honest discovery unrecordable.
+
+    `source-discovery-v1` deliberately admits HTTP or HTTPS for an OBSERVED research
+    locator -- it grants no dereference authority, unlike a fetch descriptor -- but the
+    record schemas that copy the same field verbatim required `https://`. So a valid
+    stage-1 result died on the way to the record, and legacy publisher and lab pages
+    are frequently plain HTTP: exactly the pages an access-barrier claim names.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    monkeypatch:
+        Fixture used to publish the synthetic discovery envelope.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+
+    def publish(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """Publish an access-blocked envelope whose barrier locator is plain HTTP."""
+
+        del kwargs
+        request = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        Path(request["required_output_path"]).write_text(
+            json.dumps(
+                {
+                    "schema_version": "menagerie.crawler.source-discovery.v1",
+                    "stable_id": request["stable_id"],
+                    "work_id": request["work_id"],
+                    "arm": "NEEDS_SOURCE_ACCESS",
+                    "payload": {
+                        "arm": "NEEDS_SOURCE_ACCESS",
+                        "research_summary": {
+                            "queries": ["ExampleNet original report"],
+                            "places": ["legacy publisher index"],
+                            "candidate_links": [
+                                {
+                                    "url": "http://legacy.publisher.example/paper",
+                                    "why_rejected": "The gate serves only the abstract.",
+                                    "rejection_class": "access-barrier",
+                                }
+                            ],
+                            "languages": ["en"],
+                            "conclusion": "The report exists behind a legacy gate.",
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    def transport() -> Any:
+        """Return a hermetic transport reporting the gate's refusal."""
+
+        def probe(url: str, *, max_bytes: int, timeout: float) -> TransportResponse:
+            """Return a deterministic 401 without touching the network."""
+
+            del max_bytes, timeout
+            return TransportResponse(
+                status=401,
+                final_url=url,
+                redirect_chain=(url,),
+                body=b"",
+                truncated=False,
+                error="unauthorized",
+            )
+
+        return probe
+
+    monkeypatch.setattr(driver_admission_module, "_run_operator_command", publish)
+    monkeypatch.setattr(discovery_module, "default_transport", transport)
+    result = _driver(tmp_path, snapshot, author=CommandAuthorLane(("fake-author",))).run()
+
+    assert result.status == "terminal-partition-complete"
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[0]
+    assert model["status"]["code"] == "deferred:needs-source-access"
+    assert model["discovery_probes"][0]["locator"] == ("http://legacy.publisher.example/paper")
+
+
+def test_a_plain_http_locator_survives_into_the_higher_tier_terminal_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The older deferrable arm carries the same verbatim field, so pin it too.
+
+    ``NEEDS_SOURCE_ACCESS`` is new; ``NEEDS_HIGHER_TIER`` is not, and it copies the very
+    same ``research_summary`` into the very same ``payload.research_summary`` that
+    ``author-result-v3`` constrains -- so the ``^https://`` mismatch was equally reachable
+    through this arm, and reachable for far longer. Verified against pre-sprint main
+    (67a45fdf): stage 1 admitted an ``http://`` candidate link there, and the same
+    complete BLOCKED body was refused at ``payload.research_summary.candidate_links[0].url``
+    while its ``https://`` twin validated.
+
+    This arm carries strictly more than its sibling, which is why it earns its own
+    end-to-end pin rather than a schema unit test: it also writes a ``promotion-v1``
+    row into the C3 intake extension, and that row copies the locator a THIRD time
+    through a THIRD schema.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    monkeypatch:
+        Fixture used to publish the synthetic discovery envelope.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    locator = "http://legacy.lab.example/exampletier"
+
+    def publish(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """Publish a higher-tier envelope whose retained locator is plain HTTP."""
+
+        del kwargs
+        request = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        Path(request["required_output_path"]).write_text(
+            json.dumps(
+                {
+                    "schema_version": "menagerie.crawler.source-discovery.v1",
+                    "stable_id": request["stable_id"],
+                    "work_id": request["work_id"],
+                    "arm": "NEEDS_HIGHER_TIER",
+                    "payload": {
+                        "arm": "NEEDS_HIGHER_TIER",
+                        "research_summary": {
+                            "queries": ["ExampleNet exact architecture"],
+                            "places": ["legacy lab page"],
+                            "candidate_links": [
+                                {
+                                    "url": locator,
+                                    "why_rejected": (
+                                        "Relevant, but variant fidelity needs "
+                                        "higher-tier adjudication."
+                                    ),
+                                    "rejection_class": "no-material-detail",
+                                }
+                            ],
+                            "languages": ["en"],
+                            "conclusion": (
+                                "The model is real and located, but this tier cannot "
+                                "adjudicate it faithfully."
+                            ),
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    def transport() -> Any:
+        """Return a hermetic transport reporting a deterministic miss."""
+
+        def probe(url: str, *, max_bytes: int, timeout: float) -> TransportResponse:
+            """Return a deterministic 404 without touching the network."""
+
+            del max_bytes, timeout
+            return TransportResponse(
+                status=404,
+                final_url=url,
+                redirect_chain=(url,),
+                body=b"",
+                truncated=False,
+                error="not found",
+            )
+
+        return probe
+
+    monkeypatch.setattr(driver_admission_module, "_run_operator_command", publish)
+    monkeypatch.setattr(discovery_module, "default_transport", transport)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+        campaign_id="c1-mech",
+    ).run()
+
+    assert result.status == "terminal-partition-complete"
+    paths = _paths(tmp_path, snapshot)
+    model = scan_jsonl(paths.ledgers.models)[0]
+    assert model["status"]["code"] == "deferred:needs-opus-tier"
+    assert model["discovery_probes"][0]["locator"] == locator
+
+    promotion_path = paths.ledgers.models.parent.parent / "intake-extensions" / "c3-classics.jsonl"
+    promotions = scan_jsonl(promotion_path, validate=False)
+    assert len(promotions) == 1
+    assert promotions[0]["stage1_research_summary"]["candidate_links"][0]["url"] == locator
+
+
+def test_access_blocked_arm_requires_a_barrier_it_actually_hit() -> None:
+    """The arm asserts a locator was WITHHELD, so it must name one.
+
+    Without this it would be the cheapest arm in the union -- no excerpt to retain,
+    no absence to defend -- and would simply become the new soft landing, which is the
+    failure mode this change exists to remove rather than relocate.
+    """
+
+    value = {
+        "schema_version": "menagerie.crawler.source-discovery.v1",
+        "stable_id": "m_discovery",
+        "work_id": "work-m_discovery",
+        "arm": "NEEDS_SOURCE_ACCESS",
+        "payload": {
+            "arm": "NEEDS_SOURCE_ACCESS",
+            "research_summary": {
+                "queries": ["ExampleNet architecture"],
+                "places": ["publisher index"],
+                "candidate_links": [
+                    {
+                        "url": "https://example.com/other",
+                        "why_rejected": "A different architecture of the same name.",
+                        "rejection_class": "not-this-model",
+                    }
+                ],
+                "languages": ["en"],
+                "conclusion": "The specifying paper could not be read.",
+            },
+        },
+    }
+    with pytest.raises(DiscoveryError, match="access-barrier"):
+        validate_source_discovery(value, stable_id="m_discovery", work_id="work-m_discovery")
+
+    value["payload"]["research_summary"]["candidate_links"].append(
+        {
+            "url": "https://doi.org/10.1109/5.726791",
+            "why_rejected": "The publisher gate serves only the abstract.",
+            "rejection_class": "access-barrier",
+        }
+    )
+    parsed = validate_source_discovery(value, stable_id="m_discovery", work_id="work-m_discovery")
+    assert isinstance(parsed, AccessBlockedDiscovery)
+
+
+def test_candidate_link_without_a_rejection_class_is_refused() -> None:
+    """Required, not optional: an unclassified candidate is how a paywall used to hide.
+
+    Free prose alone made 'we could not read it' indistinguishable from 'there was
+    nothing to read', so the class must be asserted for every candidate rather than
+    volunteered by the conscientious.
+    """
+
+    with pytest.raises(DiscoveryError, match="rejection_class"):
+        validate_source_discovery(
+            _candidate_link_discovery(
+                {
+                    "url": "https://example.com/paper",
+                    "why_rejected": "The publisher page is behind a paywall.",
+                }
+            ),
+            stable_id="m_discovery",
+            work_id="work-m_discovery",
+        )
+
+
+def test_candidate_link_rejection_class_vocabulary_is_closed() -> None:
+    """Closed, not free text: an invented class must fail rather than pass through."""
+
+    with pytest.raises(DiscoveryError):
+        validate_source_discovery(
+            _candidate_link_discovery(
+                {
+                    "url": "https://example.com/paper",
+                    "why_rejected": "The publisher page is behind a paywall.",
+                    "rejection_class": "paywalled",
+                }
+            ),
+            stable_id="m_discovery",
+            work_id="work-m_discovery",
+        )
+
+
+def test_candidate_probe_findings_derive_identity_the_author_never_supplied() -> None:
+    """The machine supplies identity; the author only ever supplies a locator.
+
+    A prior defect demanded a commit SHA the author could not read off the page and
+    got invented SHAs back. The same trap applies to a paywalled paper: its DOI is
+    frequently not readable from the gate page. So the DOI/arXiv/OpenReview handle is
+    derived here from the locator itself, and nothing asks the author for it.
+    """
+
+    search_evidence = {
+        "candidate_links": [
+            {
+                "url": "https://doi.org/10.1109/5.726791",
+                "why_rejected": "The publisher gate never exposes the architecture.",
+                "rejection_class": "access-barrier",
+            },
+            {
+                "url": "https://arxiv.org/abs/1706.03762",
+                "why_rejected": "A different architecture of the same name.",
+                "rejection_class": "not-this-model",
+            },
+            {
+                "url": "https://example.com/notes",
+                "why_rejected": "A blog post with no forward definition.",
+                "rejection_class": "no-material-detail",
+            },
+        ]
+    }
+    findings = candidate_probe_findings(search_evidence, None, attempted_at="2026-07-30T00:00:00Z")
+
+    assert [(row["identifier_kind"], row["identifier"]) for row in findings] == [
+        ("doi", "10.1109/5.726791"),
+        ("arxiv", "1706.03762"),
+        (None, None),
+    ]
+    # With no probe pack the machine reports that it observed nothing -- it does not
+    # borrow the author's claim to fill the gap.
+    assert all(row["probe_outcome"] is None for row in findings)
+    assert all(row["http_status"] is None for row in findings)
+    assert [row["author_claimed_class"] for row in findings] == [
+        "access-barrier",
+        "not-this-model",
+        "no-material-detail",
+    ]
+
+
+def test_candidate_probe_findings_preserve_author_machine_disagreement() -> None:
+    """A claim the machine contradicts is retained as a disagreement, not reconciled.
+
+    An author claiming ``access-barrier`` on a locator that in fact fetched cleanly is
+    exactly the signal a checker needs. Silently correcting either side would destroy it.
+    """
+
+    search_evidence = {
+        "candidate_links": [
+            {
+                "url": "https://example.com/open-paper",
+                "why_rejected": "The publisher gate blocked the full text.",
+                "rejection_class": "access-barrier",
+            }
+        ]
+    }
+    pack = BrokerPack(
+        outcomes=[
+            BrokerOutcome(
+                source_id="candidate-probe-001",
+                kind="raw-url",
+                requested_role="probe",
+                bound_role="probe",
+                outcome="fetched",
+                url="https://example.com/open-paper",
+                final_url="https://example.com/open-paper",
+                redirect_chain=(),
+                status=200,
+                bytes_fetched=12,
+                sha256=None,
+                media_type="text/html",
+                media_type_method="header",
+                resolver_receipt=None,
+                derived_citation=None,
+            )
+        ]
+    )
+    findings = candidate_probe_findings(search_evidence, pack, attempted_at="2026-07-30T00:00:00Z")
+
+    assert findings[0]["author_claimed_class"] == "access-barrier"
+    assert findings[0]["probe_outcome"] == "fetched"
+    assert findings[0]["http_status"] == 200
+
+
+def test_found_discovery_alone_requires_a_nonempty_fetch_set() -> None:
+    """The nonempty-target tripwire is scoped strictly inside ``FOUND``."""
+
+    value = {
+        "schema_version": "menagerie.crawler.source-discovery.v1",
+        "stable_id": "m_discovery",
+        "work_id": "work-m_discovery",
+        "arm": "FOUND",
+        "payload": {"arm": "FOUND", "sources": []},
+    }
+    with pytest.raises(DiscoveryError):
+        validate_source_discovery(
+            value,
+            stable_id="m_discovery",
+            work_id="work-m_discovery",
+        )
+
+
+def test_found_discovery_rejects_an_authored_revision_row() -> None:
+    """The formerly valid authored revision/media row is now unrepresentable."""
+
+    raw = {
+        "schema_version": "menagerie.crawler.source-discovery.v1",
+        "stable_id": "m_discovery",
+        "work_id": "work-m_discovery",
+        "arm": "FOUND",
+        "payload": {
+            "arm": "FOUND",
+            "sources": [
+                {
+                    "source_id": "source-1",
+                    "url": "https://example.com/model.py",
+                    "revision": "a" * 40,
+                    "media_type": "text/x-python",
+                }
+            ],
+        },
+    }
+
+    with pytest.raises(DiscoveryError):
+        validate_source_discovery(
+            raw,
+            stable_id="m_discovery",
+            work_id="work-m_discovery",
+        )
+
+
+@pytest.mark.parametrize("value", ["authored", "", None])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "revision",
+        "commit_sha",
+        "expected_sha256",
+        "content_sha256",
+        "final_url",
+        "redirect_chain",
+        "resolver_receipt",
+        "broker_role",
+        "media_type",
+        "derived_citation",
+    ],
+)
+def test_found_discovery_cannot_express_machine_owned_identity(field: str, value: object) -> None:
+    """Every machine-owned descriptor field is rejected on presence."""
+
+    descriptor: dict[str, Any] = {
+        "source_id": "source-1",
+        "kind": "forge-file",
+        "repo": "github.com/example/model",
+        "path": "model.py",
+        "ref": "v1",
+        "requested_role": "implementation",
+        "basis": "The repository owns the model implementation.",
+        field: value,
+    }
+    raw = {
+        "schema_version": "menagerie.crawler.source-discovery.v1",
+        "stable_id": "m_discovery",
+        "work_id": "work-m_discovery",
+        "arm": "FOUND",
+        "payload": {"arm": "FOUND", "sources": [descriptor]},
+    }
+
+    with pytest.raises(DiscoveryError):
+        validate_source_discovery(
+            raw,
+            stable_id="m_discovery",
+            work_id="work-m_discovery",
+        )
+
+
+@pytest.mark.parametrize("source_id", ["", "Uppercase", "has space", "a" * 65])
+def test_found_discovery_rejects_invalid_source_ids(source_id: str) -> None:
+    """Broker correlation labels use the strict bounded schema syntax."""
+
+    raw = {
+        "schema_version": "menagerie.crawler.source-discovery.v1",
+        "stable_id": "m_discovery",
+        "work_id": "work-m_discovery",
+        "arm": "FOUND",
+        "payload": {
+            "arm": "FOUND",
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "kind": "raw-url",
+                    "url": "https://example.com/model.py",
+                    "requested_role": "implementation",
+                    "basis": "Candidate implementation.",
+                }
+            ],
+        },
+    }
+
+    with pytest.raises(DiscoveryError):
+        validate_source_discovery(
+            raw,
+            stable_id="m_discovery",
+            work_id="work-m_discovery",
+        )
+
+
+def test_found_discovery_rejects_duplicate_source_ids() -> None:
+    """Distinct descriptors cannot reuse one model-local correlation label."""
+
+    descriptor = {
+        "source_id": "source-1",
+        "kind": "raw-url",
+        "url": "https://example.com/model.py",
+        "requested_role": "implementation",
+        "basis": "Candidate implementation.",
+    }
+    raw = {
+        "schema_version": "menagerie.crawler.source-discovery.v1",
+        "stable_id": "m_discovery",
+        "work_id": "work-m_discovery",
+        "arm": "FOUND",
+        "payload": {
+            "arm": "FOUND",
+            "sources": [
+                descriptor,
+                {**descriptor, "url": "https://example.com/other.py"},
+            ],
+        },
+    }
+
+    with pytest.raises(DiscoveryError, match="source_id values must be unique"):
+        validate_source_discovery(
+            raw,
+            stable_id="m_discovery",
+            work_id="work-m_discovery",
+        )
+
+
+def _sigkill_author_driver(root: Path, started_path: Path, claude_stub: Path) -> None:
+    """Run the real paid author executor until the test parent kills the driver."""
+
+    snapshot = _snapshot(root, count=1)
+    os.environ["EXA_API_KEY"] = "PSL-CREDENTIAL-DISK-ZERO-SENTINEL"
+    os.environ["MENAGERIE_AUTHOR_CLAUDE_BIN"] = shlex.join(
+        (sys.executable, str(claude_stub), str(started_path))
+    )
+    lane = CommandAuthorLane(
+        (sys.executable, "-m", "menagerie.crawler.author_executor"),
+        effort_grant=AuthorEffortGrant(wall_seconds=30.0),
+        require_receipt=True,
+        stall_bound_seconds=120.0,
+    )
+    _driver(root, snapshot, author=lane, author_concurrency=2).run()
+
+
+def _pid_is_live(pid: int) -> bool:
+    """Return whether one process identity still responds to signal zero."""
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_a_hung_author_command_is_bounded_retryable_and_leaves_no_orphan(
+    tmp_path: Path,
+) -> None:
+    """A hung author session must stall one attempt, not the whole month-long campaign.
+
+    The wrapper here spawns a grandchild that outlives it, which is what a real agent
+    wrapper does. Killing only the direct child would leave that grandchild running with
+    the campaign's file handles and provider session, so the test asserts on the
+    grandchild's PID, not the wrapper's.
+    """
+
+    snapshot = _snapshot(tmp_path)
+    driver = _driver(tmp_path, snapshot)
+    item = driver._ordered_work(snapshot, {})[0]
+    pid_path = tmp_path / "grandchild.pid"
+    wrapper = (
+        "import os, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        f"open({str(pid_path)!r}, 'w').write(str(child.pid))\n"
+        "sys.stderr.write('wrapper is hung\\n')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(600)\n"
+    )
+    # The stall bound is injected so this exercises the teardown path in seconds.
+    # Production derives it from the grant; `test_author_wall_budget.py` pins that
+    # derivation and refuses any bound that would fire inside the session budget.
+    lane = CommandAuthorLane(
+        (sys.executable, "-c", wrapper),
+        effort_grant=AuthorEffortGrant(wall_seconds=3.0),
+        stall_bound_seconds=4.0,
+    )
+    root = tmp_path / "hung-author"
+    root.mkdir(parents=True, exist_ok=True)
+    request_path = root / "request.json"
+    request_path.write_text(json.dumps({"envelope_version": "x"}), encoding="utf-8")
+
+    started = time.monotonic()
+    authority = PaidSessionAuthority(
+        tmp_path / "direct-paid-sessions.jsonl",
+        runtime_root=tmp_path / "direct-paid-runtime",
+        clock=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
+    reservation = authority.reserve(
+        scope={
+            "campaign_id": "direct-hung-author",
+            "generation_id": "generation-direct-hung-author",
+            "lane": "author",
+            "dispatch_kind": "source-request",
+            "work_generations": ((item.stable_id, "work-hung"),),
+            "machine_id": "test-machine",
+        },
+        policy=BudgetPolicy(
+            quota_sessions=1,
+            quota_wall_seconds=60.0,
+            runaway_sessions=1,
+            runaway_wall_seconds=60.0,
+            reservation_wall_seconds=60.0,
+        ),
+    )
+    with authorized_paid_dispatch(reservation):
+        with pytest.raises(RetryableOperatorError) as raised:
+            lane._dispatch(
+                kind="source-request",
+                item=item,
+                config=None,
+                work_id="work-hung",
+                request_path=request_path,
+                output_path=root / "result.json",
+            )
+    elapsed = time.monotonic() - started
+    authority.settle(
+        reservation,
+        provider_query=lambda _key: ProviderReconciliation(
+            True,
+            min(elapsed, reservation.reserved_wall_seconds),
+            "sha256:hung-command-provider",
+        ),
+        custody_outcome="test-timeout-reaped",
+    )
+
+    # Bounded rather than running forever ...
+    assert elapsed < 60.0
+    assert "stall bound" in str(raised.value)
+    # ... typed retryable, so the driver retries transport instead of burning the model ...
+    assert driver._is_infrastructure_error(raised.value)
+    # ... attributed to the author stage, NOT to the source. A wedged wrapper says
+    # nothing about whether the model's implementation exists, and `failed:source`
+    # asserts that it does not -- burying a model with a perfectly good source
+    # under a status claiming none was found. `session-crashed` is the honest
+    # generic here: `wall-exceeded` belongs to the executor, which types its own
+    # budget overruns from inside, and a hung stub never reports one.
+    assert _author_lane_failure(raised.value) == ("author", "session-crashed")
+    # ... and the whole process group is gone, grandchild included.
+    grandchild = int(pid_path.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:  # pragma: no cover -- only reached when the teardown leaked the grandchild
+        raise AssertionError(f"author timeout leaked grandchild pid {grandchild}")
+
+    # S1: repeat at the uncatchable boundary through the real concurrent driver.
+    # The child-start marker may become visible only after the canonical writer
+    # has fsynced its money row, and the parent-death guard must reap both wrapper
+    # and grandchild when SIGKILL bypasses every driver finally block.
+    kill_root = tmp_path / "sigkill-author"
+    kill_root.mkdir()
+    started_path = tmp_path / "paid-author-started.json"
+    claude_stub = tmp_path / "holding-claude.py"
+    claude_stub.write_text(
+        "import json, os, subprocess, sys, time\n"
+        f"PINNED = {CLAUDE_CLI_VERSION!r}\n"
+        "if '--version' in sys.argv:\n"
+        "    print(PINNED)\n"
+        "    raise SystemExit(0)\n"
+        "marker = sys.argv[1]\n"
+        "args = sys.argv[2:]\n"
+        "credential = args[args.index('--mcp-config') + 1]\n"
+        "with open(credential, encoding='utf-8') as credential_handle:\n"
+        "    credential_payload = credential_handle.read()\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        "with open(marker, 'w', encoding='utf-8') as handle:\n"
+        "    json.dump({\n"
+        "        'paid_child_pid': os.getpid(),\n"
+        "        'descendant_pid': child.pid,\n"
+        "        'credential_argument': credential,\n"
+        "        'credential_mode': os.stat(credential).st_mode & 0o777,\n"
+        "        'credential_exists_in_child': os.path.exists(credential),\n"
+        "        'credential_contains_sentinel': "
+        "'PSL-CREDENTIAL-DISK-ZERO-SENTINEL' in credential_payload,\n"
+        "    }, handle)\n"
+        "    handle.flush()\n"
+        "    os.fsync(handle.fileno())\n"
+        "time.sleep(600)\n",
+        encoding="utf-8",
+    )
+    process = multiprocessing.get_context("fork").Process(
+        target=_sigkill_author_driver,
+        args=(kill_root, started_path, claude_stub),
+    )
+    process.start()
+    paid_pids: tuple[int, int] | None = None
+    try:
+        start_deadline = time.monotonic() + 30.0
+        while time.monotonic() < start_deadline and not started_path.exists():
+            time.sleep(0.02)
+        assert started_path.exists(), "paid author wrapper never started"
+        started = json.loads(started_path.read_text(encoding="utf-8"))
+        paid_pids = (int(started["paid_child_pid"]), int(started["descendant_pid"]))
+        credential_argument = str(started["credential_argument"])
+        assert credential_argument.startswith("/dev/fd/")
+        assert int(started["credential_mode"]) == 0o600
+        assert started["credential_exists_in_child"] is True
+        assert started["credential_contains_sentinel"] is True
+
+        assert process.pid is not None, "process.start() above must have assigned a pid"
+        os.kill(process.pid, signal.SIGKILL)
+        process.join(timeout=10.0)
+        assert process.exitcode == -signal.SIGKILL
+
+        kill_snapshot = _snapshot(kill_root, count=1)
+        events = load_paid_session_rows(_paths(kill_root, kill_snapshot).paid_session_ledger)
+        bought = [
+            event
+            for event in events
+            if event.get("event") == "session_reserved" and event.get("lane") == "author"
+        ]
+        assert len(bought) == 1, "the paid session's durable money row was lost"
+
+        reap_deadline = time.monotonic() + 10.0
+        while time.monotonic() < reap_deadline and any(
+            _pid_is_live(pid) for pid in paid_pids
+        ):
+            time.sleep(0.05)
+        assert not any(_pid_is_live(pid) for pid in paid_pids), (
+            "paid author process group leaked"
+        )
+        sentinel = b"PSL-CREDENTIAL-DISK-ZERO-SENTINEL"
+        leaked = [
+            path
+            for path in kill_root.rglob("*")
+            if path.is_file() and sentinel in path.read_bytes()
+        ]
+        assert leaked == [], "paid author's credential reached a durable pathname"
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=10.0)
+        if paid_pids is not None:
+            for pid in paid_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def test_author_source_handshake_rejects_an_undigested_broker_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A machine broker row cannot omit the digest it necessarily observed."""
+
+    snapshot = _snapshot(tmp_path)
+    driver = _driver(tmp_path, snapshot)
+    item = driver._ordered_work(snapshot, {})[0]
+
+    def fake_run(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """Write a purported broker pack with an empty machine-owned digest.
+
+        Parameters
+        ----------
+        argv:
+            Operator argv whose final element is the request envelope path.
+        kwargs:
+            Ignored subprocess options.
+
+        Returns
+        -------
+        subprocess.CompletedProcess[str]
+            Successful operator exit.
+        """
+
+        del kwargs
+        request = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        discovery = {
+            "schema_version": "menagerie.crawler.source-discovery.v1",
+            "stable_id": request["stable_id"],
+            "work_id": request["work_id"],
+            "arm": "FOUND",
+            "payload": {
+                "arm": "FOUND",
+                "sources": [
+                    {
+                        "source_id": "source-1",
+                        "kind": "raw-url",
+                        "url": "https://example.com/model.py",
+                        "requested_role": "implementation",
+                        "basis": "Fixture implementation source.",
+                    }
+                ],
+            },
+        }
+        Path(request["required_output_path"]).write_text(
+            json.dumps(
+                {
+                    "pack_version": "menagerie.crawler.source-broker-pack.v1",
+                    "sources": [
+                        {
+                            "source_id": "source-1",
+                            "url": "https://example.com/model.py",
+                            "final_url": "https://example.com/model.py",
+                            "revision": "sha256:" + "a" * 64,
+                            "expected_sha256": "",
+                            "media_type": "text/x-python",
+                            "media_type_method": "path-extension",
+                            "broker_role": "implementation",
+                        }
+                    ],
+                    "broker": {"outcomes": [], "derived_citations": [], "total_bytes": 0},
+                    "discovery": discovery,
+                    "discovery_sha256": stable_hash(discovery),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    monkeypatch.setattr(driver_admission_module, "_run_operator_command", fake_run)
+    with pytest.raises(DriverIntegrationError, match="empty or invalid"):
+        CommandAuthorLane(("fake-author",))._fetch_author_sources(item, tmp_path / "author")
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (AuthorEffortCapExceeded("cap"), ("source", "effort-cap-exhausted")),
+        (
+            AuthorEffortCapExceeded("cap", stage="author", dimension="tool-calls"),
+            ("author", "effort-exhausted:tool-calls"),
+        ),
+        # A refused effort-exhaustion claim is still an exhausted session, so it must not
+        # fall through to the blanket arm below, and it carries the stage the author named
+        # rather than asserting the source could not be resolved.
+        (AuthorEffortExhaustionClaim("laundered"), ("source", "effort-cap-exhausted")),
+        (
+            AuthorEffortExhaustionClaim("laundered", stage="evidence"),
+            ("evidence", "effort-cap-exhausted"),
+        ),
+        (FetchHashMismatchError("mismatch"), ("fetch", "hash-mismatch")),
+        (FetchRetrievalError("unreachable"), ("fetch", "unreachable")),
+        (UnpinnedTargetError("bad pin"), ("source", "source-target-invalid")),
+        (RuntimeError("provider session crashed"), ("author", "session-crashed")),
+    ],
+)
+def test_author_lane_failure_names_the_real_cause(
+    error: Exception, expected: tuple[str, str]
+) -> None:
+    """A fetch-contract rejection must not be misreported as an unresolved identity.
+
+    Parameters
+    ----------
+    error:
+        Exception observed while resolving, fetching, or authoring one model.
+    expected:
+        Closed ``(stage, reason_code)`` the operator should be shown.
+    """
+
+    stage, reason_code = _author_lane_failure(error)
+    assert (stage, reason_code) == expected
+    assert reason_code in FAILURE_REASON_CODES[stage]
+    assert f"failed:{stage}" in TERMINAL_STATUS_CODES
+
+
+def test_repair_failure_classifier_preserves_effort_exhaustion_label() -> None:
+    """A gate-repair effort claim must not be recorded as runner/internal-error."""
+
+    stage, reason_code = AdmissionEnvironmentMixin._repair_failure_stage_and_reason(
+        AuthorEffortExhaustionClaim(
+            "repair wall exceeded",
+            stage="author",
+            reason_code="effort-exhausted:wall-seconds",
+        )
+    )
+
+    assert (stage, reason_code) == ("author", "effort-exhausted:wall-seconds")
+
+
+@pytest.mark.parametrize(
+    "site",
+    [
+        "_ensure_gates.metadata_repair",
+        "_ensure_gates.metadata_batch_contract",
+        "_ensure_gates.single_metadata_contract",
+        "_forward_and_reduce.mode_repair",
+    ],
+)
+def test_m11584_exhaustion_sites_terminalize_with_the_claimed_stage(site: str) -> None:
+    """Each m11584 catch site must use the exhaustion mapping before blanket arms.
+
+    Parameters
+    ----------
+    site:
+        Former blanket-catch site pinned by the m11584 frozen artifact.
+    """
+
+    del site
+    claim = AuthorEffortExhaustionClaim(
+        "m11584 repair wall exceeded",
+        stage="author",
+        reason_code="effort-exhausted:wall-seconds",
+    )
+    stage, reason_code = AdmissionEnvironmentMixin._repair_failure_stage_and_reason(claim)
+
+    assert f"failed:{stage}" in TERMINAL_STATUS_CODES
+    assert reason_code in FAILURE_REASON_CODES[stage]
+    assert (stage, reason_code) == ("author", "effort-exhausted:wall-seconds")
+
+
+def test_command_checker_lane_validates_real_proposal_digest_binding(tmp_path: Path) -> None:
+    """A schema-valid production checker result echoes the request's exact six-hash pack."""
+
+    stable_id = "m_checker_contract"
+    proposal = make_author_proposal(stable_id)
+    # AG-9: envelope build refuses pre-purchase unless the declared read
+    # roots dereference; materialize the two roots a real author round
+    # leaves behind.
+    (tmp_path / "model").mkdir()
+    (tmp_path / "source-cas").mkdir()
+    # D-51 era pin: the shipped manifest's identity must match the identity
+    # the proposal binds, or the envelope refuses pre-spend.
+    manifest = {"manifest_sha256": proposal["source_manifest_identity"], "sources": []}
+    artifact = make_proposed_artifact(proposal, manifest, model_dir=tmp_path / "model")
+    script = r"""
+import json
+import sys
+from pathlib import Path
+from menagerie.crawler.checker_dispatch import (
+    LEDGER_ASSIGNED_GATE_FIELDS,
+    apply_machine_owned_gate_fields,
+    machine_owned_gate_fields,
+)
+from menagerie.crawler.tests.conftest import NOW, make_gate
+
+request = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected_keys = {
+    "proposal", "source_manifest", "evidence", "code",
+    "source_to_code_map", "family_template",
+}
+assert set(request["items"][0]["verified_hashes"]) == expected_keys
+stable_ids = [item["stable_id"] for item in request["items"]]
+gate = make_gate(stable_ids, gate_id="gate-command-contract")
+# A compliant checker omits every machine-owned field and lets the wrapper
+# stamp it. Supplying the fixture's scaffold instead relied on the stamp
+# silently correcting it, which is the laundering the stamp now refuses.
+# The ledger-assigned pair goes too: the LEDGER assigns those at append time,
+# so no not-yet-appended gate legitimately carries them.
+for machine_field in (*machine_owned_gate_fields(request), *LEDGER_ASSIGNED_GATE_FIELDS):
+    gate.pop(machine_field, None)
+gate.pop("checker", None)
+for result_item, request_item in zip(gate["items"], request["items"], strict=True):
+    for field in (
+        "work_id", "campaign_root_work_id", "stable_id",
+        "family_representative_id", "fidelity_identity", "vet_identity",
+    ):
+        result_item[field] = request_item[field]
+    result_item["verified_hashes"] = request_item["verified_hashes"]
+    result_item["rung_check"]["selected_rung"] = request_item["proposal"][
+        "proposed_facts"
+    ]["source_resolution"]["rung"]
+    result_item["rung_check"]["highest_applicable"] = result_item["rung_check"][
+        "selected_rung"
+    ]
+gate = apply_machine_owned_gate_fields(gate, request, started_at=NOW, finished_at=NOW)
+Path(request["required_output_path"]).write_text(json.dumps(gate), encoding="utf-8")
+"""
+    with _authorized_direct_paid_dispatch(tmp_path, lane="checker"):
+        outcome = CommandCheckerLane((sys.executable, "-c", script)).check_metadata(
+            [artifact], tmp_path / "work", DriverConfig()
+        )
+
+    assert outcome.gate is not None
+    assert outcome.gate["items"][0]["verified_hashes"]["proposal"] == proposal["proposal_sha256"]
+
+
+def test_command_checker_lane_classifies_quota_from_stdout_with_stderr_noise(
+    tmp_path: Path,
+) -> None:
+    """Structured stdout quota survives the checker's nonempty stderr preamble."""
+
+    # AG-9: envelope build refuses pre-purchase unless the declared read
+    # roots dereference; materialize the two roots a real author round
+    # leaves behind.
+    (tmp_path / "model").mkdir()
+    (tmp_path / "source-cas").mkdir()
+    # D-51 era pin: the shipped manifest's identity must match the identity
+    # the proposal binds, or the envelope refuses pre-spend.
+    quota_proposal = make_author_proposal("m_checker_quota")
+    artifact = make_proposed_artifact(
+        quota_proposal,
+        {"manifest_sha256": quota_proposal["source_manifest_identity"], "sources": []},
+        model_dir=tmp_path / "model",
+    )
+    script = (
+        "import sys; "
+        "print('Reading additional input from stdin...', file=sys.stderr); "
+        "print('usage limit reached'); "
+        "raise SystemExit(76)"
+    )
+
+    with _authorized_direct_paid_dispatch(tmp_path, lane="checker"):
+        outcome = CommandCheckerLane((sys.executable, "-c", script)).check_metadata(
+            [artifact], tmp_path / "work", DriverConfig()
+        )
+
+    assert outcome.backoff is not None
+    assert outcome.backoff.reason is CheckerPauseReason.QUOTA_EXHAUSTED
+
+
+def test_checker_wall_bound_sits_above_the_wrapper_own_ceiling() -> None:
+    """The lane bound is a backstop: strictly looser than the wrapper's own budget.
+
+    The wrapper polices itself to the envelope deadline and clamps each Codex attempt to
+    the time remaining, so the lane must only fire once the wrapper has demonstrably
+    failed to police itself. A bound at or below the wrapper's ceiling would cut short
+    checker work that is still legitimately running.
+    """
+
+    from menagerie.crawler.operator_checker import CHECKER_MAX_ATTEMPTS, CHECKER_TIMEOUT_SECONDS
+    from menagerie.crawler.operator_protocol import OPERATOR_DEADLINE_SECONDS
+
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+    deadline = now + timedelta(seconds=OPERATOR_DEADLINE_SECONDS)
+    envelope = {"deadline_at": deadline.isoformat().replace("+00:00", "Z")}
+
+    bound = _checker_wall_bound(envelope, now=now)
+
+    # Strictly above the wrapper's own ceiling: its deadline plus the inter-attempt
+    # backoff sleeps that the deadline does not clamp.
+    assert bound > OPERATOR_DEADLINE_SECONDS + CHECKER_LANE_BACKOFF_SLACK_SECONDS
+    # And above every attempt the wrapper is allowed to make back to back.
+    assert bound > CHECKER_TIMEOUT_SECONDS * CHECKER_MAX_ATTEMPTS
+    # An envelope with no parsable deadline still yields a bound above that same ceiling,
+    # so a malformed contract degrades to a bound rather than to no bound at all.
+    assert _checker_wall_bound({}, now=now) > OPERATOR_DEADLINE_SECONDS
+
+
+def test_a_hung_checker_command_is_bounded_retryable_and_leaves_no_orphan(
+    tmp_path: Path,
+) -> None:
+    """A hung checker session must stall one attempt, not the whole month-long campaign.
+
+    The wrapper bounds its own Codex attempts, but that does not protect the lane: a
+    wrapper that hangs before or outside that call would block the single-threaded driver
+    forever. The wrapper here spawns a grandchild that outlives it, exactly as a real
+    agent wrapper does, so the test asserts on the grandchild's PID -- killing only the
+    direct child would leave it holding the campaign's file handles and provider session.
+    """
+
+    pid_path = tmp_path / "checker-pids.txt"
+    wrapper = (
+        "import os, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        "open(" + repr(str(pid_path)) + ", 'w').write(str(os.getpid()) + ' ' + str(child.pid))\n"
+        "sys.stderr.write('checker wrapper is hung\\n')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(600)\n"
+    )
+    # A deadline already in the past collapses the derived bound to its declared slack,
+    # so the real production bound derivation is exercised at test speed.
+    envelope = {
+        "envelope_version": "menagerie.crawler.checker-envelope.v3",
+        "deadline_at": "2026-01-01T00:00:00Z",
+    }
+    lane = CommandCheckerLane((sys.executable, "-c", wrapper), wall_grace_seconds=1.0)
+
+    started = time.monotonic()
+    with _authorized_direct_paid_dispatch(tmp_path, lane="checker"):
+        with pytest.raises(RetryableOperatorError) as raised:
+            lane._run(envelope, tmp_path / "hung-checker")
+    elapsed = time.monotonic() - started
+
+    # Bounded rather than running forever ...
+    assert elapsed < 60.0
+    assert "wall bound" in str(raised.value)
+    # ... typed retryable, so the driver retries transport instead of burning the model ...
+    assert CrawlerDriver._is_infrastructure_error(raised.value)
+    # ... the pipes were drained after the kill, so the wrapper's own output survives ...
+    assert "checker wrapper is hung" in str(raised.value)
+    wrapper_pid, grandchild = (int(value) for value in pid_path.read_text().split())
+    # ... the whole process group is gone, grandchild included ...
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:  # pragma: no cover -- only reached when the teardown leaked the grandchild
+        raise AssertionError(f"checker timeout leaked grandchild pid {grandchild}")
+    # ... and the root child was reaped, so the hang did not also leave a zombie. A
+    # zombie still answers signal 0; only a reaped PID raises ProcessLookupError.
+    with pytest.raises(ProcessLookupError):
+        os.kill(wrapper_pid, 0)
+
+
+def test_parent_refuses_observed_adapter_digest_mismatch() -> None:
+    """A success-shaped child envelope cannot hide a different observed adapter digest."""
+
+    proposal = make_author_proposal("m_adapter_mismatch")
+    proposal["proposed_facts"]["implementation"].update(
+        {
+            "recipe_type": "typed-adapter",
+            "code_path": "adapter.py",
+            "code_sha256": "sha256:" + "b" * 64,
+        }
+    )
+    attempt = make_attempt("m_adapter_mismatch", mode="eval")
+    mode_receipt = {
+        **attempt["worker_receipt"],
+        "error": None,
+    }
+    receipt = {
+        "receipt_version": "menagerie.crawler.worker-receipt.v1",
+        "stable_id": proposal["stable_id"],
+        "source_identity": proposal["source_identity"],
+        "recipe_revision": proposal["recipe_revision"],
+        "observed_recipe_revision": proposal["recipe_revision"],
+        "observed_adapter_sha256": "sha256:" + "c" * 64,
+        "observed_code_manifest_sha256": None,
+        "observed_input_asset_sha256": None,
+        "execution_identity": HASH,
+        "mode": None,
+        "constructor_started": True,
+        "constructor_completed": True,
+        "input_completed": True,
+        "declared_meaningful_modes": ["eval"],
+        "detected_meaningful_modes": [],
+        "meaningful_modes": ["eval"],
+        "per_mode": {"eval": mode_receipt},
+        "policy_observation": attempt["policy_observation"],
+        "error": None,
+        "receipt_sha256": HASH,
+    }
+    observation = SupervisorObservation(
+        argv=("python", "worker.py"),
+        cwd="/scratch",
+        exit_code=0,
+        signal_number=None,
+        wall_seconds=0.1,
+        cpu_seconds=0.1,
+        peak_rss_bytes=1,
+        timed_out=False,
+        rss_exceeded=False,
+        stdout_sha256=HASH,
+        stdout_bytes=0,
+        stdout_tail="",
+        stderr_sha256=HASH,
+        stderr_bytes=0,
+        stderr_tail="",
+        stdout_path="/logs/stdout",
+        stderr_path="/logs/stderr",
+    )
+
+    assert (
+        _receipt_envelope_error(
+            make_supervised_worker_result_v3(observation, receipt), proposal, HASH
+        )
+        == "invalid-receipt:identity"
+    )
+
+
+def test_detected_mode_expansion_is_award_blocking_revision_evidence(tmp_path: Path) -> None:
+    """A worker-discovered proposal gap is durable input-contract repair evidence."""
+
+    proposal = make_author_proposal("m_detected_mode_expansion")
+    proposal["proposed_facts"]["modes"]["meaningful_modes"] = ["eval"]
+    attempt = make_attempt("m_detected_mode_expansion", mode="eval")
+    receipt = {
+        "receipt_version": "menagerie.crawler.worker-receipt.v1",
+        "stable_id": proposal["stable_id"],
+        "source_identity": proposal["source_identity"],
+        "recipe_revision": proposal["recipe_revision"],
+        "observed_recipe_revision": proposal["recipe_revision"],
+        "observed_adapter_sha256": None,
+        "observed_code_manifest_sha256": None,
+        "observed_input_asset_sha256": driver_module._expected_input_asset_sha256(proposal),
+        "execution_identity": HASH,
+        "mode": "eval",
+        "constructor_started": True,
+        "constructor_completed": True,
+        "input_completed": True,
+        "declared_meaningful_modes": ["eval"],
+        "detected_meaningful_modes": ["train", "eval"],
+        "meaningful_modes": ["train", "eval"],
+        "per_mode": {"eval": {**attempt["worker_receipt"], "error": None}},
+        "policy_observation": attempt["policy_observation"],
+        "error": None,
+        "receipt_sha256": HASH,
+    }
+    observation = SupervisorObservation(
+        argv=("python", "worker.py"),
+        cwd="/scratch",
+        exit_code=0,
+        signal_number=None,
+        wall_seconds=0.1,
+        cpu_seconds=0.1,
+        peak_rss_bytes=1,
+        timed_out=False,
+        rss_exceeded=False,
+        stdout_sha256=HASH,
+        stdout_bytes=0,
+        stdout_tail="",
+        stderr_sha256=HASH,
+        stderr_bytes=0,
+        stderr_tail="",
+        stdout_path="/logs/stdout",
+        stderr_path="/logs/stderr",
+        started_at=NOW,
+        finished_at=NOW,
+    )
+    result = make_supervised_worker_result_v3(
+        observation,
+        receipt,
+        parent_attestation=build_parent_attestation(
+            request_nonce="nonce-detected-mode",
+            request_sha256=HASH,
+            completion=None,
+            observation=observation,
+        ),
+    )
+
+    assert (
+        _receipt_envelope_error(result, proposal, HASH, requested_mode="eval")
+        == "invalid-receipt:meaningful-mode-contract"
+    )
+    artifact = make_proposed_artifact(proposal, {"sources": []}, model_dir=tmp_path / "model")
+    projected = driver_module._attempts_from_supervised(
+        artifact,
+        result,
+        _test_environment(tmp_path / "env"),
+        HASH,
+        0,
+        10.0,
+        1024,
+        requested_mode="eval",
+        diagnostics_root=tmp_path / ".crawl-local" / "diagnostics",
+    )
+
+    assert len(projected) == 1
+    failure = projected[0]
+    with JsonlLedger(
+        tmp_path / "ledgers" / "attempts.jsonl", str(failure["schema_version"])
+    ) as ledger:
+        failure = ledger.append(failure).record
+    assert failure["result"] == "failed"
+    assert failure["stage"] == "input"
+    assert failure["mode"] is None
+    assert failure["error"]["reason_code"] == "contract-invalid"
+    assert failure["error"]["details"] == {
+        "route": "recipe-and-gate-revision-required",
+        "proposal_meaningful_modes": ["eval"],
+        "detected_meaningful_modes": ["train", "eval"],
+        "missing_proposal_modes": ["train"],
+    }
+    assert not driver_module._attempt_policy_satisfied(projected, proposal, 1)
+
+
+def test_parent_accepts_one_requested_mode_from_dual_mode_receipt(tmp_path: Path) -> None:
+    """A fresh mode subprocess retains full metadata but completes only its request."""
+
+    proposal = make_author_proposal("m_dual_mode_receipt")
+    proposal["proposed_facts"]["modes"]["meaningful_modes"] = ["train", "eval"]
+    _refresh_proposal_identities(proposal)
+
+    def supervised_result(mode: str) -> SupervisedResult:
+        """Build one complete v3 raw receipt and parent attestation for a mode."""
+
+        base = make_attempt("m_dual_mode_receipt", mode=mode)
+        mode_receipt = {
+            **base["worker_receipt"],
+            "observed_recipe_revision": proposal["recipe_revision"],
+            "observed_adapter_sha256": driver_module._expected_adapter_sha256(proposal),
+            "observed_code_manifest_sha256": driver_module._expected_code_manifest_sha256(proposal),
+            "observed_input_asset_sha256": driver_module._expected_input_asset_sha256(proposal),
+            "error": None,
+            "constructor_seconds": 0.25,
+            "forward_seconds": 0.5,
+        }
+        receipt = {
+            "receipt_version": "menagerie.crawler.worker-receipt.v1",
+            "stable_id": proposal["stable_id"],
+            "source_identity": proposal["source_identity"],
+            "recipe_revision": proposal["recipe_revision"],
+            "observed_recipe_revision": proposal["recipe_revision"],
+            "observed_adapter_sha256": None,
+            "observed_code_manifest_sha256": driver_module._expected_code_manifest_sha256(proposal),
+            "observed_input_asset_sha256": driver_module._expected_input_asset_sha256(proposal),
+            "execution_identity": HASH,
+            "mode": mode,
+            "constructor_started": True,
+            "constructor_completed": True,
+            "input_completed": True,
+            "declared_meaningful_modes": ["train", "eval"],
+            "detected_meaningful_modes": ["train", "eval"],
+            "meaningful_modes": ["train", "eval"],
+            "per_mode": {mode: mode_receipt},
+            "policy_observation": base["policy_observation"],
+            "error": None,
+            "receipt_sha256": HASH,
+        }
+        raw_receipt = {
+            "receipt_version": "menagerie.crawler.raw-award-receipt.v3",
+            "request_nonce": f"nonce-{mode}",
+            "request_sha256": HASH,
+            "stable_id": proposal["stable_id"],
+            "work_id": proposal["work_id"],
+            "execution_identity": HASH,
+            "recipe_revision": proposal["recipe_revision"],
+            "code_manifest_identity": driver_module._expected_code_manifest_sha256(proposal),
+            "input_identity": HASH,
+            "requested_mode": mode,
+            "observation": mode_receipt,
+        }
+        completion_line = completion_line_for_raw_award_receipt(raw_receipt)
+        completion_bytes = (completion_line + "\n").encode()
+        observation = SupervisorObservation(
+            argv=("python", "worker.py"),
+            cwd="/scratch",
+            exit_code=0,
+            signal_number=None,
+            wall_seconds=0.1,
+            cpu_seconds=0.1,
+            peak_rss_bytes=1,
+            timed_out=False,
+            rss_exceeded=False,
+            stdout_sha256=hash_bytes(completion_bytes),
+            stdout_bytes=len(completion_bytes),
+            stdout_tail=completion_line,
+            stderr_sha256=hash_bytes(b""),
+            stderr_bytes=0,
+            stderr_tail="",
+            stdout_path="/logs/stdout",
+            stderr_path="/logs/stderr",
+            started_at=NOW,
+            finished_at=NOW,
+            group_teardown_outcome="clean",
+            group_survivor_pids=(),
+        )
+        parent_attestation = derive_parent_attestation(
+            raw_receipt,
+            completion_line,
+            observation.to_dict(),
+            started_at=NOW,
+            finished_at=NOW,
+        )
+        return make_supervised_worker_result_v3(
+            observation,
+            receipt,
+            raw_award_receipt=raw_receipt,
+            parent_attestation=parent_attestation,
+        )
+
+    train_result = supervised_result("train")
+    assert (
+        _receipt_envelope_error(
+            train_result,
+            proposal,
+            HASH,
+            requested_mode="train",
+        )
+        is None
+    )
+    environment = _test_environment(Path("/tmp/dual-mode-env"))
+    artifact = make_proposed_artifact(
+        proposal, {"sources": []}, model_dir=Path("/tmp/dual-mode-model")
+    )
+    attempts = (
+        *driver_module._attempts_from_supervised(
+            artifact,
+            train_result,
+            environment,
+            HASH,
+            0,
+            10.0,
+            1024,
+            requested_mode="train",
+            diagnostics_root=tmp_path / ".crawl-local" / "diagnostics",
+        ),
+        *driver_module._attempts_from_supervised(
+            artifact,
+            supervised_result("eval"),
+            environment,
+            HASH,
+            0,
+            10.0,
+            1024,
+            requested_mode="eval",
+            diagnostics_root=tmp_path / ".crawl-local" / "diagnostics",
+        ),
+    )
+    assert attempts[0]["worker_receipt"]["constructor_seconds"] == 0.25
+    assert attempts[0]["worker_receipt"]["forward_seconds"] == 0.5
+    assert not driver_module._attempt_policy_satisfied(attempts[:1], proposal, 1)
+    assert driver_module._attempt_policy_satisfied(attempts, proposal, 1)
+
+
+def test_staging_refuses_past_the_allowance_before_any_byte_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m4851 staged 6 of a 3-session allowance: the valve now bites AT staging.
+
+    The overshoot came from staging sites (the bounded repair loops) that never
+    re-consulted the author-session valve after the buy. The chokepoint itself
+    now refuses an over-allowance staging BEFORE the staged-private event is
+    appended, threading the staged result's identity and the operational
+    ledger through to the ONE owner function.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    paths = _paths(tmp_path, snapshot)
+    driver = _driver(tmp_path, snapshot)
+    item = driver._ordered_work(snapshot, {})[0]
+    context = _test_authority_context(snapshot, driver.config)
+    artifact = FakeAuthor().author(item, paths.work_root, driver.config, context)
+    observed: list[tuple[str, Optional[str], tuple[Any, ...]]] = []
+    real_valve = driver_module.enforce_author_session_allowance
+
+    def _spy(events: Any, spy_item: Any, **kwargs: Any) -> None:
+        observed.append(
+            (
+                spy_item.stable_id,
+                kwargs.get("staging_author_result_id"),
+                tuple(kwargs.get("operational_events", ())),
+            )
+        )
+        raise AuthorEffortCapExceeded("cap", stage="author", dimension="author-sessions")
+
+    monkeypatch.setattr(driver_module, "enforce_author_session_allowance", _spy)
+    with CanonicalReducer(paths.ledgers, context) as reducer:
+        with pytest.raises(AuthorEffortCapExceeded):
+            driver._stage_author_result(item, artifact, reducer)
+        staged_events = [
+            event
+            for event in reducer.artifact_ledger.events
+            if event.get("event_kind") == "staged-private"
+        ]
+        assert staged_events == []
+        assert observed
+        assert observed[0][0] == item.stable_id
+        assert observed[0][1] == artifact.author_result.binding.result_id
+        # The real owner admits this first staging: below the allowance.
+        monkeypatch.setattr(driver_module, "enforce_author_session_allowance", real_valve)
+        staged = driver._stage_author_result(item, artifact, reducer)
+        assert staged.staged is not None
+
+
+def test_promotion_is_not_bound_to_the_award(tmp_path: Path) -> None:
+    """Author acceptance durably promotes source bytes before any award exists."""
+
+    from menagerie.crawler.text_corpus import corpus_index_path, corpus_payload_path
+
+    snapshot = _snapshot(tmp_path, count=1)
+    paths = _paths(tmp_path, snapshot)
+    driver = _driver(tmp_path, snapshot)
+    item = driver._ordered_work(snapshot, {})[0]
+    context = _test_authority_context(snapshot, driver.config)
+    artifact = FakeAuthor().author(item, paths.work_root, driver.config, context)
+    source_digest = str(artifact.source_manifest["sources"][0]["content_sha256"])
+
+    with CanonicalReducer(paths.ledgers, context) as reducer:
+        staged = driver._stage_author_result(item, artifact, reducer)
+
+    assert staged.staged is not None
+    assert not paths.ledgers.models.exists(), "no model award was committed"
+    assert corpus_payload_path(paths.ledgers.records_root, source_digest).is_file()
+    rows = scan_jsonl(corpus_index_path(paths.ledgers.records_root))
+    assert any(
+        row.get("stable_id") == item.stable_id
+        and row.get("work_id") == artifact.author_result.binding.work_id
+        for row in rows
+    )
+
+
+def test_supervised_success_round_trip_persists_attestation_and_awards_runs(
+    tmp_path: Path,
+) -> None:
+    """Driver-projected parent facts survive JSONL and earn a reducer run award."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    paths = _paths(tmp_path, snapshot)
+    driver = _driver(tmp_path, snapshot)
+    item = driver._ordered_work(snapshot, {})[0]
+    artifact = FakeAuthor().author(
+        item, paths.work_root, driver.config, _test_authority_context(snapshot, driver.config)
+    )
+    context = _test_authority_context(snapshot, driver.config)
+    with CanonicalReducer(paths.ledgers, context) as reducer:
+        artifact = driver._stage_author_result(item, artifact, reducer)
+        projected = FakeForward().forward(
+            artifact, _test_environment(tmp_path / "env"), 1, paths.work_root
+        )
+        gate = FakeChecker().check_metadata([artifact], paths.work_root, driver.config).gate
+        assert gate is not None
+        reducer.append_gate(gate)
+        for attempt in projected:
+            reducer.append_attempt(attempt)
+        persisted = scan_jsonl(paths.ledgers.attempts)
+        assert len(persisted) == 2
+        assert all(driver_module._attempt_has_current_raw_authority(value) for value in persisted)
+        model = driver_module._assemble_run_model(
+            item,
+            artifact,
+            persisted,
+            [gate],
+            driver.config,
+        )
+        driver._authorize_and_publish_artifact(artifact, model, [gate], reducer)
+        appended = reducer.append_model(reducer.prepare_model(model))
+
+    assert appended.record["status"]["code"] == "runs"
+
+
+def test_attempt_policy_rejects_observed_asset_digest_mismatch() -> None:
+    """A clean success label cannot hide stale standard-input asset bytes."""
+
+    proposal = make_author_proposal("m_asset_mismatch")
+    attempt = make_attempt("m_asset_mismatch", mode="eval")
+    attempt["worker_receipt"]["observed_recipe_revision"] = proposal["recipe_revision"]
+    attempt["worker_receipt"]["observed_input_asset_sha256"] = "sha256:" + "f" * 64
+
+    assert not driver_module._attempt_policy_satisfied([attempt], proposal, 1)
+
+
+def _unlocked_registry() -> EnvironmentRegistry:
+    """Return the shipped registry viewed as an unlocked campaign checkout.
+
+    The repository commits rotated setup artifacts for the wave-9 intents, so
+    the real registry now carries locked inventories -- and the coverage valve
+    honestly defers any recipe whose declared distribution those inventories do
+    not provide (the deterministic fixtures pin ``distribution: "example"``).
+    These driver tests were written against, and deliberately keep pinning, the
+    UNLOCKED state: a fresh campaign checkout before its first target solve,
+    where coverage is not assessable and every model is admitted. Tests that
+    need a locked inventory pass ``registry=`` explicitly.
+    """
+
+    registry = load_environment_registry(target="osx-arm64")
+    intents = {
+        name: replace(
+            intent,
+            lock=replace(
+                intent.lock,
+                # Redirect every member path into a directory that never
+                # exists: the fake environment lanes read artifact bytes from
+                # these paths directly, so nulling the loaded bytes alone
+                # would still leak the committed on-disk artifacts into the
+                # deterministic fixtures.
+                lock_path=intent.lock.lock_path.parent
+                / "unlocked-view"
+                / intent.lock.lock_path.name,
+                export_path=intent.lock.export_path.parent
+                / "unlocked-view"
+                / intent.lock.export_path.name,
+                export_hash_path=intent.lock.export_hash_path.parent
+                / "unlocked-view"
+                / intent.lock.export_hash_path.name,
+                lock_bytes=None,
+                export_bytes=None,
+                declared_export_hash=None,
+            ),
+            generation=None,
+        )
+        for name, intent in registry.intents.items()
+    }
+    return replace(registry, intents=intents)
+
+
+def _driver(
+    tmp_path: Path,
+    snapshot: IntakeSnapshot,
+    *,
+    author: Optional[AuthorLane] = None,
+    checker: Optional[CheckerLane] = None,
+    forward: Optional[ForwardLane] = None,
+    environments: Optional[EnvironmentLane] = None,
+    notifier: Optional[Notifier] = None,
+    boundary: Any = lambda _boundary, _stable_id: None,
+    review_at: Optional[int] = None,
+    milestones: tuple[int, ...] = (),
+    pause_scheduler: Optional[FakePauseScheduler] = None,
+    phase: Optional[str] = None,
+    run_repair_max: int = 2,
+    registry: Optional[EnvironmentRegistry] = None,
+    author_concurrency: Optional[int] = None,
+    checker_concurrency: Optional[int] = None,
+    # Valve/park emission requires a bound tier campaign (T2-12); the unbound
+    # default was exactly how the pilot's campaign_id="None" rows were minted.
+    campaign_id: Optional[str] = "c1-mech",
+    author_model: Optional[str] = None,
+    checker_model: Optional[str] = None,
+    paths_override: Optional[DriverPaths] = None,
+    sleeper: Optional[Any] = None,
+    scheduler: str = "waves",
+    provider_reconciler: Optional[
+        Callable[[str], ProviderReconciliation]
+    ] = None,
+) -> CrawlerDriver:
+    """Build a fully fake deterministic driver."""
+
+    dependencies = DriverDependencies(
+        author or FakeAuthor(),
+        checker or FakeChecker(),
+        forward or FakeForward(),
+        environments or FakeEnvironments(tmp_path / "fake-envs"),
+        notifier or FakeNotifier(),
+        lambda: NOW,
+        boundary,
+        pause_scheduler,
+        # Always fake the OS-scheduler boundary: a resume after a recorded pause
+        # reconciles wake projections, and the default installer would exec real
+        # launchctl/systemctl/crontab -- which fails under Seatbelt and on any CI
+        # host without a user session, and would mutate the developer's real
+        # scheduler where it succeeds. The wakeup RECORDS stay real; only the OS
+        # registration effects are stubbed. The real launchctl path is covered by
+        # the gated OS-integration test in test_wakeup_os_scheduler.py.
+        lambda _definition: None,
+        lambda _definition: True,
+        lambda _definition: None,
+        # Deterministic tests never wait out real infrastructure backoff; a test
+        # proving the ladder injects its own recorder here.
+        sleeper if sleeper is not None else (lambda _seconds: None),
+        provider_reconciler
+        or (
+            lambda _provider_idempotency_key: ProviderReconciliation(
+                True,
+                0.0,
+                "sha256:fake-provider-accepted",
+            )
+        ),
+    )
+    resolved_registry = registry or _unlocked_registry()
+    return CrawlerDriver(
+        paths_override or _paths(tmp_path, snapshot),
+        DriverConfig(
+            target="osx-arm64",
+            phase=phase,
+            run_id="run-test",
+            machine_id="machine-test",
+            review_checkpoint_at=review_at,
+            progress_milestones=milestones,
+            run_repair_max=run_repair_max,
+            campaign_id=campaign_id,
+            author_model=author_model or DriverConfig().author_model,
+            checker_model=checker_model or DriverConfig().checker_model,
+            author_concurrency=(
+                DriverConfig().author_concurrency
+                if author_concurrency is None
+                else author_concurrency
+            ),
+            checker_concurrency=(
+                DriverConfig().checker_concurrency
+                if checker_concurrency is None
+                else checker_concurrency
+            ),
+            scheduler=scheduler,
+            # The default fixture registry deliberately pins the UNLOCKED
+            # pre-first-solve checkout (see _unlocked_registry), so these
+            # tests carry the EN-2 exemption EXPLICITLY for every intent.
+            # A test that passes its own registry gets no exemption and
+            # exercises the production lockless-route refusal.
+            allow_lockless_intents=(
+                tuple(sorted(resolved_registry.intents)) if registry is None else ()
+            ),
+        ),
+        dependencies,
+        registry=resolved_registry,
+    )
+
+
+def _grant_award_supersessions(
+    tmp_path: Path, snapshot: IntakeSnapshot, models_by_id: Mapping[str, Mapping[str, Any]]
+) -> None:
+    """Mint one operator award-naming grant per settled ``runs`` award (AW-1).
+
+    COMPOSE (AW x WS-1): a settled runs award is operator property -- nothing
+    re-drives it silently. The single release authority is a requeue grant
+    naming the exact blocked award revision (``blocked_award_revision``); a
+    runs head carries no failure stage, so the grant binds through the
+    ``deferred-terminal`` stage sentinel.
+    """
+
+    grants_path = canonical_requeue_grants_path(_paths(tmp_path, snapshot).ledgers.models)
+    for item in snapshot.items:
+        payload = build_canonical_requeue_grant(
+            grants_path,
+            stable_id=item.stable_id,
+            stage=DEFERRED_TERMINAL_GRANT_STAGE,
+            reason="operator: supersession of the named award approved",
+            attempts=1,
+            granted_by="operator",
+            target_intent=None,
+            blocked_award_revision=str(models_by_id[item.stable_id]["record_revision"]),
+        )
+        append_canonical_requeue_grant(grants_path, payload)
+
+
+def _acknowledged(driver: CrawlerDriver, stale_award_ids: Sequence[str]) -> CrawlerDriver:
+    """Return the driver with the AW award-holds launch door acknowledged.
+
+    D-47: the blanket boolean is retired; the acknowledgment binds the exact
+    standing census through the ONE digest authority
+    (``census_ack.award_holds_ack_digest``). These fixtures stale every named
+    runs award and hold no live award-supersession parks, so the census is
+    exactly the granted award ids.
+    """
+
+    driver.config = replace(
+        driver.config,
+        acknowledge_award_holds=True,
+        award_holds_digest=award_holds_ack_digest(stale_award_ids, ()),
+    )
+    return driver
+
+
+def test_requeue_can_apply_dependency_evidenced_intent_correction(tmp_path: Path) -> None:
+    """An active grant reroutes a failed model without restructuring phase order."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    stable_id = snapshot.items[0].stable_id
+    work = _driver(tmp_path, snapshot)._ordered_work(
+        snapshot,
+        {},
+        {
+            stable_id: {
+                "grant_ids": ["grant-routing"],
+                "work_id": "work-routing",
+                "active": True,
+                "target_intent": "graph",
+            }
+        },
+    )
+
+    assert len(work) == 1
+    assert work[0].route.intent == "graph"
+    assert work[0].route.phase is EnvironmentPhase.PYTORCH
+
+
+@pytest.mark.smoke
+def test_inactive_recorded_grant_never_pins_the_work_identity(tmp_path: Path) -> None:
+    """A spent grant's last work_id must not become the scheduled identity.
+
+    Docket T2-13 (m7305): the recorded-grants binding carries the LAST consumed
+    generation's ``work_id`` with ``active=False`` as diagnostics; reading it
+    into ``requeue_work_id`` pinned ``WorkItem.active_work_id`` to an obsolete
+    generation, so the model re-bought and re-discarded the same
+    authority-stale artifact on every leg. The recorded grants stay visible as
+    budget history; only the ACTIVE binding may steer work identity.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    stable_id = snapshot.items[0].stable_id
+    work = _driver(tmp_path, snapshot)._ordered_work(
+        snapshot,
+        {},
+        {
+            stable_id: {
+                "grant_ids": ["grant-spent"],
+                "work_id": "sha256:" + "e" * 64,
+                "active": False,
+            }
+        },
+    )
+
+    assert len(work) == 1
+    assert work[0].requeue_work_id is None
+    assert work[0].requeue_active is False
+    assert work[0].active_work_id == f"work-{stable_id}"
+    assert work[0].explicit_grants == ("grant-spent",)
+    assert work[0].granted_attempts is None
+
+
+@pytest.mark.smoke
+def test_active_grant_binding_carries_the_attempts_allowance(tmp_path: Path) -> None:
+    """An ACTIVE granted generation exposes its attempts extension on the item.
+
+    Docket T1-13 (allowance half): the grant's ``attempts`` used to be written
+    to the consumption event and never read again -- ``WorkItem`` had no
+    allowance field at all, so nothing downstream could enforce it.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    stable_id = snapshot.items[0].stable_id
+    work = _driver(tmp_path, snapshot)._ordered_work(
+        snapshot,
+        {},
+        {
+            stable_id: {
+                "grant_ids": ["grant-live"],
+                "work_id": "sha256:" + "f" * 64,
+                "active": True,
+                "target_intent": None,
+                "attempts": 2,
+            }
+        },
+    )
+
+    assert len(work) == 1
+    assert work[0].requeue_work_id == "sha256:" + "f" * 64
+    assert work[0].requeue_active is True
+    assert work[0].granted_attempts == 2
+
+
+def test_family_representative_once_templates_variants_that_still_run(tmp_path: Path) -> None:
+    """One author result seeds variants that each pass the full write gate and execution."""
+
+    snapshot, representative_id, variant_ids = _family_snapshot(tmp_path)
+    author = FakeAuthor()
+    checker = FakeChecker()
+    counts = {representative_id: 10, variant_ids[0]: 20, variant_ids[1]: 30}
+    forward = ScriptedForward(ForwardScript(parameter_counts=counts))
+
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=author,
+        checker=checker,
+        forward=forward,
+    ).run()
+
+    assert result.status == "complete"
+    assert author.calls == {representative_id: 1}
+    # The representative gates on its own pass; the two templated variants
+    # then drain at the calibrated width. H-5: each of the three ACCEPTED
+    # members buys exactly one blind duplicate-accept confirmation on top of
+    # its primary adjudication.
+    assert checker.metadata_calls == 1 + -(-2 // METADATA_BATCH_MAX) + 3
+    assert checker.fidelity_calls == 0
+    assert forward.calls == {stable_id: 1 for stable_id in counts}
+    paths = _paths(tmp_path, snapshot)
+    assert len(scan_jsonl(paths.ledgers.gates)) == 1 + -(-2 // METADATA_BATCH_MAX)
+    current = {model["stable_id"]: model for model in scan_jsonl(paths.ledgers.models)}
+    representative = current[representative_id]
+    assert representative["website"]["kind"] == "family-representative"
+    inherited_fields = (
+        "taxonomy",
+        "external_metadata",
+        "people_and_origin",
+        "dates",
+        "citation",
+        "licenses",
+        "source_resolution",
+        "evidence",
+    )
+    for variant_id in variant_ids:
+        variant = current[variant_id]
+        assert variant["status"]["kind"] == "runs"
+        assert variant["execution"]["accepted_attempt_ids"]
+        assert variant["budget"]["author_sessions_used"] == 0
+        assert variant["budget"]["gate_rounds_used"] == 0
+        assert variant["accuracy_gate"] == representative["accuracy_gate"]
+        assert variant["website"]["kind"] == "size-variant-template"
+        assert variant["website"]["template_source_model_id"] == representative_id
+        derivation = variant["family_variant_derivation"]
+        assert derivation["variant_token"] == variant["identity"]["variant"]
+        assert derivation["template_source_revision"] == representative["record_revision"]
+        assert (
+            derivation["representative_recipe_revision"]
+            == representative["implementation"]["recipe_revision"]
+        )
+        assert derivation["allowed_input_delta"] == "unchanged"
+        assert (
+            variant["implementation"]["library_recipe"]["symbol"] == variant["identity"]["variant"]
+        )
+        assert (
+            variant["implementation"]["recipe_revision"]
+            != representative["implementation"]["recipe_revision"]
+        )
+        assert variant["website"]["variant_parameter_input_line"] == (
+            f"{counts[variant_id]} parameters; input [2, 3, 8, 8]"
+        )
+        for field in inherited_fields:
+            assert canonical_json_bytes(variant[field]) == canonical_json_bytes(
+                representative[field]
+            )
+
+
+def test_family_variant_fails_closed_when_representative_has_no_authority(
+    tmp_path: Path,
+) -> None:
+    """A failed representative cannot silently turn trusted variants into ordinary models."""
+
+    snapshot, representative_id, variant_ids = _family_snapshot(tmp_path)
+    author = ScriptedAuthor(AuthorScript(failed_id=representative_id))
+    checker = FakeChecker()
+    with pytest.raises(
+        DriverIntegrationError,
+        match="trusted family variant has no usable representative authority",
+    ):
+        _driver(tmp_path, snapshot, author=author, checker=checker).run()
+
+    assert author.calls == {}
+    current = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    assert len(current) == 1
+    assert current[0]["stable_id"] == representative_id
+    assert current[0]["status"]["kind"] == "failed"
+    assert variant_ids
+
+
+def test_family_variant_template_failure_terminalizes_its_own_lane(tmp_path: Path) -> None:
+    """A sibling that constructs the representative size fails without aborting the family."""
+
+    snapshot, representative_id, variant_ids = _family_snapshot(tmp_path)
+    author = FakeAuthor()
+    forward = FakeForward()
+    driver = _driver(tmp_path, snapshot, author=author, forward=forward)
+    result = driver.run()
+
+    assert result.status == "complete"
+    assert author.calls == {representative_id: 1}
+    assert forward.calls == {
+        representative_id: 1,
+        variant_ids[0]: 1,
+        variant_ids[1]: 1,
+    }
+    current = {
+        model["stable_id"]: model for model in scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    }
+    assert current[representative_id]["status"]["kind"] == "runs"
+    for variant_id in variant_ids:
+        assert current[variant_id]["status"]["code"] == "failed:runner"
+        assert current[variant_id]["status"]["reason_code"] == "protocol-violation"
+        # Failure text is retrievable only from the gitignored C-07 diagnostic sidecar.
+        reference = current[variant_id]["status"]["traceback"]
+        assert reference["redaction"] == "externally-controlled-text-v1"
+        sidecar_path = next(tmp_path.rglob(Path(reference["local_path"]).name))
+        assert "must differ" in sidecar_path.read_text(encoding="utf-8")
+
+    context = driver._authority_context
+    assert context is not None
+    representative = current[representative_id]
+    superseding = deepcopy(representative)
+    superseding.pop("record_seq", None)
+    superseding.pop("record_revision", None)
+    superseding["parent_revision"] = representative["record_revision"]
+    superseding["status"]["supersedes_revision"] = representative["record_revision"]
+    superseding["notes"] = "representative metadata re-vet"
+    paths = _paths(tmp_path, snapshot)
+    with CanonicalReducer(paths.ledgers, context) as reducer:
+        reducer.append_model(reducer.prepare_model(superseding))
+
+    projection = project_dependency_current(paths.ledgers, context=context)
+    assert representative_id in projection.current_records
+    for variant_id in variant_ids:
+        assert variant_id not in projection.current_records
+        assert projection.stale_reasons[variant_id] == (
+            "variant lacks its exact current representative record"
+        )
+        assert not record_is_release_eligible(current[variant_id], projection.current_records)
+    report = completeness_report(
+        (item.stable_id for item in snapshot.items), projection.current_records
+    )
+    assert not report.complete
+    assert report.partition.missing_ids == frozenset(variant_ids)
+
+    readmitted = {
+        item.stable_id: item
+        for item in driver._ordered_work(snapshot, projection.current_records)
+        if item.stable_id in variant_ids
+    }
+    assert set(readmitted) == set(variant_ids)
+    for variant_id, item in readmitted.items():
+        assert item.refresh_work_id is not None
+        assert item.active_work_id == item.refresh_work_id
+        assert item.active_work_id != f"work-{variant_id}"
+
+
+@pytest.mark.parametrize(
+    "boundary", ["after-author", "after-gate", "after-forward", "after-reduce"]
+)
+def test_resume_is_lock_safe_and_duplicate_free_at_critical_boundaries(
+    tmp_path: Path, boundary: str
+) -> None:
+    """A kill after every durable boundary resumes the first unsatisfied identity."""
+
+    snapshot = _snapshot(tmp_path)
+    killed = False
+
+    def kill_once(observed: str, stable_id: str) -> None:
+        """Raise exactly once at the selected boundary."""
+
+        nonlocal killed
+        del stable_id
+        if observed == boundary and not killed:
+            killed = True
+            raise InjectedKill(boundary)
+
+    with pytest.raises(InjectedKill):
+        _driver(tmp_path, snapshot, boundary=kill_once).run()
+    result = _driver(tmp_path, snapshot).run()
+    assert result.status == "complete"
+    paths = _paths(tmp_path, snapshot)
+    assert len(scan_jsonl(paths.ledgers.models)) == 10
+    assert len(scan_jsonl(paths.ledgers.attempts)) == 20
+    # Ten models split into ceil(10 / METADATA_BATCH_MAX) calibrated batches,
+    # so a duplicate-free ledger holds exactly that many metadata gate records.
+    assert len(scan_jsonl(paths.ledgers.gates)) == -(-10 // METADATA_BATCH_MAX)
+
+
+def test_changed_source_and_input_supersede_run_and_force_reexecution(tmp_path: Path) -> None:
+    """A changed intake projection cannot reuse runs under stable membership.
+
+    COMPOSE (AW x WS-1): the changed intake stales every settled runs award,
+    and a stale award is operator property -- an unacked blind resume refuses
+    at the award-custody door, and nothing re-drives an award without a grant
+    naming its exact blocked revision. The re-execution is therefore the
+    operator's decision, made durable per model, and the fresh awards must
+    still parent-link to the superseded revisions exactly as before.
+    """
+
+    snapshot = _snapshot(tmp_path)
+    first_forward = FakeForward()
+    first = _driver(tmp_path, snapshot, forward=first_forward).run()
+    assert first.status == "complete"
+    paths = _paths(tmp_path, snapshot)
+    first_models = {record["stable_id"]: record for record in scan_jsonl(paths.ledgers.models)}
+    for item in snapshot.items:
+        (paths.work_root / item.stable_id / "driver-author-artifact.json").unlink()
+
+    # Rerun eligibility is projection-driven: changing only a private author cache must
+    # never invalidate canonical state.  Preserve the natural keys (and therefore stable
+    # IDs) while changing the immutable intake bytes that authorize the next generation.
+    _write_jsonl(
+        tmp_path / "master.jsonl",
+        [
+            {
+                "name": f"Example{index}",
+                "zoo": "fixtures",
+                "variant": "base",
+                "source_url": f"https://example.com/changed/{index}",
+            }
+            for index in range(len(snapshot.items))
+        ],
+    )
+    changed_snapshot = create_intake_snapshot(
+        tmp_path / "master.jsonl",
+        tmp_path / "deferred.jsonl",
+        tmp_path / "intake",
+    )
+    assert [item.stable_id for item in changed_snapshot.items] == [
+        item.stable_id for item in snapshot.items
+    ]
+
+    # An unacked blind resume refuses at the award-custody door: stale awards
+    # are disclosed, never silently funneled back into the re-drive treadmill.
+    with pytest.raises(DriverIntegrationError, match="projection-stale runs award"):
+        _driver(
+            tmp_path,
+            changed_snapshot,
+            author=ChangedInputAuthor(),
+            forward=FakeForward(),
+        ).run()
+
+    _grant_award_supersessions(tmp_path, snapshot, first_models)
+    second_forward = FakeForward()
+    second = _acknowledged(
+        _driver(
+            tmp_path,
+            changed_snapshot,
+            author=ChangedInputAuthor(),
+            forward=second_forward,
+        ),
+        [item.stable_id for item in snapshot.items],
+    ).run()
+
+    assert second.status == "complete"
+    assert set(second_forward.calls) == {item.stable_id for item in snapshot.items}
+    revisions = scan_jsonl(paths.ledgers.models)
+    assert len(revisions) == 2 * len(snapshot.items)
+    for item in snapshot.items:
+        current = [record for record in revisions if record["stable_id"] == item.stable_id][-1]
+        assert current["parent_revision"] == first_models[item.stable_id]["record_revision"]
+        assert (
+            current["implementation"]["recipe_revision"]
+            != first_models[item.stable_id]["implementation"]["recipe_revision"]
+        )
+
+
+def test_checker_prompt_bytes_stale_gate_and_execution_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing current checker prompt bytes invalidates gates and runtime identity."""
+
+    snapshot = _snapshot(tmp_path)
+    author = FakeAuthor()
+    driver = _driver(tmp_path, snapshot, author=author)
+    item = driver._ordered_work(snapshot, {})[0]
+    artifact = author.author(
+        item,
+        driver.paths.work_root,
+        driver.config,
+        _test_authority_context(snapshot, driver.config),
+    )
+    outcome = FakeChecker().check_metadata([artifact], driver.paths.work_root, driver.config)
+    assert outcome.gate is not None
+    environment = _test_environment(tmp_path / "env")
+    first_execution = _execution_identity(
+        artifact, environment, closure_identity=driver_module._INJECTED_FORWARD_CLOSURE_IDENTITY
+    )
+    assert (
+        driver_module._find_gate(
+            [outcome.gate], item.stable_id, "metadata_batch", artifact.proposal
+        )
+        is not None
+    )
+    changed_prompt = "sha256:" + "f" * 64
+    monkeypatch.setattr(driver_module, "_checker_prompt_hash", lambda: changed_prompt)
+    assert (
+        driver_module._find_gate(
+            [outcome.gate], item.stable_id, "metadata_batch", artifact.proposal
+        )
+        is None
+    )
+    # BL-10 e: execution identity binds the LEG PIN, not the facade hash, so
+    # the byte change is modeled the only way it can legitimately happen -- a
+    # rotated prompt file pinned at a fresh leg boundary.
+    from menagerie.crawler import checker_dispatch
+
+    rotated = tmp_path / "rotated-checker-prompt.txt"
+    rotated.write_text("rotated checker prompt bytes\n", encoding="utf-8")
+    monkeypatch.setattr(checker_dispatch, "PROMPT_PATH", rotated)
+    checker_dispatch.begin_checker_prompt_leg()
+    assert (
+        _execution_identity(
+            artifact, environment, closure_identity=driver_module._INJECTED_FORWARD_CLOSURE_IDENTITY
+        )
+        != first_execution
+    )
+
+
+def test_award_closure_change_stales_execution_and_current_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changed parent/reducer award semantics stale execution identity."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    author = FakeAuthor()
+    driver = _driver(tmp_path, snapshot, author=author)
+    item = driver._ordered_work(snapshot, {})[0]
+    artifact = author.author(
+        item,
+        driver.paths.work_root,
+        driver.config,
+        _test_authority_context(snapshot, driver.config),
+    )
+    environment = _test_environment(tmp_path / "env")
+    first_execution = _execution_identity(
+        artifact, environment, closure_identity=driver_module._INJECTED_FORWARD_CLOSURE_IDENTITY
+    )
+    monkeypatch.setattr(
+        driver_module,
+        "_award_closure_identity",
+        lambda: "sha256:" + "f" * 64,
+    )
+
+    assert (
+        _execution_identity(
+            artifact, environment, closure_identity=driver_module._INJECTED_FORWARD_CLOSURE_IDENTITY
+        )
+        != first_execution
+    )
+
+
+def test_checker_prompt_change_invalidates_author_cache_and_reauthors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached old-checker artifact is a cache miss, not a fatal resume error.
+
+    COMPOSE (AW x WS-1): the rotation stales every settled runs award, so the
+    re-adjudication under the new checker is the operator's decision -- one
+    award-naming grant per model plus the acknowledged award-holds door --
+    and the cached old-checker artifacts must then re-author cleanly.
+    """
+
+    snapshot = _snapshot(tmp_path)
+    assert _driver(tmp_path, snapshot).run().status == "complete"
+    first_models = {
+        record["stable_id"]: record
+        for record in scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    }
+    # A REAL rotation changes the prompt FILE bytes, so every reader -- the
+    # authority context, the gate lane, the attempt-identity stamp, and the
+    # test fixtures' own digest -- moves together. Rotating only a subset of
+    # module-level producers leaves the lanes disagreeing about the live
+    # world, which no on-disk edit can produce.
+    original_read_bytes = Path.read_bytes
+
+    def rotated_checker_prompt(path: Path) -> bytes:
+        """Serve rotated checker prompt bytes to every reader."""
+
+        value = original_read_bytes(path)
+        if path.name == "codex_accuracy_checker_v2.txt":
+            return value + b"\n# rotated adjudication policy\n"
+        return value
+
+    monkeypatch.setattr(Path, "read_bytes", rotated_checker_prompt)
+    _grant_award_supersessions(tmp_path, snapshot, first_models)
+    author = FakeAuthor()
+    forward = FakeForward()
+    result = _acknowledged(
+        _driver(tmp_path, snapshot, author=author, forward=forward),
+        [item.stable_id for item in snapshot.items],
+    ).run()
+    assert result.status == "complete"
+    assert set(author.calls) == {item.stable_id for item in snapshot.items}
+    assert set(forward.calls) == {item.stable_id for item in snapshot.items}
+    paths = _paths(tmp_path, snapshot)
+    # Each complete pass gates ten models as ceil(10 / METADATA_BATCH_MAX)
+    # calibrated batches, so two passes append twice that many gate records.
+    assert len(scan_jsonl(paths.ledgers.gates)) == 2 * -(-10 // METADATA_BATCH_MAX)
+    assert len(scan_jsonl(paths.ledgers.models)) == 2 * len(snapshot.items)
+
+
+def test_author_prompt_change_stales_cached_gates_and_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live author-prompt change reauthors every cached dependent artifact.
+
+    COMPOSE (AW x WS-1): the prompt rotation stales the settled runs award,
+    so the re-author runs behind the operator's award-naming grant and the
+    acknowledged award-holds door -- never as a silent treadmill re-drive.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    assert _driver(tmp_path, snapshot).run().status == "complete"
+    stable_id = snapshot.items[0].stable_id
+    first_models = {
+        record["stable_id"]: record
+        for record in scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    }
+    original_read_bytes = Path.read_bytes
+
+    def changed_author_prompt(path: Path) -> bytes:
+        """Return revised bytes only for the frozen author prompt."""
+
+        value = original_read_bytes(path)
+        if path.name == "claude_crawler_author_v2.txt":
+            return value + b"\nRequire one more source-bound fact.\n"
+        return value
+
+    monkeypatch.setattr(Path, "read_bytes", changed_author_prompt)
+    _grant_award_supersessions(tmp_path, snapshot, first_models)
+    author = FakeAuthor()
+    forward = FakeForward()
+    result = _acknowledged(
+        _driver(tmp_path, snapshot, author=author, forward=forward), [stable_id]
+    ).run()
+
+    assert result.status == "complete"
+    assert set(author.calls) == {stable_id}
+    assert set(forward.calls) == {stable_id}
+    paths = _paths(tmp_path, snapshot)
+    assert len(scan_jsonl(paths.ledgers.gates)) == 2
+    models = scan_jsonl(paths.ledgers.models)
+    assert len(models) == 2
+    assert (
+        models[0]["provenance"]["author_prompt_sha256"]
+        != models[1]["provenance"]["author_prompt_sha256"]
+    )
+
+
+def test_only_driver_awards_runs_after_gate_receipts_and_both_modes(tmp_path: Path) -> None:
+    """Gates and worker attempts alone never create a canonical runs record."""
+
+    snapshot = _snapshot(tmp_path)
+    paths = _paths(tmp_path, snapshot)
+    checker = FakeChecker()
+    author = FakeAuthor()
+    item_driver = _driver(tmp_path, snapshot, author=author, checker=checker)
+    work = item_driver._ordered_work(snapshot, {})
+    context = _test_authority_context(snapshot, item_driver.config)
+    artifacts = [author.author(item, paths.work_root, item_driver.config, context) for item in work]
+    artifact = artifacts[0]
+    gate = checker.check_metadata(artifacts, paths.work_root, item_driver.config).gate
+    assert gate is not None
+    gate["ledger_seq"] = 1
+    gate["payload_sha256"] = HASH
+    attempts = FakeForward().forward(
+        artifact, _test_environment(tmp_path / "env"), 1, paths.work_root
+    )
+    with CanonicalReducer(paths.ledgers, context) as reducer:
+        reducer.append_gate(gate)
+        for attempt in attempts:
+            reducer.append_attempt(attempt)
+        assert reducer.current_records == {}
+    result = _driver(tmp_path, snapshot, author=author, checker=checker).run()
+    assert result.status == "complete"
+    assert scan_jsonl(paths.ledgers.models)[0]["status"]["code"] == "runs"
+
+
+@pytest.mark.skipif(
+    METADATA_BATCH_MAX < 2,
+    reason=(
+        "a mixed-verdict batch with a repair tail cannot exist at the "
+        "calibrated width-1 production config (a batch has one item); the "
+        "crash-resume drain it pins re-arms with any future width increase"
+    ),
+)
+def test_final_metadata_tail_drains_after_mixed_verdict_and_restart(tmp_path: Path) -> None:
+    """A persisted mixed batch resumes its one-item tail and reaches terminal records."""
+
+    snapshot = _snapshot(tmp_path)
+    killed = False
+
+    def kill_after_mixed_gate(boundary: str, stable_id: str) -> None:
+        """Crash after the mixed gate is durable but before any model reduction."""
+
+        nonlocal killed
+        del stable_id
+        if boundary == "after-gate" and not killed:
+            killed = True
+            raise InjectedKill("after-gate")
+
+    with pytest.raises(InjectedKill):
+        _driver(
+            tmp_path,
+            snapshot,
+            checker=ScriptedChecker(script=CheckerScript(mixed_tail=True)),
+            boundary=kill_after_mixed_gate,
+        ).run()
+    resumed_checker = ScriptedChecker(script=CheckerScript(mixed_tail=True))
+    result = _driver(tmp_path, snapshot, checker=resumed_checker).run()
+    assert result.status == "complete"
+    # The killed run persisted only the first five-item mixed gate
+    # (METADATA_BATCH_MAX=5). Resume never re-gates it: it drains that batch's
+    # one-item repair tail, gates the remaining five-item batch (mixed again),
+    # and drains that batch's tail -- exactly three checker calls.
+    assert resumed_checker.metadata_calls == 3
+    paths = _paths(tmp_path, snapshot)
+    assert len(scan_jsonl(paths.ledgers.models)) == len(snapshot.items)
+    assert len(scan_jsonl(paths.ledgers.gates)[-1]["items"]) == 1
+
+
+def test_seven_item_phase_uses_one_full_batch_and_one_final_tail(tmp_path: Path) -> None:
+    """A seven-item phase drains at the packing optimum, tail included.
+
+    At a multi-item width this is one full calibrated batch plus a flushed
+    short tail; at width 1 it degenerates to seven full batches. Either way the
+    primary adjudication count must be exactly ceil(7 / cap) -- no re-buy, no
+    abandoned tail -- plus one H-5 blind duplicate-accept confirmation per
+    accepted member (all seven accept here).
+    """
+
+    snapshot = _snapshot(tmp_path, count=7)
+    checker = FakeChecker()
+    result = _driver(tmp_path, snapshot, checker=checker).run()
+    assert result.status == "complete"
+    assert checker.metadata_calls == -(-7 // METADATA_BATCH_MAX) + 7
+    assert len(scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)) == 7
+
+
+def test_quota_pause_awards_pending_runs_then_metadata_supersedes(tmp_path: Path) -> None:
+    """A quota pause awards proven R1/R2 runs and recovery supersedes their metadata."""
+
+    snapshot = _snapshot(tmp_path)
+    scheduler = FakePauseScheduler(_paths(tmp_path, snapshot).wakeup_root)
+    forward = FakeForward()
+    checker = FakeChecker(quota=True)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        checker=checker,
+        forward=forward,
+        pause_scheduler=scheduler,
+    ).run()
+    assert result.status == "paused:usage-limit"
+    assert scheduler.calls == 1
+    paths = _paths(tmp_path, snapshot)
+    pending = scan_jsonl(paths.ledgers.models)
+    assert len(pending) == len(snapshot.items)
+    assert {model["status"]["code"] for model in pending} == {"runs"}
+    assert {model["authored_metadata_state"] for model in pending} == {"pending"}
+    assert all(model["accuracy_gate"]["current"] is False for model in pending)
+    assert all(model["completeness"]["release_eligible"] is False for model in pending)
+    assert all(model["external_metadata"] is None for model in pending)
+    attempts = scan_jsonl(paths.ledgers.attempts)
+    assert len(attempts) == 2 * len(snapshot.items)
+    assert set(forward.calls) == {item.stable_id for item in snapshot.items}
+    events = scan_jsonl(paths.operational_ledger)
+    # WS-1 clause 7: every leg start discloses its selection census before any
+    # operational event that is a CONSEQUENCE of the selection -- the pause, the
+    # wake install, every grant consumption and park stash. B-09 puts exactly one
+    # row ahead of it: the leg-config attestation naming the config the census
+    # was computed under, appended before the leg's first admission decision so
+    # a leg that refuses at a door has still attested what it ran as. It
+    # consumes nothing and admits nothing, so it is a premise of the census
+    # rather than a consequence of it. Still an EXACT full sequence. BL-10 e
+    # added the once-per-leg checker-prompt pin attestation at the first
+    # checker dispatch. Paid-session money now belongs exclusively to the
+    # chain-verified paid-session authority, so the operational sequence has
+    # exactly that one non-money campaign-health row before the pause.
+    assert [event["event_kind"] for event in events] == [
+        "leg-config",
+        # D-20: the leg-start read-only close preview rides directly after
+        # the config attestation -- a premise-side disclosure like it, before
+        # any admission decision or selection consequence.
+        "close-preview",
+        "work-selection-census",
+        "projection-staleness",
+        "campaign-health",
+        "usage-pause",
+        "wakeup-installed",
+        # W6/OB-M12 (Wave-2 batch): every configured leg's end mirrors a
+        # leg-outcome operational event -- the paused leg included.
+        "leg-outcome",
+        # DX-26: every non-close leg exit (this pause included) leaves the
+        # immutable nonterminal leg-partial.v1 checkpoint -- the D-20 preview
+        # payload at exit.
+        "close-preview",
+    ]
+    assert events[4]["details"]["disposition"] == "checker-prompt-pinned"
+    assert events[-1]["details"]["checkpoint"] == "leg-partial.v1"
+    assert events[-1]["details"]["at"] == "leg-exit"
+    paid_rows = load_paid_session_rows(paths.paid_session_ledger)
+    reservations = [row for row in paid_rows if row.get("event") == "session_reserved"]
+    assert sum(row.get("lane") == "author" for row in reservations) == len(snapshot.items)
+    assert sum(row.get("lane") == "checker" for row in reservations) == (
+        checker.metadata_calls
+    )
+
+    # WS-1 clause 4 / V3: an ordinary resume no longer auto-readmits
+    # pending-metadata records -- it closes without touching them, never
+    # silently re-driving settled heads.
+    blind = _driver(tmp_path, snapshot, forward=FakeForward(), pause_scheduler=scheduler).run()
+    assert blind.status == "terminal-partition-complete"
+    assert len(scan_jsonl(paths.ledgers.models)) == len(snapshot.items)
+
+    # The metadata catch-up is the operator's NAMED gate-catchup decision.
+    resumed_forward = FakeForward()
+    resumed_driver = _driver(
+        tmp_path,
+        snapshot,
+        forward=resumed_forward,
+        pause_scheduler=scheduler,
+    )
+    resumed_driver.config = replace(
+        resumed_driver.config,
+        gate_catchup_targets=tuple(sorted(item.stable_id for item in snapshot.items)),
+    )
+    resumed = resumed_driver.run()
+    assert resumed.status == "complete"
+    assert resumed_forward.calls == {}
+    revisions = scan_jsonl(paths.ledgers.models)
+    assert len(revisions) == 2 * len(snapshot.items)
+    current = {model["stable_id"]: model for model in revisions[-len(snapshot.items) :]}
+    assert {model["authored_metadata_state"] for model in current.values()} == {"accepted"}
+    assert all(model["completeness"]["release_eligible"] is True for model in current.values())
+    for model in current.values():
+        parent = next(
+            revision
+            for revision in pending
+            if revision["record_revision"] == model["parent_revision"]
+        )
+        assert model["status"]["supersedes_revision"] == parent["record_revision"]
+
+
+def test_legacy_faithful_r1_requires_current_fidelity_gate(tmp_path: Path) -> None:
+    """A fresh R1 selection cannot fast-pass an immutable legacy fidelity claim."""
+
+    master = tmp_path / "legacy-master.jsonl"
+    deferred = tmp_path / "legacy-deferred.jsonl"
+    _write_jsonl(
+        master,
+        [
+            {
+                "name": "LegacyFaithful",
+                "zoo": "unregistered-classics-pytorch",
+                "variant": "base",
+                "notes": "faithful-verified classic implementation",
+                "source_url": "https://example.com/legacy-faithful",
+            }
+        ],
+    )
+    _write_jsonl(deferred, [])
+    snapshot = create_intake_snapshot(master, deferred, tmp_path / "legacy-intake")
+    checker = FakeChecker()
+
+    result = _driver(tmp_path, snapshot, checker=checker).run()
+
+    assert result.status == "complete"
+    # One primary fidelity adjudication plus its H-5 blind confirmation.
+    assert checker.fidelity_calls == 2
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[-1]
+    assert "legacy-fidelity-claim" in model["intake"]["preserved_legacy_flags"]
+    assert "legacy-classic-requires-fidelity-audit" in model["intake"]["preserved_legacy_flags"]
+    assert model["fidelity"]["required"] is True
+    assert model["fidelity"]["current"] is True
+    assert model["fidelity"]["verdict"] == "match"
+    assert model["completeness"]["release_eligible"] is True
+
+
+def test_runtime_mode_expansion_is_model_local_and_restart_stable(tmp_path: Path) -> None:
+    """Worker mode expansion is re-authored, re-gated, and executed in both modes.
+
+    This is rung 11's m10949 chain replayed to its intended end: the worker
+    detects ``[train, eval]`` against a declared ``[eval]``, the ONE repair
+    generation answers with a dual-mode revision under the same machine-issued
+    work identity (the only shape the production lane can emit), and that
+    revision flows to a fresh metadata gate round and a dual-mode forward. On
+    rung 11 the driver refused exactly this revision twice for "not issuing a
+    new work identity" -- an unsatisfiable demand -- and burned the model to
+    ``failed:runner``.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    expanded_id = snapshot.items[0].stable_id
+    author = DetectedModeRepairAuthor()
+    checker = FakeChecker()
+    forward = ScriptedForward(ForwardScript(expanded_id=expanded_id))
+    first = _driver(
+        tmp_path,
+        snapshot,
+        author=author,
+        checker=checker,
+        forward=forward,
+    ).run()
+    paths = _paths(tmp_path, snapshot)
+    models = {record["stable_id"]: record for record in scan_jsonl(paths.ledgers.models)}
+
+    assert first.status == "complete"
+    assert models[expanded_id]["status"]["code"] == "runs"
+    assert models[expanded_id]["modes"]["meaningful_modes"] == ["train", "eval"]
+    assert set(models[expanded_id]["modes"]["per_mode_run"]) == {"train", "eval"}
+    assert author.calls == {expanded_id: 2}
+    assert checker.metadata_calls == 4, (
+        "the repaired proposal must reach a fresh gate round (two accepted "
+        "primary rounds, each with its H-5 blind confirmation)"
+    )
+    failures = [
+        attempt
+        for attempt in scan_jsonl(paths.ledgers.attempts)
+        if isinstance(attempt.get("error"), Mapping)
+        and attempt["error"].get("details", {}).get("route") == "recipe-and-gate-revision-required"
+    ]
+    assert len(failures) == 1
+    repair_root = paths.work_root / expanded_id / "repair"
+    assert len(list(repair_root.glob("run-modes-generation-*.json"))) == 1
+    assert list(repair_root.glob("run-modes-charge-*.json")) == [], (
+        "an ACCEPTED repair generation must not charge the bounded cap"
+    )
+    revision_count = len(scan_jsonl(paths.ledgers.models))
+    restarted = _driver(tmp_path, snapshot, author=author, checker=checker, forward=forward).run()
+    assert restarted.status == first.status
+    assert len(scan_jsonl(paths.ledgers.models)) == revision_count
+
+
+def test_mode_repair_request_residue_from_a_dead_run_does_not_charge_the_cap(
+    tmp_path: Path,
+) -> None:
+    """Only COMPLETED revisions charge the repair cap; a dead run's requests do not.
+
+    Frozen m10949 state from rung 11: two ``run-modes-generation-*.json`` request
+    files standing in ``repair/`` with no author answer behind them (requests are
+    written BEFORE dispatch). Under request-file accounting a resume started past
+    the cap -- ``range(3, 3)`` is empty -- and terminalized ``cap exhausted``
+    without running one revision. The cap must count durable charge markers, so
+    this resume repairs and completes with the full cap available.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    expanded_id = snapshot.items[0].stable_id
+    paths = _paths(tmp_path, snapshot)
+    repair_root = paths.work_root / expanded_id / "repair"
+    repair_root.mkdir(parents=True, exist_ok=True)
+    for generation in (1, 2):
+        (repair_root / f"run-modes-generation-{generation}.json").write_text(
+            json.dumps({"stable_id": expanded_id, "generation": generation}) + "\n"
+        )
+
+    author = DetectedModeRepairAuthor()
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=author,
+        forward=ScriptedForward(ForwardScript(expanded_id=expanded_id)),
+        run_repair_max=2,
+    ).run()
+    model = scan_jsonl(paths.ledgers.models)[-1]
+
+    assert result.status == "complete"
+    assert model["status"]["code"] == "runs"
+    assert model["modes"]["meaningful_modes"] == ["train", "eval"]
+    assert author.calls == {expanded_id: 2}, (
+        "the residue must not pre-consume generations: one initial author, one repair"
+    )
+    assert list(repair_root.glob("run-modes-charge-*.json")) == []
+
+
+def test_mode_repair_refuses_a_forged_work_identity_as_drift(tmp_path: Path) -> None:
+    """A repair artifact bound to a different work generation is refused and charged.
+
+    The work identity is machine-issued and constant across repair generations;
+    the ONLY way a repaired proposal arrives under a different one is a lane
+    handing back another generation's artifact. Each such round completed and was
+    rejected, so it charges the cap, and exhaustion terminalizes honestly.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    stable_id = snapshot.items[0].stable_id
+    author = ForgedWorkIdentityModeRepairAuthor()
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=author,
+        forward=ScriptedForward(ForwardScript(expanded_id=stable_id)),
+        run_repair_max=2,
+    ).run()
+    paths = _paths(tmp_path, snapshot)
+    model = scan_jsonl(paths.ledgers.models)[-1]
+
+    assert result.status == "complete"
+    # DX-9/RE-9: budget exhaustion publishes as the AUTHOR stage, never a
+    # runner verdict -- the repair lane, not the worker, ran out of answers.
+    assert model["status"]["code"] == "failed:author"
+    assert model["status"]["reason_code"] == "repair-exhausted"
+    assert author.calls == {stable_id: 3}
+    charges = sorted((paths.work_root / stable_id / "repair").glob("run-modes-charge-*.json"))
+    assert len(charges) == 2
+    assert all(
+        json.loads(charge.read_text())["disposition"] == "revision-rejected" for charge in charges
+    )
+
+
+def test_runtime_mode_expansion_terminalizes_only_after_repair_cap(tmp_path: Path) -> None:
+    """A repairable mode gap consumes the configured revisions before one terminal."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    stable_id = snapshot.items[0].stable_id
+    author = ModeRepairCapAuthor()
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=author,
+        forward=ScriptedForward(ForwardScript(expanded_id=stable_id)),
+        run_repair_max=2,
+    ).run()
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[-1]
+
+    assert result.status == "complete"
+    # DX-9/RE-9: exhausting the v3 run-mode repair budget is an AUTHOR-lane
+    # fact; it is not evidence the worker misbehaved, and it is not evidence
+    # that the independently resolved public source became invalid.
+    assert model["status"]["code"] == "failed:author"
+    assert model["status"]["reason_code"] == "repair-exhausted"
+    assert author.calls == {stable_id: 3}
+    repair_root = _paths(tmp_path, snapshot).work_root / stable_id / "repair"
+    repair_requests = sorted(repair_root.glob("run-modes-generation-*.json"))
+    assert len(repair_requests) == 2
+    # Every charged generation actually RAN an author to a rejected answer:
+    # the durable charge markers, not the request files, are the cap's memory.
+    charges = sorted(repair_root.glob("run-modes-charge-*.json"))
+    assert len(charges) == 2
+
+
+def test_a_mode_repair_generation_may_answer_with_a_terminal_recommendation(
+    tmp_path: Path,
+) -> None:
+    """A typed terminal answer to a mode repair is adjudicated, never cap-burned.
+
+    ``_repair_author_for_detected_modes`` had the same structural defect the
+    ``_ensure_gates`` repair sites just shed, with a WORSE cost profile: a typed
+    DEFER/SKIP/BLOCKED answer from the repair generation was consumed into
+    ``last_error`` by the blanket per-generation arm, so the driver re-ran the
+    AGENTIC author for every remaining generation of ``run_repair_max`` asking a
+    question the author had already declined, then died ``cap exhausted`` as
+    ``failed:runner / protocol-violation`` with the verdict discarded. In a
+    run-once system each of those re-runs is a real agent session.
+
+    With ``run_repair_max=3`` the defective path makes four author calls and a
+    protocol-violation record; the routed path makes exactly two and records the
+    disposition the author actually gave, adjudicated by the same
+    terminal-disposition gate the first-call arm uses.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    stable_id = snapshot.items[0].stable_id
+    author = ModeRepairTerminalAuthor(stable_id)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=author,
+        forward=ScriptedForward(ForwardScript(expanded_id=stable_id)),
+        run_repair_max=3,
+    ).run()
+
+    assert result.status == "complete"
+    assert author.calls == {stable_id: 2}, (
+        "a terminal answer must consume ONE repair generation, not the whole cap"
+    )
+    paths = _paths(tmp_path, snapshot)
+    assert list((paths.work_root / stable_id / "repair").glob("run-modes-charge-*.json")) == [], (
+        "a terminal ANSWER is not a rejected revision and must not charge the cap"
+    )
+    model = scan_jsonl(paths.ledgers.models)[-1]
+    assert model["status"]["code"] == "deferred:needs-cuda", (
+        "the author's typed verdict must reach the record as the disposition it is"
+    )
+    assert model["status"]["code"] != "failed:runner"
+    assert model["status"]["reason_code"] is None
+    # The verdict was ADJUDICATED, not merely relabeled: the terminal-disposition
+    # gate the first-call arm uses must have run for this model too.
+    terminal_gates = [
+        gate
+        for gate in scan_jsonl(paths.ledgers.gates)
+        if gate.get("gate_kind") == "terminal_disposition"
+        and any(entry.get("stable_id") == stable_id for entry in gate.get("items", []))
+    ]
+    assert terminal_gates, "the repair terminal must be adjudicated by the terminal gate"
+
+
+def test_declared_mode_order_is_canonical_before_gate_and_recipe_identity(tmp_path: Path) -> None:
+    """An eval/train author declaration is gated and stored in canonical train/eval order."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    result = _driver(tmp_path, snapshot, author=ReverseModeAuthor()).run()
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[0]
+
+    assert result.status == "complete"
+    assert model["modes"]["meaningful_modes"] == ["train", "eval"]
+    assert model["external_metadata"]["modes"]["meaningful_modes"] == ["train", "eval"]
+
+
+def test_review_checkpoint_blocks_notifies_and_is_one_shot(tmp_path: Path) -> None:
+    """The configured terminal count blocks until explicit sign-off, then never re-blocks."""
+
+    snapshot = _snapshot(tmp_path, count=10)
+    notifier = FakeNotifier()
+    first = _driver(tmp_path, snapshot, notifier=notifier, review_at=1).run()
+    assert first.status == "paused:review-checkpoint"
+    paths = _paths(tmp_path, snapshot)
+    assert len(scan_jsonl(paths.ledgers.models)) == 1
+    events = scan_jsonl(paths.operational_ledger)
+    review = next(event for event in events if event["event_kind"] == "checkpoint-review")
+    assert Path(review["report_path"]).is_file()
+    assert len(notifier.messages) == 1
+    still_paused = _driver(tmp_path, snapshot, review_at=1).run()
+    assert still_paused.status == "paused:review-checkpoint"
+    resumed = _driver(tmp_path, snapshot, review_at=1).run(after_review=True)
+    assert resumed.status == "complete"
+    assert len(scan_jsonl(paths.ledgers.models)) == 10
+    final_events = scan_jsonl(paths.operational_ledger)
+    assert [event["event_kind"] for event in final_events].count("checkpoint-review") == 1
+    assert [event["event_kind"] for event in final_events].count("review-signoff") == 1
+
+
+def test_clean_clone_can_sign_off_canonical_pending_review(tmp_path: Path) -> None:
+    """Canonical policy facts keep ``--after-review`` usable without runtime state."""
+
+    snapshot = _snapshot(tmp_path, count=3)
+    assert _driver(tmp_path, snapshot, review_at=1).run().status == "paused:review-checkpoint"
+    paths = _paths(tmp_path, snapshot)
+    shutil.rmtree(paths.runtime_root)
+
+    resumed = _driver(tmp_path, snapshot, review_at=1).run(after_review=True)
+    assert resumed.status == "complete"
+    from menagerie.crawler.checkpoint import canonical_operational_ledger_path
+
+    canonical = scan_jsonl(canonical_operational_ledger_path(paths.ledgers.models))
+    review = next(event for event in canonical if event["event_kind"] == "checkpoint-review")
+    signoff = next(event for event in canonical if event["event_kind"] == "review-signoff")
+    assert signoff["details"]["policy_key"] == review["details"]["policy_key"]
+
+
+def test_progress_milestones_fire_once_without_pausing(tmp_path: Path) -> None:
+    """Every crossed milestone emits one event/message and resume does not re-fire it."""
+
+    snapshot = _snapshot(tmp_path, count=10)
+    notifier = FakeNotifier()
+    first = _driver(tmp_path, snapshot, notifier=notifier, milestones=(1, 2)).run()
+    assert first.status == "complete"
+    assert len(notifier.messages) == 2
+    second_notifier = FakeNotifier()
+    second = _driver(tmp_path, snapshot, notifier=second_notifier, milestones=(1, 2)).run()
+    assert second.status == "complete"
+    assert second_notifier.messages == []
+    events = scan_jsonl(_paths(tmp_path, snapshot).operational_ledger)
+    assert [
+        event["milestone"] for event in events if event["event_kind"] == "progress-notification"
+    ] == [1, 2]
+
+
+def test_runtime_wipe_preserves_milestone_and_review_one_shots(tmp_path: Path) -> None:
+    """Canonical policy identities prevent milestone replay and review re-blocking."""
+
+    snapshot = _snapshot(tmp_path, count=10)
+    first_notifier = FakeNotifier()
+    first = _driver(
+        tmp_path,
+        snapshot,
+        notifier=first_notifier,
+        review_at=1,
+        milestones=(1,),
+    ).run()
+    assert first.status == "paused:review-checkpoint"
+    resumed = _driver(tmp_path, snapshot, review_at=1, milestones=(1,)).run(after_review=True)
+    assert resumed.status == "complete"
+    paths = _paths(tmp_path, snapshot)
+    from menagerie.crawler.checkpoint import canonical_operational_ledger_path
+
+    canonical_events = scan_jsonl(canonical_operational_ledger_path(paths.ledgers.models))
+    assert [event["event_kind"] for event in canonical_events].count("progress-notification") == 1
+    assert [event["event_kind"] for event in canonical_events].count("checkpoint-review") == 1
+    assert [event["event_kind"] for event in canonical_events].count("review-signoff") == 1
+
+    shutil.rmtree(paths.runtime_root)
+    renamed_root = tmp_path / "renamed-clean-clone-intake"
+    shutil.copytree(snapshot.root, renamed_root)
+    renamed_snapshot = replace(snapshot, root=renamed_root)
+    clean_notifier = FakeNotifier()
+    clean_resume = _driver(
+        tmp_path,
+        renamed_snapshot,
+        notifier=clean_notifier,
+        review_at=1,
+        milestones=(1,),
+    ).run()
+    assert clean_resume.status == "complete"
+    assert clean_notifier.messages == []
+    after_rename = scan_jsonl(canonical_operational_ledger_path(paths.ledgers.models))
+    assert [event["event_kind"] for event in after_rename].count("progress-notification") == 1
+    assert [event["event_kind"] for event in after_rename].count("checkpoint-review") == 1
+
+
+def test_driver_failure_diagnostics_are_sidecar_only_and_checkpoint_safe(
+    tmp_path: Path,
+) -> None:
+    """Driver exception source text never enters canonical attempts or terminal models."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    restricted = "https://restricted.example/repo.py\nraise LicenseBoundSource('private excerpt')"
+    driver = _driver(
+        tmp_path,
+        snapshot,
+        author=ScriptedAuthor(
+            AuthorScript(failed_id=snapshot.items[0].stable_id, failure_message=restricted)
+        ),
+    )
+    assert driver.run().status == "terminal-partition-complete"
+    paths = _paths(tmp_path, snapshot)
+    attempt_bytes = paths.ledgers.attempts.read_bytes()
+    model_bytes = paths.ledgers.models.read_bytes()
+    assert restricted.encode() not in attempt_bytes
+    assert restricted.encode() not in model_bytes
+    attempt = scan_jsonl(paths.ledgers.attempts)[0]
+    model = scan_jsonl(paths.ledgers.models)[0]
+    assert attempt["error"]["message"]["redaction"] == "externally-controlled-text-v1"
+    assert model["status"]["detail"] is None
+    assert model["status"]["traceback"]["redaction"] == "externally-controlled-text-v1"
+    assert model["status"]["human_review"]["reason"] is None
+    assert (
+        _externally_controlled_record_text(
+            Path("menagerie/crawler/records/attempts/driver-failure.jsonl"), attempt_bytes
+        )
+        == ()
+    )
+    assert (
+        _externally_controlled_record_text(
+            Path("menagerie/crawler/records/models/driver-failure.jsonl"), model_bytes
+        )
+        == ()
+    )
+
+
+def test_scheduled_wake_live_lock_is_idempotent_success(tmp_path: Path) -> None:
+    """A lock-contended scheduled wake fsyncs one bucket intent and exits zero."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    driver = _driver(tmp_path, snapshot)
+
+    class LockedDriverFactory:
+        """Return the same lock-contending driver for each CLI replay."""
+
+        def __call__(self, _args: argparse.Namespace) -> CrawlerDriver:
+            """Return the lock-contending driver."""
+
+            return driver
+
+    factory = LockedDriverFactory()
+
+    event_path = canonical_operational_ledger_path(driver.paths.ledgers.models)
+    with JsonlLedger(event_path, OPERATIONAL_EVENT_SCHEMA_VERSION) as ledger:
+        scheduled = WakeupManager(
+            driver.paths.wakeup_root,
+            ledger,
+            ["python", "-m", "menagerie.crawler", "run", "--resume"],
+            backend=WakeupBackend.CRON,
+            installer=lambda _definition: None,
+            verifier=lambda _definition: True,
+        ).record_pause_and_schedule(
+            provider="openai",
+            observed_response="quota exhausted",
+            reset_at=NOW,
+            context=OperationalContext("driver-run", "test-machine", {"models": 1}, None),
+            created_at=NOW,
+        )
+    argv = [
+        "--repo-root",
+        str(tmp_path),
+        "run",
+        "--wake-episode-id",
+        scheduled.episode.episode_id,
+    ]
+    with DriverLock(driver.paths.lock_path, {"pid": 1}):
+        assert cli_main(argv, driver_factory=factory) == 0
+        assert cli_main(argv, driver_factory=factory) == 0
+    intents = tuple((driver.paths.wakeup_root / "fire-intents").glob("*/*.json"))
+    assert len(intents) == 1
+    assert all(
+        event["event_kind"] != "wake-noop-already-running" for event in scan_jsonl(event_path)
+    )
+
+
+def test_wake_callback_reloads_all_commands_from_private_config_in_clean_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launchd-style clean environment retains every frozen wrapper and scope."""
+
+    from menagerie.crawler.tests.campaign_binding_support import bind_snapshot_to_campaign
+
+    snapshot = _snapshot(tmp_path, count=1)
+    # The factory refuses unbound snapshots (T4-T2) and c1-mech's launch policy
+    # pins the review checkpoint to 1000 with the 900,950,1000 milestones; the
+    # 19,23 milestones stay as the distinctive persistence round-trip proof.
+    bind_snapshot_to_campaign(tmp_path, snapshot)
+    commands: dict[str, Path] = {}
+    for lane in ("author", "checker", "provider-reconcile", "environment", "notify"):
+        path = tmp_path / "bin" / lane
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+        commands[lane] = path
+    public_mirror = tmp_path / "public-mirror"
+    private_mirror = tmp_path / "private-mirror"
+    public_mirror.mkdir()
+    private_mirror.mkdir()
+    monkeypatch.setenv("MENAGERIE_PUBLIC_MIRROR", str(public_mirror))
+    monkeypatch.setenv("MENAGERIE_PRIVATE_MIRROR", str(private_mirror))
+    launch_args = build_parser().parse_args(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "run",
+            "--intake",
+            str(snapshot.root),
+            "--phase",
+            "pytorch",
+            "--review-checkpoint-at",
+            "1000",
+            "--progress-milestones",
+            "19,23,900,950,1000",
+            "--author-concurrency",
+            "12",
+            "--checker-concurrency",
+            "24",
+            "--run-id",
+            "clean-wake",
+            "--author-command",
+            str(commands["author"]),
+            "--checker-command",
+            str(commands["checker"]),
+            "--provider-reconcile-command",
+            str(commands["provider-reconcile"]),
+            "--environment-command",
+            str(commands["environment"]),
+            "--notify-command",
+            str(commands["notify"]),
+        ]
+    )
+    launched = cli_module._default_driver_factory(launch_args)
+    callback = launched._wakeup_callback_argv()
+    config_index = callback.index("--campaign-config") + 1
+    config_path = Path(callback[config_index])
+    persisted = load_campaign_config(config_path)
+
+    assert config_path.stat().st_mode & 0o777 == 0o600
+    assert persisted.author_command == (str(commands["author"].resolve()),)
+    assert persisted.checker_command == (str(commands["checker"].resolve()),)
+    assert persisted.provider_reconcile_command == (
+        str(commands["provider-reconcile"].resolve()),
+    )
+    assert persisted.environment_command == (str(commands["environment"].resolve()),)
+    assert persisted.notify_command == (str(commands["notify"].resolve()),)
+    assert persisted.review_checkpoint_at == 1000
+    assert persisted.progress_milestones == (19, 23, 900, 950, 1000)
+    assert persisted.phase == "pytorch"
+    assert persisted.author_concurrency == 12
+    assert persisted.checker_concurrency == 24
+
+    # A "clean" launchd wake inherits a bare environment, so the scrub must
+    # cover the CLOSED restore vocabulary (D-63 added the concurrency names;
+    # a stale hand-list here let an inherited MENAGERIE_AUTHOR_CONCURRENCY
+    # read as an explicit-wins operator override of the frozen width).
+    for name in (
+        "MENAGERIE_AUTHOR_COMMAND",
+        "MENAGERIE_CHECKER_COMMAND",
+        "MENAGERIE_ENVIRONMENT_COMMAND",
+        "MENAGERIE_PUBLIC_MIRROR",
+        "MENAGERIE_PRIVATE_MIRROR",
+        *cli_module.LAUNCH_ENVIRONMENT_VARIABLES,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    resumed_args = build_parser().parse_args(list(callback[3:]))
+    resumed = cli_module._default_driver_factory(resumed_args)
+
+    assert isinstance(resumed.dependencies.author, CommandAuthorLane)
+    assert resumed.dependencies.author.command == persisted.author_command
+    assert isinstance(resumed.dependencies.checker, CommandCheckerLane)
+    assert resumed.dependencies.checker.command == persisted.checker_command
+    assert resumed.config.review_checkpoint_at == 1000
+    assert resumed.config.progress_milestones == (19, 23, 900, 950, 1000)
+    assert resumed.config.phase == "pytorch"
+    assert resumed.config.author_concurrency == 12
+    assert resumed.config.checker_concurrency == 24
+    assert os.environ["MENAGERIE_PUBLIC_MIRROR"] == str(public_mirror.resolve())
+    assert os.environ["MENAGERIE_PRIVATE_MIRROR"] == str(private_mirror.resolve())
+
+    for name in (
+        "MENAGERIE_AUTHOR_COMMAND",
+        "MENAGERIE_CHECKER_COMMAND",
+        "MENAGERIE_ENVIRONMENT_COMMAND",
+        "MENAGERIE_PUBLIC_MIRROR",
+        "MENAGERIE_PRIVATE_MIRROR",
+        *cli_module.LAUNCH_ENVIRONMENT_VARIABLES,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    manual_args = build_parser().parse_args(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "resume",
+            "--intake",
+            str(snapshot.root),
+        ]
+    )
+    manual_resume = cli_module._default_driver_factory(manual_args)
+    assert isinstance(manual_resume.dependencies.author, CommandAuthorLane)
+    assert manual_resume.dependencies.author.command == persisted.author_command
+    assert manual_resume.config.campaign_config_path == config_path
+    assert manual_resume.config.author_concurrency == 12
+    assert manual_resume.config.checker_concurrency == 24
+
+
+def test_cli_uses_distinct_review_and_operator_outage_exits(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review pauses and missing operator configuration no longer collapse.
+
+    BL-1 later put the environment-readiness receipt door IN FRONT of the
+    production driver factory (its own refusal is pinned as ``EXIT_ERROR`` by
+    ``test_run_and_resume_refuse_without_current_readiness_receipt``). This
+    test's subject is the DISTINCTNESS of the review and outage exits behind
+    that door, so the readiness gate is stubbed open here.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    driver = _driver(tmp_path, snapshot, review_at=1)
+
+    assert (
+        cli_main(
+            ["--repo-root", str(tmp_path), "run"],
+            driver_factory=lambda _args: driver,
+        )
+        == cli_module.EXIT_REVIEW_PAUSED
+    )
+    monkeypatch.setattr(
+        cli_module, "_require_environment_readiness_receipt", lambda _args: None
+    )
+    assert cli_main(["--repo-root", str(tmp_path), "run"]) == cli_module.EXIT_OPERATOR_OUTAGE
+    error = json.loads(capsys.readouterr().err)
+    assert error["status"] == "operator-outage"
+
+
+class _FakeArtifactLedger:
+    """One exclusively locked artifact shard with an append generation."""
+
+    def __init__(self, path: Path, events: list[dict[str, object]]) -> None:
+        """Bind this shard's path and complete in-memory event history."""
+
+        self.path = path
+        self._events = events
+
+    @property
+    def event_count(self) -> int:
+        """Return the append generation."""
+
+        return len(self._events)
+
+    def events_since(self, index: int) -> tuple[dict[str, object], ...]:
+        """Return the exact appended suffix after ``index``."""
+
+        return tuple(self._events[index:])
+
+
+class _FakeReducer:
+    """Minimal reducer surface consumed by checkpoint validation."""
+
+    def __init__(self, ledger: _FakeArtifactLedger) -> None:
+        """Bind one locked artifact ledger and its trust roots."""
+
+        self.artifact_ledger = ledger
+        self.context = object()
+
+
+class _FakeIncrement:
+    """Recorded stand-in for the incremental checkpoint fold."""
+
+    instances: list["_FakeIncrement"] = []
+
+    def __init__(self, projection: object) -> None:
+        """Bind the projection every fold step returns."""
+
+        self.projection = projection
+        self.start_calls: list[dict[str, object]] = []
+        self.advances: list[tuple[dict[str, object], ...]] = []
+
+    def bind(self, monkeypatch: pytest.MonkeyPatch) -> "_FakeIncrement":
+        """Install this fake as the driver's increment factory."""
+
+        fake = self
+
+        class Factory:
+            """Increment factory recording its full-validation starts."""
+
+            @staticmethod
+            def start(paths: object, **kwargs: object) -> "_FakeIncrement":
+                fake.start_calls.append({"paths": paths, **kwargs})
+                return fake
+
+        monkeypatch.setattr(driver_admission_module, "ArtifactCheckpointIncrement", Factory)
+        return fake
+
+    def advance(self, events: tuple[dict[str, object], ...]) -> object:
+        """Fold one appended suffix."""
+
+        self.advances.append(events)
+        return self.projection
+
+
+def test_artifact_validation_cache_serves_reserve_and_incremental_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default-on cache: full once, reserve on no growth, incremental on append."""
+
+    driver = _driver(tmp_path, _snapshot(tmp_path, count=1))
+    events: list[dict[str, object]] = [{"ledger_seq": index} for index in range(4)]
+    ledger = _FakeArtifactLedger(driver.paths.ledgers.artifacts, events)
+    fake = _FakeIncrement(object()).bind(monkeypatch)
+    monkeypatch.delenv("MENAGERIE_CRAWLER_ARTIFACT_MEMOIZATION", raising=False)
+    mirrors = MirrorStore(
+        tmp_path / "mirrors" / "public",
+        tmp_path / "mirrors" / "private",
+        tmp_path / "mirrors" / "local",
+    )
+    kwargs = {
+        "artifact_paths": (driver.paths.ledgers.artifacts,),
+        "mirrors": mirrors,
+        "canonical_root": tmp_path,
+        "repository_root": tmp_path,
+    }
+
+    first, first_mode = driver._validated_artifact_projection(_FakeReducer(ledger), **kwargs)
+    second, second_mode = driver._validated_artifact_projection(_FakeReducer(ledger), **kwargs)
+    events.append({"ledger_seq": 4})
+    third, third_mode = driver._validated_artifact_projection(_FakeReducer(ledger), **kwargs)
+
+    assert first is fake.projection and second is fake.projection and third is fake.projection
+    assert (first_mode, second_mode, third_mode) == ("full", "reserve-hit", "incremental")
+    assert len(fake.start_calls) == 1
+    assert fake.advances == [({"ledger_seq": 4},)]
+    # The persistent memo travels with every full validation start.
+    assert fake.start_calls[0].get("memo") is not None
+
+
+def test_artifact_validation_cache_kill_switch_restores_todays_behavior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MENAGERIE_CRAWLER_ARTIFACT_MEMOIZATION=0 disables every cache layer."""
+
+    driver = _driver(tmp_path, _snapshot(tmp_path, count=1))
+    events: list[dict[str, object]] = [{"ledger_seq": index} for index in range(4)]
+    ledger = _FakeArtifactLedger(driver.paths.ledgers.artifacts, events)
+    calls: list[int] = []
+    projection = object()
+
+    def fake_validate(*_args: object, **kwargs: object) -> object:
+        """Record each full checkpoint validation and refuse memo plumbing."""
+
+        assert "memo" not in kwargs or kwargs["memo"] is None
+        calls.append(len(calls))
+        return projection
+
+    monkeypatch.setenv("MENAGERIE_CRAWLER_ARTIFACT_MEMOIZATION", "0")
+    monkeypatch.setattr(driver_admission_module, "validate_artifact_checkpoint", fake_validate)
+    mirrors = MirrorStore(
+        tmp_path / "mirrors" / "public",
+        tmp_path / "mirrors" / "private",
+        tmp_path / "mirrors" / "local",
+    )
+    kwargs = {
+        "artifact_paths": (driver.paths.ledgers.artifacts,),
+        "mirrors": mirrors,
+        "canonical_root": tmp_path,
+        "repository_root": tmp_path,
+    }
+
+    first, first_mode = driver._validated_artifact_projection(_FakeReducer(ledger), **kwargs)
+    second, second_mode = driver._validated_artifact_projection(_FakeReducer(ledger), **kwargs)
+
+    assert first is projection and second is projection
+    assert (first_mode, second_mode) == ("full", "full")
+    assert calls == [0, 1]
+
+
+def test_incremental_advance_failure_falls_back_to_full_live_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An advance refusal is treated as a cache death: full live wins."""
+
+    driver = _driver(tmp_path, _snapshot(tmp_path, count=1))
+    events: list[dict[str, object]] = [{"ledger_seq": index} for index in range(2)]
+    ledger = _FakeArtifactLedger(driver.paths.ledgers.artifacts, events)
+    fake = _FakeIncrement(object()).bind(monkeypatch)
+
+    def failing_advance(_events: object) -> object:
+        """Refuse the fold like a genuine incremental defect."""
+
+        raise ArtifactCheckpointError("incremental fold refused")
+
+    monkeypatch.setattr(fake, "advance", failing_advance)
+    monkeypatch.delenv("MENAGERIE_CRAWLER_ARTIFACT_MEMOIZATION", raising=False)
+    mirrors = MirrorStore(
+        tmp_path / "mirrors" / "public",
+        tmp_path / "mirrors" / "private",
+        tmp_path / "mirrors" / "local",
+    )
+    kwargs = {
+        "artifact_paths": (driver.paths.ledgers.artifacts,),
+        "mirrors": mirrors,
+        "canonical_root": tmp_path,
+        "repository_root": tmp_path,
+    }
+
+    _projection, first_mode = driver._validated_artifact_projection(_FakeReducer(ledger), **kwargs)
+    events.append({"ledger_seq": 2})
+    result, fallback_mode = driver._validated_artifact_projection(_FakeReducer(ledger), **kwargs)
+
+    assert (first_mode, fallback_mode) == ("full", "full")
+    assert result is fake.projection
+    assert len(fake.start_calls) == 2
+    cache_events = scan_jsonl(
+        driver.paths.runtime_root / "instrumentation" / "ledger-hot-path.jsonl",
+        validate=False,
+    )
+    assert any(
+        row.get("metric") == "checkpoint-cache-event"
+        and row.get("reason") == "incremental-advance-failed"
+        for row in cache_events
+    )
+
+
+def test_shadow_verify_divergence_fails_loud_toward_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify mode compares every incremental fold against full live derivation."""
+
+    driver = _driver(tmp_path, _snapshot(tmp_path, count=1))
+    events: list[dict[str, object]] = [{"ledger_seq": 0}]
+    ledger = _FakeArtifactLedger(driver.paths.ledgers.artifacts, events)
+    _FakeIncrement(object()).bind(monkeypatch)
+    live_projection = object()
+    monkeypatch.setattr(
+        driver_admission_module,
+        "validate_artifact_checkpoint",
+        lambda *args, **kwargs: live_projection,
+    )
+    monkeypatch.delenv("MENAGERIE_CRAWLER_ARTIFACT_MEMOIZATION", raising=False)
+    monkeypatch.setenv("MENAGERIE_CRAWLER_CHECKPOINT_CACHE_VERIFY", "1")
+    mirrors = MirrorStore(
+        tmp_path / "mirrors" / "public",
+        tmp_path / "mirrors" / "private",
+        tmp_path / "mirrors" / "local",
+    )
+    kwargs = {
+        "artifact_paths": (driver.paths.ledgers.artifacts,),
+        "mirrors": mirrors,
+        "canonical_root": tmp_path,
+        "repository_root": tmp_path,
+    }
+
+    _projection, _mode = driver._validated_artifact_projection(_FakeReducer(ledger), **kwargs)
+    events.append({"ledger_seq": 1})
+    result, mode = driver._validated_artifact_projection(_FakeReducer(ledger), **kwargs)
+
+    assert result is live_projection and mode == "full"
+    cache_events = scan_jsonl(
+        driver.paths.runtime_root / "instrumentation" / "ledger-hot-path.jsonl",
+        validate=False,
+    )
+    assert any(
+        row.get("metric") == "checkpoint-cache-event"
+        and row.get("reason") == "incremental-divergence"
+        for row in cache_events
+    )
+
+
+def test_artifact_validation_cache_never_crosses_ledgers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An append generation only excuses revalidation for its own locked ledger."""
+
+    driver = _driver(tmp_path, _snapshot(tmp_path, count=1))
+    fake = _FakeIncrement(object()).bind(monkeypatch)
+    monkeypatch.delenv("MENAGERIE_CRAWLER_ARTIFACT_MEMOIZATION", raising=False)
+    mirrors = MirrorStore(
+        tmp_path / "mirrors" / "public",
+        tmp_path / "mirrors" / "private",
+        tmp_path / "mirrors" / "local",
+    )
+    kwargs = {
+        "artifact_paths": (driver.paths.ledgers.artifacts,),
+        "mirrors": mirrors,
+        "canonical_root": tmp_path,
+        "repository_root": tmp_path,
+    }
+    events = [{"ledger_seq": index} for index in range(4)]
+    first_ledger = _FakeArtifactLedger(driver.paths.ledgers.artifacts, list(events))
+    second_ledger = _FakeArtifactLedger(driver.paths.ledgers.artifacts, list(events))
+
+    _projection, cold_mode = driver._validated_artifact_projection(
+        _FakeReducer(first_ledger), **kwargs
+    )
+    _projection, same_ledger_mode = driver._validated_artifact_projection(
+        _FakeReducer(first_ledger), **kwargs
+    )
+    _projection, foreign_ledger_mode = driver._validated_artifact_projection(
+        _FakeReducer(second_ledger), **kwargs
+    )
+
+    assert (cold_mode, same_ledger_mode, foreign_ledger_mode) == (
+        "full",
+        "reserve-hit",
+        "full",
+    )
+    assert len(fake.start_calls) == 2
+    assert fake.advances == []
+
+
+def test_ledger_hot_path_metrics_report_positive_terminal_slope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-model authority timing exposes a positive slope against terminal count."""
+
+    monkeypatch.delenv("MENAGERIE_CRAWLER_ARTIFACT_MEMOIZATION", raising=False)
+    driver = _driver(tmp_path, _snapshot(tmp_path, count=1))
+    driver._record_ledger_hot_path_metric(
+        terminal_count=10,
+        elapsed_seconds=0.1,
+        artifact_event_count=4,
+        checkpoint_cache_mode="full",
+    )
+    driver._record_ledger_hot_path_metric(
+        terminal_count=20,
+        elapsed_seconds=0.2,
+        artifact_event_count=4,
+        checkpoint_cache_mode="reserve-hit",
+    )
+
+    metrics = scan_jsonl(
+        driver.paths.runtime_root / "instrumentation" / "ledger-hot-path.jsonl",
+        validate=False,
+    )
+    assert metrics[-1]["slope_seconds_per_terminal"] == pytest.approx(0.01)
+    assert metrics[-1]["positive_slope_detected"] is True
+    # The instrumentation is honest by default: the cache exists and is on.
+    assert [row["checkpoint_cache_enabled"] for row in metrics] == [True, True]
+    assert [row["checkpoint_cache_hit"] for row in metrics] == [False, True]
+    assert [row["checkpoint_cache_mode"] for row in metrics] == ["full", "reserve-hit"]
+
+
+def test_scheduled_wake_not_before_guard_does_not_run_driver(tmp_path: Path) -> None:
+    """An early recurring callback remains active and exits before driver work."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    driver = _driver(tmp_path, snapshot)
+
+    class GuardedDriverFactory:
+        """Return a driver that must not run before the episode guard."""
+
+        def __call__(self, args: argparse.Namespace) -> CrawlerDriver:
+            """Return the guarded driver."""
+
+            assert args.wake_episode_id == scheduled.episode.episode_id
+            return driver
+
+    event_path = canonical_operational_ledger_path(driver.paths.ledgers.models)
+    with JsonlLedger(event_path, OPERATIONAL_EVENT_SCHEMA_VERSION) as ledger:
+        scheduled = WakeupManager(
+            driver.paths.wakeup_root,
+            ledger,
+            ["python", "-m", "menagerie.crawler", "run", "--resume"],
+            backend=WakeupBackend.CRON,
+            installer=lambda _definition: None,
+            verifier=lambda _definition: True,
+        ).record_pause_and_schedule(
+            provider="openai",
+            observed_response="quota exhausted",
+            reset_at="2099-01-01T00:00:00Z",
+            context=OperationalContext("driver-run", "test-machine", {"models": 1}, None),
+            created_at=NOW,
+        )
+    argv = [
+        "--repo-root",
+        str(tmp_path),
+        "run",
+        "--wake-episode-id",
+        scheduled.episode.episode_id,
+    ]
+    assert cli_main(argv, driver_factory=GuardedDriverFactory()) == 0
+    assert scan_jsonl(driver.paths.ledgers.models) == []
+    projection = reduce_wake_episodes(scan_jsonl(event_path))
+    assert projection.episodes[scheduled.episode.episode_id].active
+
+
+def test_live_driver_ingests_scheduled_wake_intent_without_deactivation(tmp_path: Path) -> None:
+    """The single writer turns a contention intent into visible fire/no-op facts."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    driver = _driver(tmp_path, snapshot)
+
+    class LockedDriverFactory:
+        """Return the same driver while its authoritative driver lock is live."""
+
+        def __call__(self, _args: argparse.Namespace) -> CrawlerDriver:
+            """Return the lock-contending driver."""
+
+            return driver
+
+    event_path = canonical_operational_ledger_path(driver.paths.ledgers.models)
+    context = OperationalContext("driver-run", "test-machine", {"models": 1}, None)
+    with JsonlLedger(event_path, OPERATIONAL_EVENT_SCHEMA_VERSION) as ledger:
+        manager = WakeupManager(
+            driver.paths.wakeup_root,
+            ledger,
+            ["python", "-m", "menagerie.crawler", "run", "--resume"],
+            backend=WakeupBackend.CRON,
+            installer=lambda _definition: None,
+            verifier=lambda _definition: True,
+        )
+        scheduled = manager.record_pause_and_schedule(
+            provider="openai",
+            observed_response="quota exhausted",
+            reset_at=NOW,
+            context=context,
+            created_at=NOW,
+        )
+    argv = [
+        "--repo-root",
+        str(tmp_path),
+        "run",
+        "--wake-episode-id",
+        scheduled.episode.episode_id,
+    ]
+    with DriverLock(driver.paths.lock_path, {"pid": 1}):
+        assert cli_main(argv, driver_factory=LockedDriverFactory()) == 0
+    with JsonlLedger(event_path, OPERATIONAL_EVENT_SCHEMA_VERSION) as ledger:
+        manager = WakeupManager(
+            driver.paths.wakeup_root,
+            ledger,
+            scheduled.episode.callback_argv,
+            backend=WakeupBackend.CRON,
+            installer=lambda _definition: None,
+            verifier=lambda _definition: True,
+        )
+        assert manager.ingest_fire_intents(context=context, created_at=NOW) == 1
+        assert manager.projection.episodes[scheduled.episode.episode_id].active
+    kinds = [event["event_kind"] for event in scan_jsonl(event_path)]
+    assert kinds.count("wakeup-fired") == 1
+    assert kinds.count("wake-noop-already-running") == 1
+    assert "usage-resume" not in kinds
+    assert "wakeup-deactivated" not in kinds
+
+
+def test_empty_milestones_and_missing_notifier_never_block(tmp_path: Path) -> None:
+    """No milestones means no pings; a missing notifier remains a nonfatal fallback."""
+
+    snapshot = _snapshot(tmp_path)
+    result = _driver(tmp_path, snapshot, milestones=()).run()
+    assert result.status == "complete"
+    events = scan_jsonl(_paths(tmp_path, snapshot).operational_ledger)
+    assert all(event["event_kind"] != "progress-notification" for event in events)
+    assert (
+        CommandNotifier("/definitely/missing/send-to-jmt.sh").notify(
+            "milestone 1", idempotency_key=HASH
+        )
+        is False
+    )
+
+
+def test_resolve_notify_command_falls_back_to_claude_scripts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The auto-discovery search path must reach ``~/.claude/scripts/``.
+
+    ``send-to-jmt.sh`` is not on PATH and neither ``~/scripts/`` nor ``~/bin/``
+    holds it on this machine's real notifier layout -- only
+    ``~/.claude/scripts/send-to-jmt.sh`` does. A silent miss here means a
+    stalled campaign produces no notification at all, since ``CommandNotifier``
+    is deliberately best-effort and never raises.
+
+    The resolved default is now the ``operator_notify`` receipt shim wrapping that same
+    discovered transport: the search order is what this test pins, and the shim is what
+    lets the strict doctor tell a delivered notification from a merely present script.
+    """
+
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    claude_script = tmp_path / ".claude" / "scripts" / "send-to-jmt.sh"
+    claude_script.parent.mkdir(parents=True)
+    claude_script.write_text("#!/bin/sh\nexit 0\n")
+    claude_script.chmod(claude_script.stat().st_mode | 0o111)
+
+    resolved = _resolve_notify_command(None)
+    assert resolved is not None
+    assert resolved[1:4] == ("-m", "menagerie.crawler.operator_notify", "--transport")
+    assert resolved[4] == str(claude_script)
+
+
+def test_resolve_notify_command_prefers_scripts_and_bin_over_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-existing ``~/scripts/`` and ``~/bin/`` candidates still win first."""
+
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for parent in ("scripts", "bin", os.path.join(".claude", "scripts")):
+        script = tmp_path / parent / "send-to-jmt.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(script.stat().st_mode | 0o111)
+
+    resolved = _resolve_notify_command(None)
+    assert resolved is not None
+    assert resolved[4] == str(tmp_path / "scripts" / "send-to-jmt.sh")
+
+
+def test_resolve_notify_command_missing_everywhere_is_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No candidate anywhere still degrades to the log-only fallback, not a crash."""
+
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    assert _resolve_notify_command(None) is None
+
+
+def test_failed_forward_terminalizes_and_campaign_continues(tmp_path: Path) -> None:
+    """One failed forward records its real error while later models still run."""
+
+    snapshot = _snapshot(tmp_path)
+    failed_id = snapshot.items[0].stable_id
+    result = _driver(
+        tmp_path,
+        snapshot,
+        forward=ScriptedForward(ForwardScript(failed_id=failed_id)),
+    ).run()
+    # An evidenced failed:forward outcome is terminal; it leaves no campaign work pending.
+    assert result.status == "complete"
+    paths = _paths(tmp_path, snapshot)
+    models = {record["stable_id"]: record for record in scan_jsonl(paths.ledgers.models)}
+    assert models[failed_id]["status"]["code"] == "failed:forward"
+    assert len(models) == len(snapshot.items)
+    assert any(record["status"]["code"] == "runs" for record in models.values())
+    failed_attempt = next(
+        record
+        for record in scan_jsonl(paths.ledgers.attempts)
+        if record["stable_id"] == failed_id and record["result"] == "failed"
+    )
+    assert failed_attempt["stage"] == "forward"
+    error = failed_attempt["error"]
+    assert {key: value for key, value in error.items() if key not in {"message", "traceback"}} == {
+        "stage": "forward",
+        "reason_code": "mode-run",
+        "exception_type": "builtins.RuntimeError",
+        "no_traceback_reason": None,
+        "native_crash": False,
+        "root_cause_fingerprint": HASH,
+        "details": {"mode": failed_attempt["mode"]},
+    }
+    assert error["message"]["redaction"] == "externally-controlled-text-v1"
+    assert error["traceback"]["redaction"] == "externally-controlled-text-v1"
+    sidecar_path = next(tmp_path.rglob(Path(error["message"]["local_path"]).name))
+    sidecar_text = sidecar_path.read_text(encoding="utf-8")
+    assert "synthetic forward failure" in sidecar_text
+
+
+def test_author_failure_without_source_is_honest_and_later_models_continue(
+    tmp_path: Path,
+) -> None:
+    """A source-less author failure stays visible instead of receiving a stand-in URL."""
+
+    snapshot = _snapshot(tmp_path, count=20)
+    failed_id = snapshot.items[0].stable_id
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=ScriptedAuthor(AuthorScript(failed_id=failed_id)),
+    ).run()
+    assert result.status == "terminal-partition-complete"
+    models = {
+        record["stable_id"]: record
+        for record in scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    }
+    # The author session failed; nothing established that the model's source does
+    # not exist, so the failure is owned by the author stage rather than asserting
+    # an unresolved identity.
+    assert models[failed_id]["status"]["code"] == "failed:author"
+    assert models[failed_id]["status"]["reason_code"] == "session-crashed"
+    assert sum(record["status"]["code"] == "runs" for record in models.values()) == 19
+    assert models[failed_id]["source_resolution"]["sources"] == []
+    assert models[failed_id]["source_resolution"]["mandatory_link_status"] == "failed"
+    assert models[failed_id]["completeness"]["mandatory_source_present"] is False
+    assert (
+        models[failed_id]["implementation"]["torchlens_import_static_check"]
+        == "not-applicable-no-code"
+    )
+
+
+class ContractInvalidExitAuthor(FakeAuthor):
+    """One model's executor relays the verbatim rung-5 exit-75 contract refusal.
+
+    The failing model drives the REAL ``classify_author_exit`` with the exact
+    structured stderr the author executor emitted on 2026-07-27 for m4066, so
+    the test exercises the production classification rather than a hand-built
+    exception.
+    """
+
+    def __init__(self, failed_id: str) -> None:
+        """Record which scheduled model publishes contract-invalid payloads."""
+
+        super().__init__()
+        self.failed_id = failed_id
+
+    def author(
+        self,
+        item: WorkItem,
+        work_root: Path,
+        config: DriverConfig,
+        context: AuthorityContext,
+    ) -> AuthorArtifact:
+        """Relay the executor's typed refusal for the one failing model."""
+
+        if item.stable_id == self.failed_id:
+            self.calls[item.stable_id] = self.calls.get(item.stable_id, 0) + 1
+            classify_author_exit(
+                "author",
+                item.stable_id,
+                75,
+                "",
+                "author executor stage2 failed: result-contract-invalid "
+                "(attempt 810e0dd00ddc472baeba4bec6cab653c)",
+            )
+            raise AssertionError("classify_author_exit accepted a nonzero author exit")
+        return super().author(item, work_root, config, context)
+
+
+class TransportFailingAuthor(FakeAuthor):
+    """One model's author dispatch dies with genuine campaign-scoped transport."""
+
+    def __init__(self, failed_id: str) -> None:
+        """Record which scheduled model's transport persistently fails."""
+
+        super().__init__()
+        self.failed_id = failed_id
+
+    def author(
+        self,
+        item: WorkItem,
+        work_root: Path,
+        config: DriverConfig,
+        context: AuthorityContext,
+    ) -> AuthorArtifact:
+        """Fail the one model with the transport type the campaign must not absorb."""
+
+        if item.stable_id == self.failed_id:
+            raise RetryableOperatorError(
+                f"author command failed for {item.stable_id} (exit 75): socket reset"
+            )
+        return super().author(item, work_root, config, context)
+
+
+@pytest.mark.smoke
+def test_classify_author_exit_scopes_published_contract_refusals_to_the_model() -> None:
+    """The executor's refusal of PUBLISHED payload bytes indicts the model, not the machine.
+
+    Exit 75 with a structured ``*-contract-invalid`` / ``result-not-json`` line
+    means a session ran to completion and what it published failed the frozen
+    contract -- evidence confined to one model's authoring. Typing that as
+    ``RetryableOperatorError`` let one schema-invalid author result terminate a
+    whole 20-model rung with zero records written (2026-07-27, m4066). Sessions
+    that died WITHOUT publishing stay campaign-scoped transport, and the two
+    provider-outage arms keep their own promotable types.
+    """
+
+    for line in (
+        "author executor stage1 failed: discovery-contract-invalid (attempt aa)",
+        "author executor stage2 failed: result-not-json (attempt aa)",
+        "author executor stage2 failed: result-contract-invalid (attempt aa)",
+    ):
+        with pytest.raises(AuthorExecutorContractError) as raised:
+            classify_author_exit("author", "m4066", 75, "", line)
+        assert not isinstance(raised.value, RetryableOperatorError)
+        assert raised.value.stable_id == "m4066"
+        # The model-local terminal names the author's content, never a dead session.
+        assert _author_lane_failure(raised.value) == ("author", "malformed-result")
+    # A session that died without publishing is indistinguishable from broken
+    # infrastructure and must keep its campaign-scoped classification.
+    with pytest.raises(RetryableOperatorError):
+        classify_author_exit(
+            "author",
+            "m4066",
+            75,
+            "",
+            "author executor stage2 failed: session-crashed (attempt aa)",
+        )
+    # The streak-promotable outage arms are unchanged.
+    with pytest.raises(ResearchToolsUnavailableError):
+        classify_author_exit(
+            "source-request",
+            "m4066",
+            75,
+            "",
+            "author executor stage1 failed: research-tools-unavailable (attempt aa)",
+        )
+
+
+def test_one_contract_invalid_author_result_cannot_abort_the_campaign(
+    tmp_path: Path,
+) -> None:
+    """The rung-5 abort, replayed: one invalid author result must cost one model.
+
+    On 2026-07-27 a 20-model rung dispatched 22 author attempts and published 18
+    good results, then m4066's two sessions each published schema-invalid
+    payloads; the executor's exit-75 refusal was classified campaign-scoped
+    transport, so the run terminated with ZERO terminal records, ZERO gates, and
+    ZERO ledger rows. This drives the same refusal through the same classifier
+    and asserts the blast radius is the model: the siblings all land in the
+    ledger, and the failing model gets an honest author-owned terminal after its
+    one bounded fresh session.
+    """
+
+    snapshot = _snapshot(tmp_path, count=6)
+    failed_id = snapshot.items[0].stable_id
+    author = ContractInvalidExitAuthor(failed_id)
+
+    result = _driver(tmp_path, snapshot, author=author).run()
+
+    assert result.status == "terminal-partition-complete"
+    models = {
+        record["stable_id"]: record
+        for record in scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    }
+    # Every sibling completed and was recorded.
+    assert sum(record["status"]["code"] == "runs" for record in models.values()) == 5
+    # The refusal still fired -- the model is failed, honestly, as the author's
+    # published content, not as a dead session and not as an engine fault.
+    assert models[failed_id]["status"]["code"] == "failed:author"
+    assert models[failed_id]["status"]["reason_code"] == "malformed-result"
+    # One bounded fresh session was granted before the model-local terminal:
+    # exactly the two per-run author attempts the aborting run also spent.
+    assert author.calls[failed_id] == 2
+
+
+def test_genuine_transport_failure_still_halts_the_campaign(tmp_path: Path) -> None:
+    """The boundary moved; it did not dissolve.
+
+    A persistent ``RetryableOperatorError`` that is NOT an executor contract
+    refusal -- a spawn or socket failure -- is evidence about the machine, and
+    terminalizing models into it would burn good models on a broken host. With
+    NO contemporaneous same-lane publication (the failing model is the first
+    authored, serially), the lane-health boundary has no witness that the host
+    works, so the run must still unwind LOUD for the scheduler to retry.
+    """
+
+    snapshot = _snapshot(tmp_path, count=3)
+    failed_id = snapshot.items[0].stable_id
+
+    with pytest.raises(RetryableOperatorError):
+        _driver(
+            tmp_path,
+            snapshot,
+            author=TransportFailingAuthor(failed_id),
+            author_concurrency=1,
+        ).run()
+
+
+def test_fetch_contract_rejection_terminalizes_with_its_own_reason(tmp_path: Path) -> None:
+    """The operator is told the pinned target was rejected, not that identity is unknown.
+
+    Parameters
+    ----------
+    tmp_path:
+        Campaign root for this driver run.
+    """
+
+    class _UnpinnedAuthor(ScriptedAuthor):
+        """Fail exactly one model the way the controlled fetcher rejects a target."""
+
+        def author(
+            self,
+            item: WorkItem,
+            work_root: Path,
+            config: DriverConfig,
+            context: AuthorityContext,
+        ) -> AuthorArtifact:
+            """Raise the fetch-contract rejection for the scripted model.
+
+            Parameters
+            ----------
+            item, work_root, config, context:
+                Standard author-lane arguments.
+
+            Returns
+            -------
+            AuthorArtifact
+                Canonical synthetic artifact for every other model.
+            """
+
+            if item.stable_id == self.script.failed_id:
+                raise UnpinnedTargetError(
+                    "expected_sha256 must be sha256:<64 hex> or <64 hex>, or omitted when unknown"
+                )
+            return super().author(item, work_root, config, context)
+
+    snapshot = _snapshot(tmp_path, count=3)
+    failed_id = snapshot.items[0].stable_id
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=_UnpinnedAuthor(AuthorScript(failed_id=failed_id)),
+    ).run()
+
+    assert result.status == "terminal-partition-complete"
+    models = {
+        record["stable_id"]: record
+        for record in scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    }
+    status = models[failed_id]["status"]
+    assert status["code"] == "failed:source"
+    assert status["reason_code"] == "source-target-invalid"
+    assert status["stage"] == "source"
+    assert sum(record["status"]["code"] == "runs" for record in models.values()) == 2
+
+
+def test_author_failure_retains_exact_intake_discovery_url(tmp_path: Path) -> None:
+    """A pre-author terminal uses its model's retained intake URL, never a stand-in."""
+
+    master = tmp_path / "source-master.jsonl"
+    deferred = tmp_path / "source-deferred.jsonl"
+    source_url = "https://example.com/intake-model"
+    _write_jsonl(
+        master,
+        [
+            {
+                "name": "IntakeSourceModel",
+                "zoo": "pytorch",
+                "variant": "base",
+                "source_url": source_url,
+            }
+        ],
+    )
+    _write_jsonl(deferred, [])
+    snapshot = create_intake_snapshot(master, deferred, tmp_path / "source-intake")
+    failed_id = snapshot.items[0].stable_id
+
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=ScriptedAuthor(AuthorScript(failed_id=failed_id)),
+    ).run()
+
+    assert result.status == "complete"
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[-1]
+    # The retained discovery URL preserves source provenance, but it does not
+    # turn a failed author session into a runner observation.
+    assert model["status"]["code"] == "failed:author"
+    assert model["status"]["reason_code"] == "session-crashed"
+    assert model["source_resolution"]["mandatory_link_status"] == "ok"
+    assert model["source_resolution"]["sources"] == [
+        {
+            "source_id": "intake-discovery-record",
+            "role": "documentation",
+            "kind": "intake-snapshot",
+            "url": source_url,
+            "revision_kind": "legacy-row-sha256",
+            "revision": snapshot.items[0].legacy_row_sha256,
+            "locator": "natural-key:('IntakeSourceModel', 'pytorch', 'base')",
+            "content_sha256": None,
+            "byte_count": 0,
+            "media_type": "application/json",
+            "retrieved_at": model["created_at"],
+            "fetch_recipe": "immutable-intake-discovery-lead",
+            "mirror_class": "public",
+            "mirror_digest": None,
+        }
+    ]
+    assert model["completeness"]["mandatory_source_present"] is True
+
+
+def test_mode_normalization_failure_terminalizes_and_continues(tmp_path: Path) -> None:
+    """A schema-invalid v3 author result fails one model without aborting the phase tail."""
+
+    snapshot = _snapshot(tmp_path, count=10)
+    failed_id = snapshot.items[0].stable_id
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=ScriptedAuthor(AuthorScript(invalid_modes_id=failed_id)),
+    ).run()
+
+    assert result.status == "terminal-partition-complete"
+    models = {
+        record["stable_id"]: record
+        for record in scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    }
+    # The v3 result union rejects the malformed mode before it can become a
+    # staged proposal or runner input. The author emitted an invalid result, so
+    # the failure is author-owned; claiming the source could not be identified
+    # would be a fact this run never established. The reason is the PUBLISHED
+    # content's, not a session death: `session-crashed` here was the historical
+    # catch-all, and rung 7 (m9617) showed it permanently misrecording a session
+    # that ran to a clean published result.
+    assert models[failed_id]["status"]["code"] == "failed:author"
+    assert models[failed_id]["status"]["reason_code"] == "malformed-result"
+    assert sum(record["status"]["code"] == "runs" for record in models.values()) == 9
+
+
+def test_repair_author_machinery_failure_parks_and_never_mints_a_verdict(
+    tmp_path: Path,
+) -> None:
+    """A machinery fault in one repair generation never mints a model verdict.
+
+    Pre-DX-1 contract: this exact scenario drained the model to ``failed:runner
+    / internal-error`` -- a machinery fault settling a model's head (the m12446
+    class; 19 false runner verdicts in 200a). Under the mint-sink ownership
+    guard the fault PARKS: the member settles each leg machine-deferred (the
+    quarantine's bounded retry is fresh-leg only, so no in-window head can land
+    beside the live row -- the LC-1 pinned close contradiction stays
+    unreachable). This fixture's repair dies identically on EVERY leg, so the
+    bounded fresh-leg retry re-parks it and the recidivism cap then holds the
+    row for an operator -- disclosed weather forever, a false verdict never.
+    """
+
+    from menagerie.crawler.scheduler_parks import (
+        load_scheduler_quarantine_rows,
+        scheduler_quarantine_path,
+    )
+
+    snapshot = _snapshot(tmp_path, count=10)
+    failed_id = snapshot.items[0].stable_id
+    author = ScriptedAuthor(
+        AuthorScript(
+            failed_id=failed_id,
+            failure_message="synthetic repair author failure",
+            failed_call=2,
+        )
+    )
+    checker = ScriptedChecker(
+        script=CheckerScript(
+            metadata_verdict="inaccurate",
+            selected_id=failed_id,
+            required_repair="repair selected model",
+            field_repair="repair selected model",
+        )
+    )
+    first = _driver(tmp_path, snapshot, author=author, checker=checker).run()
+
+    # Leg 1: the machinery fault parks the member; no verdict exists, the
+    # sibling members award normally, and the leg closes with the deferral.
+    assert first.status == "complete-with-deferrals"
+    paths = _paths(tmp_path, snapshot)
+    models = {record["stable_id"]: record for record in scan_jsonl(paths.ledgers.models)}
+    assert failed_id not in models, "a machinery fault must not settle the member"
+    assert models, "sibling members still award in the same leg"
+    assert all(record["status"]["code"] == "runs" for record in models.values())
+    records_root = paths.ledgers.models.parent.parent
+    quarantines = load_scheduler_quarantine_rows([scheduler_quarantine_path(records_root)])
+    assert {row["stable_id"] for row in quarantines} == {failed_id}
+    parked_events = [
+        event
+        for event in scan_jsonl(paths.operational_ledger)
+        if event.get("details", {}).get("disposition") == "non-model-fault-parked"
+        and event.get("details", {}).get("stable_id") == failed_id
+    ]
+    assert parked_events, "the machinery fault must stay disclosed"
+
+    # Leg 2: the fresh-leg bounded retry re-drives the repair, which dies
+    # identically -- the member re-parks with the fault disclosed again, and
+    # still no verdict exists. No leg ever contradicts itself at close.
+    second = _driver(tmp_path, snapshot, author=author, checker=checker).run()
+    assert second.status == "complete-with-deferrals"
+    models = {record["stable_id"]: record for record in scan_jsonl(paths.ledgers.models)}
+    assert failed_id not in models, "the persistent machinery fault stays a park"
+
+
+def test_a_repair_generation_may_answer_with_a_terminal_recommendation(
+    tmp_path: Path,
+) -> None:
+    """The author's terminal answer to a repair is adjudicated, not called a violation.
+
+    Verbatim from pilot rung 3 (``a74c4d48``): ``m5888`` was asked to repair ONE
+    field -- "Replace external_metadata.availability.predecessors ... with the
+    source-established Mixtral predecessor/lineage" -- re-read its frozen sources,
+    and returned a ``BLOCKED`` recommendation carrying six grounded excerpts
+    showing the library default is not the published architecture. That result
+    parses cleanly through the production v3 parser as a ``BlockedRecommendation``.
+    The driver recorded it as ``failed:runner / protocol-violation`` and discarded
+    the verdict, because ``_repair_author`` raised ``DriverIntegrationError`` on
+    any non-proposal arm.
+
+    The same run contains the control: ``m3671`` returned an equally well-formed
+    ``BLOCKED`` on its FIRST author call and was adjudicated by the
+    terminal-disposition gate. Same code, same rung, same recommendation quality --
+    the only difference was which author call produced it. This asserts the two
+    arms now agree.
+    """
+
+    snapshot = _snapshot(tmp_path, count=10)
+    repaired_id = snapshot.items[0].stable_id
+    author = ScriptedAuthor(
+        AuthorScript(
+            terminal_outcomes=(("platform", "cuda"),),
+            terminal_id=repaired_id,
+            terminal_call=2,
+        )
+    )
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=author,
+        checker=ScriptedChecker(
+            script=CheckerScript(
+                metadata_verdict="inaccurate",
+                selected_id=repaired_id,
+                required_repair="repair selected model",
+                field_repair="repair selected model",
+            )
+        ),
+    ).run()
+
+    assert result.status == "complete"
+    assert author.calls[repaired_id] == 2, "the repair generation must have run"
+    paths = _paths(tmp_path, snapshot)
+    models = {record["stable_id"]: record for record in scan_jsonl(paths.ledgers.models)}
+    status = models[repaired_id]["status"]
+    assert status["code"] == "deferred:needs-cuda", (
+        "a typed terminal recommendation from a repair generation must reach the "
+        "record as the disposition it is"
+    )
+    assert status["code"] != "failed:runner"
+    assert status["reason_code"] is None
+    # The verdict was ADJUDICATED, not merely relabeled: the terminal-disposition
+    # gate the first-call arm uses must have run for this model too.
+    terminal_gates = [
+        gate
+        for gate in scan_jsonl(paths.ledgers.gates)
+        if gate.get("gate_kind") == "terminal_disposition"
+        and any(entry.get("stable_id") == repaired_id for entry in gate.get("items", []))
+    ]
+    assert terminal_gates, "the repair terminal must be adjudicated by the terminal gate"
+    assert any(
+        stable_id != repaired_id and record["status"]["code"] == "runs"
+        for stable_id, record in models.items()
+    ), "siblings must be unaffected"
+
+
+def test_checker_contract_failure_parks_batch_members_gateless(tmp_path: Path) -> None:
+    """A checker-lane contract failure parks every member; none terminalizes.
+
+    Rung 10 (head50, 2026-08-06): three over-budget metadata batches were refused
+    by the operator wrapper and the driver terminalized all 41 members
+    ``failed:runner`` / ``protocol-violation`` -- models charged for a lane that
+    never rendered a verdict on them. A batch-level checker failure must never
+    mint member terminals: a multi-item batch downshifts along the halving
+    ladder (at width 1 there is no ladder to walk -- the single member parks
+    directly), and a floor item whose gate still cannot be delivered parks on
+    the durable checker-lane deferral valve, accounted by the terminal
+    partition.
+
+    A lane that fails EVERY batch crosses the consecutive-parks tripwire at
+    park number ``CHECKER_LANE_PARK_STREAK_LIMIT``: the run ends loud and
+    retryable instead of grinding the rest of the leg to
+    ``complete-with-deferrals``, while every park already taken stays durable,
+    gateless, and supersedable, and the models behind the tripwire simply
+    requeue on resume -- the rung-10 property this test pins. Parks bounded by
+    one batch width still complete with deferrals
+    (``test_one_full_batch_of_parks_still_completes_with_deferrals``).
+    """
+
+    snapshot = _snapshot(tmp_path)
+    forward = FakeForward()
+    with pytest.raises(RetryableOperatorError, match="consecutive"):
+        _driver(tmp_path, snapshot, checker=FailingMetadataChecker(), forward=forward).run()
+    paths = _paths(tmp_path, snapshot)
+    state = json.loads(paths.driver_state.read_text(encoding="utf-8"))
+    assert state["status"] == "retryable:infrastructure"
+    # NO model terminal exists: nothing was adjudicated, so nothing may fail.
+    assert scan_jsonl(paths.ledgers.models) == []
+    assert scan_jsonl(paths.ledgers.gates) == []
+    assert forward.calls == {}, "a parked model must never reach the worker"
+    valve_rows = scan_jsonl(
+        paths.ledgers.models.parent.parent / "intake-extensions" / "checker-lane-deferrals.jsonl"
+    )
+    parked_ids = {row["stable_id"] for row in valve_rows}
+    assert len(valve_rows) == CHECKER_LANE_PARK_STREAK_LIMIT
+    assert parked_ids <= {item.stable_id for item in snapshot.items}
+    assert {row["disposition"] for row in valve_rows} == {"deferred:checker-lane-contract-failure"}
+    for row in valve_rows:
+        assert row["checker_lane"]["remedy"] == "checker-lane-contract-failure"
+        assert row["checker_lane"]["attempted_batch_sizes"][-1] == 1
+    # The failure route is observable: at a multi-item width, downshift
+    # events walked the halving ladder before any model parked (a width-1
+    # batch has no ladder -- its one member parks directly).
+    events = scan_jsonl(paths.operational_ledger)
+    downshifts = [
+        event
+        for event in events
+        if event.get("details", {}).get("disposition") == "checker-batch-downshift"
+    ]
+    if METADATA_BATCH_MAX > 1:
+        assert downshifts, "the batch must downshift before members park"
+    else:
+        assert not downshifts, "a single-item batch has no halving ladder to walk"
+    parked_events = [
+        event
+        for event in events
+        if event.get("details", {}).get("disposition") == "checker-lane-parked"
+    ]
+    assert {event["details"]["stable_id"] for event in parked_events} == parked_ids
+
+
+def test_human_requeue_consumes_grant_and_supersedes_failed_gate(tmp_path: Path) -> None:
+    """A reviewed failed gate is superseded once through its durable explicit grant."""
+
+    snapshot = _snapshot(tmp_path)
+    paths = _paths(tmp_path, snapshot)
+    assert (
+        _driver(tmp_path, snapshot, checker=InaccurateChecker()).run().status
+        == "terminal-partition-complete"
+    )
+    stable_id = snapshot.items[0].stable_id
+    reason = "human reviewed corrected evidence"
+    grant_id = stable_hash(
+        {
+            "stable_id": stable_id,
+            "stage": "accuracy-gate",
+            "reason": reason,
+            "grant": 1,
+        }
+    )
+    grant = {
+        "grant_id": grant_id,
+        "stable_id": stable_id,
+        "stage": "accuracy-gate",
+        "reason": reason,
+        "attempts": 1,
+        "created_at": NOW,
+    }
+    paths.requeue_grants.parent.mkdir(parents=True, exist_ok=True)
+    with paths.requeue_grants.open("ab") as handle:
+        handle.write(canonical_json_bytes(grant) + b"\n")
+
+    forward = FakeForward()
+    result = _driver(tmp_path, snapshot, forward=forward).run()
+    assert result.status == "terminal-partition-complete"
+    assert forward.calls == {stable_id: 1}
+    revisions = [
+        record for record in scan_jsonl(paths.ledgers.models) if record["stable_id"] == stable_id
+    ]
+    assert [record["status"]["code"] for record in revisions] == [
+        "failed:accuracy-gate",
+        "runs",
+    ]
+    assert revisions[-1]["budget"]["explicit_grants"] == [grant_id]
+    consumed = [
+        event
+        for event in scan_jsonl(paths.operational_ledger)
+        if event["event_kind"] == "requeue-grant-consumed"
+    ]
+    assert len(consumed) == 1
+    assert consumed[0]["details"]["grant_id"] == grant_id
+
+    replay_forward = FakeForward()
+    _driver(tmp_path, snapshot, forward=replay_forward).run()
+    assert replay_forward.calls == {}
+    assert (
+        len(
+            [
+                record
+                for record in scan_jsonl(paths.ledgers.models)
+                if record["stable_id"] == stable_id
+            ]
+        )
+        == 2
+    )
+    assert (
+        len(
+            [
+                event
+                for event in scan_jsonl(paths.operational_ledger)
+                if event["event_kind"] == "requeue-grant-consumed"
+            ]
+        )
+        == 1
+    )
+    from menagerie.crawler.checkpoint import canonical_records_root
+
+    canonical_operational = canonical_records_root(paths.ledgers.models) / "operational"
+    assert scan_jsonl(canonical_operational / "requeue-grants.jsonl", validate=False) == [grant]
+    assert (
+        len(
+            [
+                event
+                for event in scan_jsonl(canonical_operational / "events.jsonl")
+                if event["event_kind"] == "requeue-grant-consumed"
+            ]
+        )
+        == 1
+    )
+
+    shutil.rmtree(paths.runtime_root)
+    context = _test_authority_context(snapshot, _driver(tmp_path, snapshot).config)
+    context = replace(
+        context,
+        environment_generations={
+            "core": str(revisions[-1]["dependency_vector"]["environment_generation"])
+        },
+    )
+    with CanonicalReducer(paths.ledgers, context) as rebuilt:
+        assert rebuilt.current_records[stable_id]["budget"]["explicit_grants"] == [grant_id]
+
+
+def test_environment_failure_parks_intent(tmp_path: Path) -> None:
+    """A probe failure parks assigned models only after the medic retry.
+
+    A probe failure is a fact about the SETUP -- the committed family failed
+    its own canaries -- never about any model: no model ran. The old behavior
+    (intent-wide ``failed:environment`` terminals) was the T3-T2/T5-2 defect;
+    the models now park in the environment-failure machine-deferral ledger
+    with the rotation remedy named.
+    """
+
+    snapshot = _snapshot(tmp_path)
+    paths = _paths(tmp_path, snapshot)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        environments=FailingEnvironments(tmp_path / "fake-envs"),
+    ).run()
+    assert result.status == "complete-with-deferrals"
+    assert scan_jsonl(paths.ledgers.models) == []
+    records_root = paths.ledgers.models.parent.parent
+    parked = load_rebuild_deferral_rows([rebuild_deferral_path(records_root)])
+    assert {row["stable_id"] for row in parked} == {item.stable_id for item in snapshot.items}
+    assert {row["quarantine"]["condition_scope"] for row in parked} == {"intent-setup"}
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_kind"),
+    [
+        (EnvironmentProbeError("probe"), "park-intent-setup"),
+        (EnvironmentSolveError("solve"), "park-intent-setup"),
+        (DiskRecoveryError("disk"), "park-host-condition"),
+        (SandboxUnavailableError("sandbox"), "terminal"),
+    ],
+)
+def test_environment_failure_routing_is_closed_and_deliberate(
+    error: Exception, expected_kind: str
+) -> None:
+    """Every lifecycle outcome routes deliberately; the catch-all is GONE."""
+
+    assert all(
+        route.exception_type not in (Exception, BaseException)
+        for route in _ENVIRONMENT_FAILURE_ROUTES
+    )
+    assert _environment_failure(error).kind == expected_kind
+    # An unrouted exception is a loud typed refusal, never a silent
+    # ``build-failed`` world-fact (the removed catch-all).
+    with pytest.raises(DriverIntegrationError, match="deliberate"):
+        _environment_failure(RuntimeError("build"))
+
+
+def test_environment_medic_retries_before_model_fanout(tmp_path: Path) -> None:
+    """A transient pre-use environment failure is retried without model terminals."""
+
+    class FlakyEnvironments(FakeEnvironments):
+        """Fail one probe cycle before running the environment callback."""
+
+        def __init__(self, root: Path) -> None:
+            """Initialize one-shot environment failure state."""
+
+            super().__init__(root)
+            self.calls = 0
+
+        def run(self, intent: EnvironmentIntent, *, use: Any) -> object:
+            """Raise before use once, then run normally."""
+
+            self.calls += 1
+            if self.calls == 1:
+                raise EnvironmentProbeError("synthetic transient probe failure")
+            return super().run(intent, use=use)
+
+    snapshot = _snapshot(tmp_path, count=1)
+    environments = FlakyEnvironments(tmp_path / "fake-envs")
+    result = _driver(tmp_path, snapshot, environments=environments).run()
+
+    assert result.status == "complete"
+    assert environments.calls == 2
+    models = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    assert [record["status"]["code"] for record in models] == ["runs"]
+
+
+def test_post_use_teardown_failure_preserves_pending_run_award(tmp_path: Path) -> None:
+    """A teardown error quarantines its generation without revising or retrying runs.
+
+    COMPOSE (WS-1 clause 4 / V3): an ordinary resume no longer auto-readmits
+    the pending-metadata run, so the metadata retry is the operator's NAMED
+    gate-catchup decision -- and it must still preserve the pending award and
+    never rebuild inside the quarantined generation.
+    """
+
+    class TeardownFailingEnvironments(FakeEnvironments):
+        """Complete model use and then report teardown disk failure."""
+
+        def run(self, intent: EnvironmentIntent, *, use: Any) -> object:
+            """Invoke use successfully before raising a teardown exception."""
+
+            super().run(intent, use=use)
+            raise DiskRecoveryError("synthetic post-use teardown failure")
+
+    snapshot = _snapshot(tmp_path, count=1)
+    paths = _paths(tmp_path, snapshot)
+    environments = TeardownFailingEnvironments(tmp_path / "fake-envs")
+    first = _driver(
+        tmp_path,
+        snapshot,
+        checker=FakeChecker(quota=True),
+        environments=environments,
+        pause_scheduler=FakePauseScheduler(paths.wakeup_root),
+    ).run()
+    second_driver = _driver(
+        tmp_path,
+        snapshot,
+        checker=FakeChecker(quota=True),
+        environments=environments,
+        pause_scheduler=FakePauseScheduler(paths.wakeup_root),
+    )
+    second_driver.config = replace(
+        second_driver.config, gate_catchup_targets=(snapshot.items[0].stable_id,)
+    )
+    second = second_driver.run()
+
+    assert first.status == second.status == "paused:usage-limit"
+    models = scan_jsonl(paths.ledgers.models)
+    assert len(models) == 1
+    assert models[0]["status"]["code"] == "runs"
+    assert models[0]["authored_metadata_state"] == "pending"
+    assert models[0]["completeness"]["release_eligible"] is False
+    assert len(scan_jsonl(paths.ledgers.attempts)) == 2
+    assert environments.events.count("create:core") == 1
+    canonical_events = scan_jsonl(
+        driver_module.canonical_operational_ledger_path(paths.ledgers.models)
+    )
+    quarantines = [
+        event
+        for event in canonical_events
+        if event.get("details", {}).get("disposition") == "environment-cleanup-quarantined"
+    ]
+    assert len(quarantines) == 1
+
+
+def test_checker_backoff_sees_driver_owned_mechanical_anchor_first(
+    tmp_path: Path,
+) -> None:
+    """Pending R1/R2 execution starts only after its reconstruction transaction."""
+
+    order: list[str] = []
+
+    class BackoffAfterAnchor(FakeChecker):
+        """Pause only after observing the driver-owned staging call."""
+
+        def check_metadata(
+            self,
+            artifacts: Sequence[AuthorArtifact],
+            work_root: Path,
+            config: DriverConfig,
+        ) -> CheckerOutcome:
+            """Return quota backoff after the anchor-order assertion."""
+
+            del work_root, config
+            assert artifacts[0].staged is not None
+            order.append(f"anchor:{artifacts[0].proposal['stable_id']}")
+            return CheckerOutcome(
+                backoff=CheckerBackoffSignal(
+                    CheckerPauseReason.QUOTA_EXHAUSTED,
+                    None,
+                    "2026-07-15T13:00:00Z",
+                    "quota",
+                )
+            )
+
+    snapshot = _snapshot(tmp_path, count=1)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        checker=BackoffAfterAnchor(),
+        pause_scheduler=FakePauseScheduler(_paths(tmp_path, snapshot).wakeup_root),
+    ).run()
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[0]
+
+    assert result.status == "paused:usage-limit"
+    assert model["status"]["code"] == "runs"
+    assert model["authored_metadata_state"] == "pending"
+    assert order == [f"anchor:{snapshot.items[0].stable_id}"]
+
+
+def test_quarantine_parks_new_work_identity_once_without_resume_loop(
+    tmp_path: Path,
+) -> None:
+    """New work under an exact quarantined generation parks -- never terminalizes.
+
+    The rung-11 contract change: a quarantine refusal writes NO model terminal
+    (``build-failed`` would assert a build the run never attempted) and instead
+    records one durable environment-rebuild deferral row that the completion
+    partition claims. The once-only anti-resume-loop property still holds: the
+    ledger keeps exactly one row per work generation, no rebuild is attempted,
+    and repeated resumes converge instead of looping.
+    """
+
+    class TeardownFailingEnvironments(FakeEnvironments):
+        """Complete the first use and then fail environment teardown."""
+
+        def run(self, intent: EnvironmentIntent, *, use: Any) -> object:
+            """Invoke use before reporting an incomplete cleanup."""
+
+            super().run(intent, use=use)
+            raise DiskRecoveryError("synthetic post-use teardown failure")
+
+    from menagerie.crawler.rung_staging import RUNG_CLASS_SUCCESSOR, register_existing_snapshot
+    from menagerie.crawler.tests.campaign_binding_support import bind_snapshot_at_records_root
+
+    master = tmp_path / "master.jsonl"
+    deferred = tmp_path / "deferred.jsonl"
+    _write_jsonl(master, [{"name": "First", "zoo": "fixtures", "variant": "base"}])
+    _write_jsonl(deferred, [])
+    first_snapshot = create_intake_snapshot(master, deferred, tmp_path / "intake-first")
+    environments = TeardownFailingEnvironments(tmp_path / "fake-envs")
+    pause_scheduler = FakePauseScheduler(_paths(tmp_path, first_snapshot).wakeup_root)
+    # Production shape under close-v2 (BL-5): a rung boundary is crossed on a
+    # registered lineage and an immutable close, so leg 1 runs to a CLOSE on
+    # its bound rung before the widened rung below may exist. The later legs'
+    # closes carry First's untouched award along exactly this chain.
+    records_root = _paths(tmp_path, first_snapshot).ledgers.models.parent.parent
+    bind_snapshot_at_records_root(
+        records_root,
+        first_snapshot,
+        extra_roster_rows=({"name": "Second", "zoo": "fixtures", "variant": "base"},),
+    )
+    assert (
+        _driver(
+            tmp_path,
+            first_snapshot,
+            environments=environments,
+            pause_scheduler=pause_scheduler,
+        )
+        .run()
+        .status
+        == "complete"
+    )
+
+    _write_jsonl(
+        master,
+        [
+            {"name": "First", "zoo": "fixtures", "variant": "base"},
+            {"name": "Second", "zoo": "fixtures", "variant": "base"},
+        ],
+    )
+    second_snapshot = create_intake_snapshot(master, deferred, tmp_path / "intake-second")
+    paths = _paths(tmp_path, second_snapshot)
+
+    # COMPOSE (AW x WS-1, RULING 1): First's completed run award is
+    # projection-stale under the new intake, and nothing re-drives a runs
+    # award silently -- the withheld RE-DRIVE below exists only because the
+    # operator names the blocked award revision in a grant and acknowledges
+    # both launch doors. The re-drive then parks against the quarantined
+    # generation instead of executing, which is exactly the once-only
+    # property under audit here.
+    first_award = {
+        record["stable_id"]: record
+        for record in scan_jsonl(_paths(tmp_path, first_snapshot).ledgers.models)
+    }
+    _grant_award_supersessions(tmp_path, first_snapshot, first_award)
+    # The widened rung registers through the production new-work door: it
+    # strictly widens the closed tip, and First's runs award crosses on an
+    # explicit operator award authority (AW-2). W16/S-2: a new-work adoption
+    # under the live licensing close declares its staging class -- this IS the
+    # successor scenario (the strict widening of the closed tip).
+    from menagerie.crawler.tests.rt3_support import fixture_composition_attestation
+
+    register_existing_snapshot(
+        records_root,
+        second_snapshot.root,
+        campaign_id="c1-mech",
+        label="widened-second-rung",
+        registered_by="pytest",
+        created_at="2026-08-11T01:00:00Z",
+        historical_only=False,
+        rung_class=RUNG_CLASS_SUCCESSOR,
+        award_authorities={
+            stable_id: str(record["record_revision"]) for stable_id, record in first_award.items()
+        },
+        # SOL-02: a successor stage presents the PD-7-bearing attestation.
+        composition_attestation=fixture_composition_attestation(
+            records_root,
+            "c1-mech",
+            stable_ids=tuple(item.stable_id for item in second_snapshot.items),
+            label="widened-second-rung",
+            snapshot_id=second_snapshot.snapshot_id,
+            snapshot_sha256=second_snapshot.snapshot_sha256,
+        ),
+    )
+
+    def _acked_ordinary() -> Any:
+        driver = _driver(
+            tmp_path,
+            second_snapshot,
+            checker=FakeChecker(quota=True),
+            environments=environments,
+            pause_scheduler=pause_scheduler,
+        )
+        # D-47: the award-holds acknowledgment binds its standing census --
+        # First's stale runs award is the whole award-holds census (no live
+        # award parks). The stale-excluded door never fires here (the head is
+        # GRANT-admitted, never stale-EXCLUDED), so the stale ack rides along
+        # defensively with a well-formed placeholder digest; if selection ever
+        # excluded the member instead, the digest mismatch would refuse loudly.
+        driver.config = replace(
+            driver.config,
+            acknowledge_award_holds=True,
+            award_holds_digest=award_holds_ack_digest(sorted(first_award), ()),
+            ack_stale_excluded=True,
+            stale_excluded_digest="sha256:" + "0" * 64,
+        )
+        return driver
+
+    statuses = [_acked_ordinary().run().status for _ in range(3)]
+    assert statuses[0] == "paused:usage-limit"
+    assert statuses[-1] == "complete-with-deferrals"
+
+    first_id = next(item.stable_id for item in second_snapshot.items if item.name == "First")
+    second_id = next(item.stable_id for item in second_snapshot.items if item.name == "Second")
+    # Park, never terminalize: the quarantine writes NO model record for either
+    # new work identity, and above all no false `build-failed` fact. First's
+    # completed run award survives in the ledger UN-superseded (the old
+    # contract destroyed it with a `failed:environment` fan-out terminal);
+    # the reducer merely holds it non-current under the new work generation.
+    models = scan_jsonl(paths.ledgers.models)
+    assert [model["stable_id"] for model in models] == [first_id]
+    assert models[0]["status"]["code"] == "runs"
+    attempts = scan_jsonl(paths.ledgers.attempts)
+    assert not [
+        attempt
+        for attempt in attempts
+        if attempt.get("failure", {}).get("reason_code") == "build-failed"
+    ]
+    # Exactly one durable deferral row per work generation, no matter how many
+    # resumes re-derive the same park (the once-only property, now honest).
+    records_root = paths.ledgers.models.parent.parent
+    rows = scan_jsonl(records_root / "intake-extensions" / "environment-rebuild-deferrals.jsonl")
+    assert sorted(row["stable_id"] for row in rows) == sorted([first_id, second_id])
+    for row in rows:
+        assert row["disposition"] == "deferred:environment-rebuild-required"
+        quarantine = row["quarantine"]
+        assert quarantine["intent"] == "core"
+        assert quarantine["failure_type"].endswith("DiskRecoveryError")
+        assert quarantine["event_id"].startswith("campaign-health-")
+        assert quarantine["event_id"] in row["recheck_hint"]
+        assert "re-drive" in row["recheck_hint"]
+        assert "build" not in row["recheck_hint"] or "no build was attempted" in row["recheck_hint"]
+    # The quarantined generation is never rebuilt behind the quarantine.
+    assert environments.events.count("create:core") == 1
+    canonical_events = scan_jsonl(
+        driver_module.canonical_operational_ledger_path(paths.ledgers.models)
+    )
+    parked = [
+        event
+        for event in canonical_events
+        if event.get("details", {}).get("disposition") == "environment-rebuild-deferred"
+    ]
+    assert {event["details"]["stable_id"] for event in parked} == {first_id, second_id}
+    # The completion partition accounts both parked models through the deferral
+    # machinery, and the driver state discloses the rows and their remedy -- in
+    # the two SEGREGATED blocks BD-1 distinguishes. `second_id` holds no record
+    # at all, so its row CLAIMS it. `first_id` holds a recorded `runs` award the
+    # projection cannot vouch for under the new work generation: coverage comes
+    # from that head, so the row is not a coverage claim (an award reported as
+    # `deferred:*` is the T1-opus-02 laundering) -- it is the live accounting for
+    # the withheld RE-DRIVE. Both are counted as deferrals, which is what keeps
+    # the close at `complete-with-deferrals` above.
+    state = json.loads(paths.driver_state.read_text(encoding="utf-8"))
+    deferrals = state["machine_deferrals"]
+    assert deferrals["by_disposition"] == {"deferred:environment-rebuild-required": [second_id]}
+    assert deferrals["stale_deferred_by_disposition"] == {
+        "deferred:environment-rebuild-required": [first_id]
+    }
+    assert deferrals["count"] == 2
+    assert sorted(entry["stable_id"] for entry in deferrals["deferred"]) == sorted(
+        [first_id, second_id]
+    )
+
+
+def test_quarantine_code_identity_hotfix_preserves_completed_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A code hotfix between quarantine snapshot and resume voids no completed run.
+
+    Rung 11: `_quarantine_work_identity` folds in the live award closure and
+    checker prompt, so ANY hotfix between the quarantine snapshot and the
+    resuming leg failed the freshness test for EVERY completed run -- mass
+    invalidation was structurally guaranteed at the fix cadence. Freshness is
+    now record-anchored: when only code identities moved and every record
+    identity (proposal, sources, receipts, environment generation) still
+    matches, the completed work is accepted, and the drift is disclosed in a
+    typed operational event.
+    """
+
+    class TeardownFailingEnvironments(FakeEnvironments):
+        """Complete model use and then report teardown disk failure."""
+
+        def run(self, intent: EnvironmentIntent, *, use: Any) -> object:
+            """Invoke use successfully before raising a teardown exception."""
+
+            super().run(intent, use=use)
+            raise DiskRecoveryError("synthetic post-use teardown failure")
+
+    snapshot = _snapshot(tmp_path, count=1)
+    paths = _paths(tmp_path, snapshot)
+    environments = TeardownFailingEnvironments(tmp_path / "fake-envs")
+    pause_scheduler = FakePauseScheduler(paths.wakeup_root)
+    first = _driver(
+        tmp_path,
+        snapshot,
+        checker=FakeChecker(quota=True),
+        environments=environments,
+        pause_scheduler=pause_scheduler,
+    ).run()
+    assert first.status == "paused:usage-limit"
+
+    # Simulate a code hotfix landing between the quarantine snapshot and the
+    # resume: the award closure identity moves while every record stays put.
+    monkeypatch.setattr(driver_module, "_award_closure_identity", lambda: "sha256:" + "ab" * 32)
+    # COMPOSE (WS-1 clause 4 / V3): the pending-metadata record re-enters
+    # through the operator's NAMED gate-catchup lane; ordinary mode no longer
+    # auto-readmits it.
+    second_driver = _driver(
+        tmp_path,
+        snapshot,
+        checker=FakeChecker(quota=True),
+        environments=environments,
+        pause_scheduler=pause_scheduler,
+    )
+    second_driver.config = replace(
+        second_driver.config, gate_catchup_targets=(snapshot.items[0].stable_id,)
+    )
+    second = second_driver.run()
+    assert second.status == "paused:usage-limit"
+
+    # The completed run award survives: one record, still runs, never
+    # superseded, never parked, never terminalized.
+    models = scan_jsonl(paths.ledgers.models)
+    assert len(models) == 1
+    assert models[0]["status"]["code"] == "runs"
+    records_root = paths.ledgers.models.parent.parent
+    rebuild_ledger = records_root / "intake-extensions" / "environment-rebuild-deferrals.jsonl"
+    assert scan_jsonl(rebuild_ledger) == []
+    assert environments.events.count("create:core") == 1
+    # The acceptance is disclosed as a typed operational event naming exactly
+    # the moved code-identity components -- never silently.
+    canonical_events = scan_jsonl(
+        driver_module.canonical_operational_ledger_path(paths.ledgers.models)
+    )
+    acceptances = [
+        event
+        for event in canonical_events
+        if event.get("details", {}).get("disposition")
+        == "environment-quarantine-record-anchored-acceptance"
+    ]
+    assert acceptances
+    accepted = acceptances[0]["details"]["accepted"]
+    assert [entry["stable_id"] for entry in accepted] == [snapshot.items[0].stable_id]
+    assert accepted[0]["record_revision"] == models[0]["record_revision"]
+    assert "award_closure" in accepted[0]["moved_identity_components"]
+    assert "proposal_sha256" not in accepted[0]["moved_identity_components"]
+    assert acceptances[0]["details"]["quarantine_event_id"].startswith("campaign-health-")
+
+
+def test_checker_digest_rotation_stales_gated_records_before_quarantine_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checker-prompt rotation parks a gated award; the fallback never blesses it.
+
+    The single policy-closure authority is the dependency-current replay: a
+    GATED record binds the checker prompt identity in its dependency vector,
+    so rotating the checker prompt bytes stales the record under the live
+    authority context BEFORE the quarantine arm's record-anchored fallback can
+    even see it. The old checker's award is never re-blessed across a checker
+    rotation -- it parks with the rebuild remedy instead (rung-11 review
+    finding 7: the lower-level drift classifier alone would say the opposite,
+    which is exactly why it is not the authority).
+    """
+
+    class TeardownFailingEnvironments(FakeEnvironments):
+        """Complete model use and then report teardown disk failure."""
+
+        def run(self, intent: EnvironmentIntent, *, use: Any) -> object:
+            """Invoke use successfully before raising a teardown exception."""
+
+            super().run(intent, use=use)
+            raise DiskRecoveryError("synthetic post-use teardown failure")
+
+    snapshot = _snapshot(tmp_path, count=1)
+    paths = _paths(tmp_path, snapshot)
+    stable_id = snapshot.items[0].stable_id
+    environments = TeardownFailingEnvironments(tmp_path / "fake-envs")
+    first = _driver(tmp_path, snapshot, environments=environments).run()
+    assert first.status == "complete"
+    gated = scan_jsonl(paths.ledgers.models)
+    assert [model["status"]["code"] for model in gated] == ["runs"]
+    assert gated[0]["accuracy_gate"]["gate_id"]
+
+    # A REAL checker rotation: the prompt file's bytes move, so the authority
+    # context, the gate lane, and the quarantine drift classifier all observe
+    # the same new digest.
+    original_read_bytes = Path.read_bytes
+
+    def rotated_checker_prompt(path: Path) -> bytes:
+        """Serve rotated checker prompt bytes to every reader."""
+
+        value = original_read_bytes(path)
+        if path.name == "codex_accuracy_checker_v2.txt":
+            return value + b"\n# rotated adjudication policy\n"
+        return value
+
+    monkeypatch.setattr(Path, "read_bytes", rotated_checker_prompt)
+
+    # COMPOSE (AW x WS-1, RULING 1): the rotation stales the gated runs
+    # award, so an unacked blind resume refuses at the award-custody door.
+    with pytest.raises(DriverIntegrationError, match="projection-stale runs award"):
+        _driver(tmp_path, snapshot, environments=environments).run()
+
+    # The re-adjudication is the operator's award-naming grant plus the
+    # acknowledged doors -- and even then the old award is never re-blessed:
+    # the quarantined generation parks it with the rebuild remedy instead.
+    _grant_award_supersessions(tmp_path, snapshot, {gated[0]["stable_id"]: gated[0]})
+    second_driver = _driver(tmp_path, snapshot, environments=environments)
+    second_driver.config = replace(
+        second_driver.config,
+        acknowledge_award_holds=True,
+        ack_stale_excluded=True,
+        # D-47: the award-holds acknowledgment binds the exact standing census
+        # (one rotation-staled award, zero live award parks). The
+        # stale-excluded door never fires here -- the head is GRANT-admitted,
+        # never stale-EXCLUDED -- so the stale ack rides along defensively
+        # with a well-formed placeholder digest; if selection ever excluded
+        # the member instead, the digest mismatch would refuse loudly.
+        award_holds_digest=award_holds_ack_digest([stable_id], []),
+        stale_excluded_digest="sha256:" + "0" * 64,
+    )
+    second = second_driver.run()
+
+    # The gated award is parked -- never accepted, never superseded, never
+    # rebuilt inside the quarantined generation.
+    assert second.status == "complete-with-deferrals"
+    models = scan_jsonl(paths.ledgers.models)
+    assert [model["record_revision"] for model in models] == [gated[0]["record_revision"]]
+    canonical_events = scan_jsonl(
+        driver_module.canonical_operational_ledger_path(paths.ledgers.models)
+    )
+    acceptances = [
+        event
+        for event in canonical_events
+        if event.get("details", {}).get("disposition")
+        == "environment-quarantine-record-anchored-acceptance"
+    ]
+    assert acceptances == []
+    records_root = paths.ledgers.models.parent.parent
+    rows = scan_jsonl(records_root / "intake-extensions" / "environment-rebuild-deferrals.jsonl")
+    assert [row["stable_id"] for row in rows] == [stable_id]
+    assert environments.events.count("create:core") == 1
+
+
+def test_disposable_author_cache_corruption_reauthors(tmp_path: Path) -> None:
+    """Malformed author cache bytes are logged, then discarded and re-authored."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    paths = _paths(tmp_path, snapshot)
+    stable_id = snapshot.items[0].stable_id
+    cache = paths.work_root / stable_id / "driver-author-artifact.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text("{not-json", encoding="utf-8")
+    author = FakeAuthor()
+
+    result = _driver(tmp_path, snapshot, author=author).run()
+
+    assert result.status == "complete"
+    assert author.calls == {stable_id: 1}
+    assert scan_jsonl(paths.ledgers.models)[0]["status"]["code"] == "runs"
+    discarded = [
+        event
+        for event in scan_jsonl(paths.operational_ledger)
+        if event.get("details", {}).get("disposition") == "author-cache-discarded"
+    ]
+    assert len(discarded) == 1
+    assert discarded[0]["details"]["stable_id"] == stable_id
+    assert "DriverIntegrationError" in discarded[0]["details"]["error"]
+    assert "Expecting property name" in discarded[0]["details"]["error"]
+
+
+def test_stale_forward_cache_work_id_regenerates_without_campaign_failure(tmp_path: Path) -> None:
+    """A same-execution cache from another work generation is disposable."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    author = FakeAuthor()
+    driver = _driver(tmp_path, snapshot, author=author)
+    item = driver._ordered_work(snapshot, {})[0]
+    artifact = author.author(
+        item,
+        driver.paths.work_root,
+        driver.config,
+        _test_authority_context(snapshot, driver.config),
+    )
+    intent = driver.registry.intents[item.route.intent]
+    prefix = tmp_path / "fake-envs" / intent.name
+    prefix.mkdir(parents=True, exist_ok=True)
+    environment = _environment_binding(
+        intent,
+        prefix,
+        tuple(ProbeResult(name, True, "ok") for name in expected_probe_names(intent.probes)),
+        strict=False,
+    )
+    execution_identity = _execution_identity(
+        artifact, environment, closure_identity=driver_module._INJECTED_FORWARD_CLOSURE_IDENTITY
+    )
+    cache_identity = stable_hash(
+        {
+            "execution_identity": execution_identity,
+            "work_id": artifact.proposal["work_id"],
+        }
+    )
+    cache = (
+        driver.paths.work_root
+        / item.stable_id
+        / f"driver-forward-attempts-{cache_identity[7:23]}.json"
+    )
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(
+        json.dumps(
+            {
+                "work_id": "work-stale-requeue",
+                "execution_identity": execution_identity,
+                "attempts": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    forward = FakeForward()
+
+    result = _driver(tmp_path, snapshot, forward=forward).run()
+
+    assert result.status == "complete"
+    assert forward.calls == {item.stable_id: 1}
+    assert scan_jsonl(driver.paths.ledgers.models)[0]["status"]["code"] == "runs"
+
+
+def test_transient_author_and_checker_infrastructure_retry_without_terminals(
+    tmp_path: Path,
+) -> None:
+    """One spawn/transport failure cannot become a model or batch terminal."""
+
+    class FlakyAuthor(FakeAuthor):
+        """Raise one spawn-shaped error before authoring successfully."""
+
+        def __init__(self) -> None:
+            """Initialize one-shot spawn failure state."""
+
+            super().__init__()
+            self.attempts = 0
+
+        def author(
+            self,
+            item: WorkItem,
+            work_root: Path,
+            config: DriverConfig,
+            context: AuthorityContext,
+        ) -> AuthorArtifact:
+            """Fail the first process invocation only."""
+
+            self.attempts += 1
+            if self.attempts == 1:
+                raise FileNotFoundError("synthetic missing author CLI")
+            return super().author(item, work_root, config, context)
+
+    class FlakyChecker(FakeChecker):
+        """Raise one transport error before returning a valid metadata gate."""
+
+        def __init__(self) -> None:
+            """Initialize one-shot transport failure state."""
+
+            super().__init__()
+            self.attempts = 0
+
+        def check_metadata(
+            self,
+            artifacts: Sequence[AuthorArtifact],
+            work_root: Path,
+            config: DriverConfig,
+        ) -> CheckerOutcome:
+            """Fail once, then delegate to the valid checker."""
+
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ConnectionError("synthetic checker transport reset")
+            return super().check_metadata(artifacts, work_root, config)
+
+    snapshot = _snapshot(tmp_path, count=1)
+    author = FlakyAuthor()
+    checker = FlakyChecker()
+    result = _driver(tmp_path, snapshot, author=author, checker=checker).run()
+
+    assert result.status == "complete"
+    assert author.attempts == 2
+    assert author.calls == {snapshot.items[0].stable_id: 1}
+    # One failed transport attempt, the primary adjudication, and the H-5
+    # blind duplicate-accept confirmation of its acceptance.
+    assert checker.attempts == 3
+    models = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    assert [record["status"]["code"] for record in models] == ["runs"]
+
+
+def test_publication_failure_resumes_from_committed_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed public write resumes from its committed capability without an award.
+
+    BL-8 (a): the deterministic publication failure is a fact about ONE
+    member, so it no longer aborts the campaign -- the member quarantines
+    behind the durable typed park and the leg closes with deferrals. The
+    original subject of this test is unchanged and still asserted below: the
+    committed publication AUTHORIZATION survives the failure, and the resume
+    publishes from that committed capability without buying a new session.
+    """
+
+    from menagerie.crawler.scheduler_parks import (
+        load_scheduler_quarantine_rows,
+        scheduler_quarantine_path,
+    )
+
+    snapshot = _snapshot(tmp_path, count=2)
+    failed_id = snapshot.items[0].stable_id
+    original = driver_module.publish_authorized_artifact
+
+    def fail_one_publication(staged: StagedArtifact, authorization: Any, **kwargs: Any) -> Any:
+        """Fail the authorized writer for one stable ID and preserve the tail."""
+
+        if staged.event["stable_id"] == failed_id:
+            raise DriverIntegrationError("synthetic deterministic publication failure")
+        return original(staged, authorization, **kwargs)
+
+    monkeypatch.setattr(driver_module, "publish_authorized_artifact", fail_one_publication)
+    first = _driver(tmp_path, snapshot).run()
+    assert first.status == "complete-with-deferrals"
+    quarantines = load_scheduler_quarantine_rows(
+        [scheduler_quarantine_path(_paths(tmp_path, snapshot).ledgers.models.parent.parent)]
+    )
+    assert {row["stable_id"] for row in quarantines} == {failed_id}
+
+    paths = _paths(tmp_path, snapshot)
+    # The sibling kept its leg (blast radius): only the failed member holds
+    # no record -- its publication never completed, so no award may exist.
+    assert {record["stable_id"] for record in scan_jsonl(paths.ledgers.models)} == {
+        snapshot.items[1].stable_id
+    }
+    first_events = scan_jsonl(paths.ledgers.artifacts)
+    assert any(
+        event["stable_id"] == failed_id and event["event_kind"] == "publication-authorized"
+        for event in first_events
+    )
+    assert not any(
+        event["stable_id"] == failed_id and event["event_kind"] == "published"
+        for event in first_events
+    )
+
+    monkeypatch.setattr(driver_module, "publish_authorized_artifact", original)
+    result = _driver(tmp_path, snapshot).run()
+    assert result.status == "complete"
+    assert_known_event_kinds("published")
+    assert any(
+        event["stable_id"] == failed_id and event["event_kind"] == "published"
+        for event in scan_jsonl(paths.ledgers.artifacts)
+    )
+    assert {
+        record["stable_id"]: record["status"]["code"] for record in scan_jsonl(paths.ledgers.models)
+    } == {item.stable_id: "runs" for item in snapshot.items}
+
+
+def test_private_deferral_avoids_public_promotion(tmp_path: Path) -> None:
+    """A valid private disposition remains private while entering its terminal lane."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    result = _driver(tmp_path, snapshot, author=ScriptedAuthor(_TERMINAL_OUTCOME_SCRIPT)).run()
+
+    assert result.status == "complete"
+    paths = _paths(tmp_path, snapshot)
+    assert scan_jsonl(paths.ledgers.models)[0]["status"]["code"] == "deferred:needs-cuda"
+    artifact_events = scan_jsonl(paths.ledgers.artifacts)
+    asserted_kinds = (
+        "staged-private",
+        "terminal-authorized",
+        "private-committed",
+        "published",
+    )
+    assert_known_event_kinds(*asserted_kinds)
+    event_kinds = {event["event_kind"] for event in artifact_events}
+    assert set(asserted_kinds[:3]) <= event_kinds
+    assert "published" not in event_kinds
+    committed = next(
+        event for event in artifact_events if event["event_kind"] == "private-committed"
+    )
+    for claim in committed["claims"]:
+        object_row = next(
+            value for value in committed["objects"] if value["object_id"] == claim["object_id"]
+        )
+        public_object = paths.runtime_root / "mirrors" / "public" / object_row["object_key"]
+        repository_materialization = tmp_path / claim["logical_path"]
+        assert not public_object.exists()
+        assert not repository_materialization.exists()
+
+
+def test_needs_higher_tier_is_deferred_and_appended_to_c3_intake(
+    tmp_path: Path,
+) -> None:
+    """A checked Sonnet escalation is durable in both source and C3 lineages."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=NeedsOpusAuthor(),
+        campaign_id="c1-mech",
+    ).run()
+
+    assert result.status == "terminal-partition-complete"
+    paths = _paths(tmp_path, snapshot)
+    model = scan_jsonl(paths.ledgers.models)[0]
+    assert model["status"]["code"] == "deferred:needs-opus-tier"
+    promotion_path = paths.ledgers.models.parent.parent / "intake-extensions" / "c3-classics.jsonl"
+    promotions = scan_jsonl(promotion_path, validate=False)
+    assert len(promotions) == 1
+    promotion = promotions[0]
+    assert promotion["stable_id"] == snapshot.items[0].stable_id
+    assert promotion["destination_campaign_id"] == "c3-classics"
+    assert promotion["source_manifest"]["sources"]
+    assert promotion["stage1_research_summary"]["queries"]
+    assert promotion["stage1_research_summary"]["candidate_links"][0]["why_rejected"]
+    assert promotion["prior_attempt"]["kind"] == "BLOCKED"
+    probe_receipts = list(tmp_path.rglob("discovery-probes/receipts.json"))
+    assert len(probe_receipts) == 1
+    probe_pack = json.loads(probe_receipts[0].read_text(encoding="utf-8"))
+    assert probe_pack["sources"] == []
+    assert probe_pack["broker"]["outcomes"][0]["outcome"] == "unreachable"
+
+    promoted_snapshot = materialize_promotion_intake(
+        promotions,
+        tmp_path / "promotion-intake",
+    )
+    promotion_binding = cli_module._optional_campaign_binding(
+        Path.cwd(),
+        promoted_snapshot,
+    )
+    assert promotion_binding is not None
+    assert promotion_binding.spec.campaign_id == "c3-classics"
+    assert promotion_binding.spec.author_model == "claude-opus-5"
+    launch_paths = cli_module._driver_paths_for_snapshot(Path.cwd(), promoted_snapshot)
+    assert "promotion-campaigns/c3-classics" in launch_paths.ledgers.models.as_posix()
+    promoted_paths = DriverPaths(
+        tmp_path / "promotion-runtime",
+        promoted_snapshot.root,
+        default_ledger_paths(promotion_records_root(paths.ledgers.models.parent)),
+    )
+    c3_result = _driver(
+        tmp_path,
+        promoted_snapshot,
+        author=FakeAuthor(),
+        campaign_id="c3-classics",
+        author_model="claude-opus-5",
+        checker_model="gpt-5.6-sol",
+        paths_override=promoted_paths,
+    ).run()
+    assert c3_result.status == "complete"
+    c3_terminal = scan_jsonl(promoted_paths.ledgers.models)[0]
+    merged, superseded, unconsumed = resolve_promotion_supersession(
+        {
+            "c1-mech": {model["stable_id"]: model},
+            "c2-disco": {},
+            "c3-classics": {},
+            "c4-native": {},
+        },
+        promotions,
+        {c3_terminal["stable_id"]: c3_terminal},
+    )
+    assert list(merged) == [model["stable_id"]]
+    assert merged[model["stable_id"]]["provenance"]["author_model"] == "claude-opus-5"
+    assert superseded == (promotion["promotion_id"],)
+    assert unconsumed == ()
+
+
+def test_assert_known_event_kinds_rejects_vacuous_negative_typos() -> None:
+    """The F-8 helper makes a misspelled negative event assertion fail loudly."""
+
+    with pytest.raises(AssertionError, match="unknown artifact event kinds"):
+        assert_known_event_kinds("public-committed")
+
+
+def test_transient_fidelity_checker_infrastructure_retries(tmp_path: Path) -> None:
+    """A one-shot fidelity transport error does not become identity mismatch."""
+
+    class FlakyFidelityChecker(FakeChecker):
+        """Fail the first fidelity transport invocation only."""
+
+        def __init__(self) -> None:
+            """Initialize one-shot fidelity failure state."""
+
+            super().__init__()
+            self.attempts = 0
+
+        def check_fidelity(
+            self,
+            artifact: AuthorArtifact,
+            work_root: Path,
+            config: DriverConfig,
+        ) -> CheckerOutcome:
+            """Raise once, then return a valid fidelity gate."""
+
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ConnectionError("synthetic fidelity transport reset")
+            return super().check_fidelity(artifact, work_root, config)
+
+    snapshot = _snapshot(tmp_path, count=1)
+    checker = FlakyFidelityChecker()
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=FidelityAuthor(),
+        checker=checker,
+    ).run()
+
+    assert result.status == "complete"
+    # One failed transport attempt, the primary fidelity adjudication, and
+    # the H-5 blind duplicate-accept confirmation of its acceptance.
+    assert checker.attempts == 3
+    assert scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[0]["status"]["code"] == "runs"
+
+
+def test_sandbox_unavailable_has_honest_terminal_and_null_environment(tmp_path: Path) -> None:
+    """A fail-closed sandbox refusal parks host-owned and fabricates no env hashes.
+
+    BL-12(e): ``sandbox-unavailable-v1`` is HOST-owned infrastructure weather,
+    so it may never settle a model's head -- the member parks loudly and stays
+    pending for the next leg. BL-8 (a): the park is additionally accounted by
+    the durable scheduler-quarantine valve, so the leg CLOSES (with deferrals)
+    instead of dying on the unroutable member. The original point of this test
+    stands unchanged: no fabricated environment or execution identities appear
+    on the recorded attempts.
+    """
+
+    from menagerie.crawler.scheduler_parks import (
+        SCHEDULER_QUARANTINE_DISPOSITION,
+        load_scheduler_quarantine_rows,
+        scheduler_quarantine_path,
+    )
+
+    snapshot = _snapshot(tmp_path)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        forward=ScriptedForward(ForwardScript(sandbox_unavailable=True)),
+    ).run()
+    # A host-owned refusal is a park, not a verdict: no model record exists,
+    # and the close accounts every parked member as machine-deferred.
+    assert result.status == "complete-with-deferrals"
+    paths = _paths(tmp_path, snapshot)
+    assert scan_jsonl(paths.ledgers.models) == []
+    records_root = paths.ledgers.models.parent.parent
+    quarantines = load_scheduler_quarantine_rows([scheduler_quarantine_path(records_root)])
+    assert {row["stable_id"] for row in quarantines} == {
+        item.stable_id for item in snapshot.items
+    }
+    assert {row["disposition"] for row in quarantines} == {SCHEDULER_QUARANTINE_DISPOSITION}
+    assert {row["scheduler_quarantine"]["reason_code"] for row in quarantines} == {
+        "non-model-fault"
+    }
+    parked_events = [
+        event
+        for event in scan_jsonl(paths.operational_ledger)
+        if event.get("details", {}).get("disposition") == "non-model-fault-parked"
+    ]
+    assert {event["details"]["stable_id"] for event in parked_events} == {
+        item.stable_id for item in snapshot.items
+    }
+    attempts = scan_jsonl(paths.ledgers.attempts)
+    assert attempts, "the refusal evidence lives on recorded attempts"
+    assert all(attempt["environment"] is None for attempt in attempts)
+    assert all(attempt["identities"]["environment"] is None for attempt in attempts)
+    assert all(attempt["identities"]["execution"] is None for attempt in attempts)
+    assert all(attempt["supervisor_observation"]["stdout_sha256"] is None for attempt in attempts)
+    assert all(attempt["supervisor_observation"]["stderr_sha256"] is None for attempt in attempts)
+
+
+def test_skip_and_evidenced_deferral_use_driver_terminalization(tmp_path: Path) -> None:
+    """Ruled skip/deferral outcomes enter distinct terminal partition buckets."""
+
+    snapshot = _snapshot(tmp_path, count=2)
+    result = _driver(tmp_path, snapshot, author=ScriptedAuthor(_TERMINAL_OUTCOME_SCRIPT)).run()
+    # Ruled skips and evidenced deferrals are final outcomes, not pending campaign work.
+    assert result.status == "complete"
+    paths = _paths(tmp_path, snapshot)
+    models = scan_jsonl(paths.ledgers.models)
+    assert {record["status"]["code"] for record in models} == {
+        "deferred:needs-cuda",
+        "skipped:no-description",
+    }
+    assert scan_jsonl(paths.ledgers.attempts) == []
+    assert {gate["gate_kind"] for gate in scan_jsonl(paths.ledgers.gates)} == {
+        "terminal_disposition"
+    }
+    artifact_events = scan_jsonl(paths.ledgers.artifacts)
+    asserted_kinds = {
+        "staged-private",
+        "private-committed",
+        "terminal-authorized",
+    }
+    assert_known_event_kinds(*asserted_kinds, "published")
+    assert {event["event_kind"] for event in artifact_events} >= asserted_kinds
+    assert all(event["event_kind"] != "published" for event in artifact_events)
+
+
+def test_cached_terminal_artifacts_follow_same_terminal_branch_on_resume(tmp_path: Path) -> None:
+    """Cached deferral/R5 artifacts never re-enter checker or execution maps."""
+
+    snapshot = _snapshot(tmp_path, count=2)
+    author = ScriptedAuthor(_TERMINAL_OUTCOME_SCRIPT)
+    first = _driver(tmp_path, snapshot, author=author).run()
+    # Cached clean terminal outcomes remain complete because replay creates no pending work.
+    assert first.status == "complete"
+    paths = _paths(tmp_path, snapshot)
+    first_models = scan_jsonl(paths.ledgers.models)
+    checker = FakeChecker()
+    forward = FakeForward()
+    second = _driver(
+        tmp_path,
+        snapshot,
+        author=author,
+        checker=checker,
+        forward=forward,
+    ).run()
+    assert second.status == "complete"
+    assert checker.metadata_calls == 0
+    assert forward.calls == {}
+    assert scan_jsonl(paths.ledgers.models) == first_models
+
+
+def test_linux_handoff_attempts_both_deferred_statuses_and_supersedes(
+    tmp_path: Path,
+    real_environment_fixture: RealEnvironmentFixture,
+) -> None:
+    """A clean clone executes only canonical deferred handoff authority.
+
+    Parameters
+    ----------
+    tmp_path:
+        Isolated cross-platform campaign root.
+    real_environment_fixture:
+        Strictly bound hardlink-cloned prefix used by the shipped compiler path.
+    """
+
+    source_root = tmp_path / "source-campaign"
+    source_root.mkdir()
+    snapshot = _snapshot(source_root, count=2)
+    source_environments = RealEnvironmentLane(real_environment_fixture)
+    first = _driver(
+        source_root,
+        snapshot,
+        author=BothDeferredRealAuthor(),
+        forward=SupervisedForwardLane(timeout_seconds=20, cwd=Path.cwd()),
+        environments=source_environments,
+        registry=real_environment_registry(real_environment_fixture),
+    ).run()
+    assert first.status == "complete"
+    assert source_environments.events == []
+    source_paths = _paths(source_root, snapshot)
+    deferred = scan_jsonl(source_paths.ledgers.models)
+    assert {record["status"]["code"] for record in deferred} == {
+        "deferred:needs-cuda",
+        "deferred:needs-x86",
+    }
+    source_finals = [
+        event
+        for event in scan_jsonl(source_paths.ledgers.artifacts)
+        if event["event_kind"] == ArtifactEventKind.PRIVATE_COMMITTED.value
+    ]
+    assert len(source_finals) == 2
+    assert len({event["transaction_id"] for event in source_finals}) == 2
+    assert len({event["handoff_sha256"] for event in source_finals}) == 2
+    assert all(event["handoff_proposal_id"] is not None for event in source_finals)
+    assert all(event["reconstruction"] is not None for event in source_finals)
+
+    old_source_cas = tuple(source_paths.work_root.rglob("source-cas"))
+    assert len(old_source_cas) == 2
+    old_cache = source_paths.runtime_root / "caches" / "forbidden-cache"
+    old_cache.mkdir(parents=True)
+    (old_cache / "sentinel.bin").write_bytes(b"must not transfer")
+    from menagerie.crawler.checkpoint import canonical_records_root
+
+    clone_root = tmp_path / "clean-clone"
+    # The clone's top-level reconstruction store exists exactly when the
+    # source held one (the canonical crawler root's transaction-addressed
+    # store; terminal-disposition finals without reconstruction transactions
+    # legitimately hold none).
+    source_had_reconstruction = (
+        canonical_records_root(source_paths.ledgers.models).parent / "reconstruction"
+    ).is_dir()
+    clone_snapshot, paths = _copy_clean_clone_handoff_authority(source_paths, snapshot, clone_root)
+    assert clone_snapshot.snapshot_sha256 == snapshot.snapshot_sha256
+    assert {path.name for path in clone_root.iterdir()} == {
+        "intake",
+        "records",
+        "runtime",
+        *(("reconstruction",) if source_had_reconstruction else ()),
+    }
+    assert set((paths.runtime_root / "mirrors").iterdir()) == {
+        paths.runtime_root / "mirrors" / "private"
+    }
+    assert not paths.work_root.exists()
+    assert not (paths.runtime_root / "caches").exists()
+    assert not (paths.runtime_root / "source-cas").exists()
+    shutil.rmtree(source_root)
+    assert not source_root.exists()
+    assert all(not path.exists() for path in old_source_cas)
+    assert not old_cache.exists()
+
+    linux_author = DisabledAuthor()
+    linux_checker = FakeChecker()
+    linux_forward = SupervisedForwardLane(timeout_seconds=20, cwd=Path.cwd())
+    linux_environments = RealEnvironmentLane(real_environment_fixture)
+    linux_registry = real_environment_registry(real_environment_fixture)
+    linux_environment = driver_module.bind_materialized_environment(
+        linux_registry.intents["core"],
+        real_environment_fixture.prefix,
+        real_environment_fixture.probe_results,
+        authority_cache=linux_environments.active_authority_cache(real_environment_fixture.prefix),
+    )
+    dependencies = DriverDependencies(
+        linux_author,
+        linux_checker,
+        linux_forward,
+        linux_environments,
+        FakeNotifier(),
+        lambda: NOW,
+    )
+
+    def linux_handoff_driver() -> CrawlerDriver:
+        """Build the exact repeated handoff-linux command composition."""
+
+        return CrawlerDriver(
+            paths,
+            DriverConfig(
+                target="linux-x86_64-cuda",
+                only_status="deferred:*",
+                run_id="linux-handoff",
+                machine_id="linux-machine",
+                review_checkpoint_at=None,
+                progress_milestones=(),
+                # T2-12: durable row emission refuses an unbound tier
+                # campaign; the resumed handoff leg binds the same tier
+                # campaign the source campaign ran under.
+                campaign_id="c1-mech",
+            ),
+            dependencies,
+            registry=linux_registry,
+        )
+
+    linux = linux_handoff_driver()
+    result = linux.run()
+    assert result.status == "terminal-partition-complete"
+    resumed_attempts = [
+        attempt
+        for attempt in scan_jsonl(paths.ledgers.attempts)
+        if attempt["result"] == "succeeded"
+    ]
+    assert len(resumed_attempts) == 2
+    assert {attempt["stable_id"] for attempt in resumed_attempts} == {
+        item.stable_id for item in snapshot.items
+    }
+    expected_adapter_sha256 = hash_bytes(_HANDOFF_ADAPTER.encode("utf-8"))
+    assert {
+        attempt["worker_receipt"]["observed_adapter_sha256"] for attempt in resumed_attempts
+    } == {expected_adapter_sha256}
+    reconstructed_adapters = tuple(paths.work_root.rglob("model/adapter.py"))
+    assert len(reconstructed_adapters) == 2
+    assert all(
+        path.read_bytes() == _HANDOFF_ADAPTER.encode("utf-8") for path in reconstructed_adapters
+    )
+
+    for attempt in resumed_attempts:
+        artifact = linux._family_artifacts[str(attempt["stable_id"])]
+        closure = driver_module._collect_worker_executable_closure(artifact, linux_environment)
+        execution_identity = driver_module._execution_identity(
+            artifact,
+            linux_environment,
+            closure_identity=closure.identity,
+        )
+        manifest = driver_module._compile_worker_read_manifest(
+            artifact,
+            linux_environment,
+            execution_identity,
+            closure=closure,
+        )
+        assert attempt["execution_read_manifest_identity"] == manifest.manifest_id
+
+    revisions = scan_jsonl(paths.ledgers.models)
+    assert len(revisions) == 4
+    assert revisions[:2] == deferred
+    deferred_by_id = {record["stable_id"]: record for record in deferred}
+    superseding = revisions[-len(snapshot.items) :]
+    assert {record["status"]["code"] for record in superseding} == {"runs"}
+    assert all(
+        record["parent_revision"] == deferred_by_id[str(record["stable_id"])]["record_revision"]
+        for record in superseding
+    )
+    assert all(
+        record["status"]["supersedes_revision"]
+        == deferred_by_id[str(record["stable_id"])]["record_revision"]
+        for record in superseding
+    )
+    current = {record["stable_id"]: record for record in superseding}
+    assert_partition((item.stable_id for item in snapshot.items), current)
+
+    operational = scan_jsonl(paths.operational_ledger)
+    worker_started = [
+        event for event in operational if event["event_kind"] == "worker-lease-started"
+    ]
+    worker_closed = [event for event in operational if event["event_kind"] == "worker-lease-closed"]
+    assert len(worker_started) == len(worker_closed) == 2
+    assert {event["details"]["lease_id"] for event in worker_started} == {
+        event["details"]["lease_id"] for event in worker_closed
+    }
+    assert not paths.worker_lease.exists()
+
+    forbidden_roots = (source_root, *old_source_cas, old_cache)
+    for attempt in resumed_attempts:
+        policy = attempt["policy_observation"]
+        assert not policy["network_attempted"]
+        assert not policy["cache_read_attempted"]
+        assert not policy["checkpoint_or_weight_read_attempted"]
+        assert policy["socket_targets"] == []
+        assert all(
+            not str(path).startswith(str(root))
+            for path in policy["checkpoint_paths"]
+            for root in forbidden_roots
+        )
+        assert str(source_root) not in canonical_json_bytes(attempt).decode("utf-8")
+    assert linux_author.calls == 0
+    assert linux_checker.metadata_calls == 0
+    assert linux_checker.fidelity_calls == 0
+    assert linux_environments.events == ["use:core"]
+
+    def _leg_journal(relative: str) -> bool:
+        """Return whether one records path is per-leg journal, not work truth.
+
+        Every leg durably journals its own open/config/outcome and close
+        (BL-5 leg generations, DX-22 close-licenses-successor, D-20 close
+        previews), so those ledgers lawfully APPEND on a no-op leg. The
+        no-op invariant's target is the canonical WORK ledgers: models,
+        attempts, gates, artifacts, and the valve/park families.
+        """
+
+        return relative.startswith("records/operational/events") or relative.startswith(
+            "records/intake/leg-"
+        )
+
+    canonical_ledgers = tuple(sorted((clone_root / "records").rglob("*.jsonl")))
+    before_third = {
+        path.relative_to(clone_root).as_posix(): path.read_bytes() for path in canonical_ledgers
+    }
+    third = linux_handoff_driver().run()
+    assert third.status == "terminal-partition-complete"
+    after_third = {
+        path.relative_to(clone_root).as_posix(): path.read_bytes()
+        for path in sorted((clone_root / "records").rglob("*.jsonl"))
+    }
+    assert {rel: data for rel, data in after_third.items() if not _leg_journal(rel)} == {
+        rel: data for rel, data in before_third.items() if not _leg_journal(rel)
+    }
+    # The per-leg journal is append-only even on the no-op leg: prior bytes
+    # are a strict prefix, never rewritten.
+    for relative, data in before_third.items():
+        if _leg_journal(relative):
+            assert after_third[relative].startswith(data), relative
+    assert linux_environments.events == ["use:core"]
+    assert linux_author.calls == 0
+    assert linux_checker.metadata_calls == 0
+    assert linux_checker.fidelity_calls == 0
+
+
+def test_linux_code_less_deferral_fails_visibly_without_failed_source(
+    tmp_path: Path,
+) -> None:
+    """A persisted proposal-less legacy final aborts before every active lane.
+
+    Parameters
+    ----------
+    tmp_path:
+        Isolated two-platform campaign root.
+    """
+
+    source_root = tmp_path / "legacy-source"
+    source_root.mkdir()
+    snapshot = _snapshot(source_root, count=1)
+    assert (
+        _driver(source_root, snapshot, author=ScriptedAuthor(_BOTH_DEFERRED_SCRIPT)).run().status
+        == "complete"
+    )
+    source_paths = _paths(source_root, snapshot)
+    clone_root = tmp_path / "legacy-clean-clone"
+    clone_snapshot, paths = _copy_clean_clone_handoff_authority(source_paths, snapshot, clone_root)
+    _make_final_transaction_proposal_less(paths.ledgers.artifacts)
+    shutil.rmtree(source_root)
+    assert not source_root.exists()
+
+    guarded_ledgers = (
+        paths.ledgers.models,
+        paths.ledgers.attempts,
+        paths.ledgers.gates,
+        paths.ledgers.artifacts,
+    )
+    before = {path: path.read_bytes() if path.exists() else None for path in guarded_ledgers}
+    linux_author = DisabledAuthor()
+    linux_checker = FakeChecker()
+    linux_forward = FakeForward()
+    linux_environments = FakeEnvironments(clone_root / "forbidden-environments")
+    dependencies = DriverDependencies(
+        linux_author,
+        linux_checker,
+        linux_forward,
+        linux_environments,
+        FakeNotifier(),
+        lambda: NOW,
+    )
+    linux = CrawlerDriver(
+        paths,
+        DriverConfig(
+            target="linux-x86_64-cuda",
+            only_status="deferred:*",
+            run_id="linux-code-less-handoff",
+            machine_id="linux-machine",
+            review_checkpoint_at=None,
+            progress_milestones=(),
+        ),
+        dependencies,
+        registry=load_environment_registry(target="linux-x86_64-cuda"),
+    )
+
+    with pytest.raises(DriverIntegrationError) as caught:
+        linux.run()
+    assert str(caught.value) == "handoff-authority-unavailable"
+    after = {path: path.read_bytes() if path.exists() else None for path in guarded_ledgers}
+    assert after == before
+    models = scan_jsonl(paths.ledgers.models)
+    assert all(model["status"]["code"] != "failed:source" for model in models)
+    assert linux_author.calls == 0
+    assert linux_checker.metadata_calls == 0
+    assert linux_checker.fidelity_calls == 0
+    assert linux_forward.calls == {}
+    assert linux_environments.events == []
+    assert not linux_environments.root.exists()
+    assert clone_snapshot.snapshot_sha256 == snapshot.snapshot_sha256
+
+
+def test_linux_only_status_cli_and_config_are_closed() -> None:
+    """The handoff selector is parsed and rejects non-deferred or non-Linux use."""
+
+    args = build_parser().parse_args(
+        ["handoff-linux", "--intake", "/tmp/intake", "--only-status", "deferred:*"]
+    )
+    assert args.only_status == "deferred:*"
+    with pytest.raises(ValueError, match="closed deferred"):
+        DriverConfig(target="linux-x86_64-cuda", only_status="failed:*")
+    with pytest.raises(ValueError, match="Linux deferred handoff"):
+        DriverConfig(target="osx-arm64", only_status="deferred:*")
+
+
+def test_phase_filtered_run_is_not_global_complete(tmp_path: Path) -> None:
+    """A PyTorch-only pass reports phase completion while native intake remains."""
+
+    snapshot = _mixed_phase_snapshot(tmp_path)
+    result = _driver(tmp_path, snapshot, phase="pytorch").run()
+    assert result.status == "phase-complete:pytorch"
+    paths = _paths(tmp_path, snapshot)
+    current = {record["stable_id"]: record for record in scan_jsonl(paths.ledgers.models)}
+    pytorch_ids = [
+        item.stable_id for item in snapshot.items if "tensorflow" not in item.name.lower()
+    ]
+    assert_partition(pytorch_ids, current)
+    assert len(current) == 10
+    assert len(current) < len(snapshot.items)
+
+
+def test_inaccurate_metadata_gate_repairs_are_bounded(tmp_path: Path) -> None:
+    """Changed proposal identities stop at the durable author-session allowance.
+
+    The allowance is ``AUTHOR_SESSIONS_MAX = GATE_MAX_REPAIRS + 1``: the
+    initial authoring plus BOTH gate-granted repairs actually dispatch, the
+    third adjudication round exhausts the gate's chargeable cap, and the
+    GATE terminalizes review-held (``inaccurate-cap-exhausted``) -- the
+    rung-12 grant-pending trajectory's leg 1. The prior pin froze the
+    admission double-charge, where the allowance's own final repair session
+    was recorded as bought and then refused before dispatch, terminalizing
+    ``failed:author`` with a phantom third session and leaving the gate's
+    review-held terminal unreachable.
+    """
+
+    snapshot = _snapshot(tmp_path)
+    checker = ScriptedChecker(
+        script=CheckerScript(metadata_verdict="inaccurate", lineage_repairs=True)
+    )
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=RepairingIdentityAuthor(),
+        checker=checker,
+    ).run()
+    # Review-held terminals hold the partition open for the operator.
+    assert result.status == "terminal-partition-complete"
+    # Every calibrated batch runs three rounds: every granted repair ran.
+    assert checker.metadata_calls == 3 * -(-10 // METADATA_BATCH_MAX)
+    paths = _paths(tmp_path, snapshot)
+    models = scan_jsonl(paths.ledgers.models)
+    assert {record["status"]["code"] for record in models} == {"failed:accuracy-gate"}
+    assert {record["status"]["reason_code"] for record in models} == {
+        "inaccurate-cap-exhausted"
+    }
+    assert all(record["status"]["human_review"]["required"] for record in models)
+    assert all(record["budget"]["author_sessions_used"] == 3 for record in models)
+    # The author proposed R1_LIBRARY (see attempted_rungs below) and the metadata gate
+    # refused it three times, so no rung was ever accepted. R5_SKIP would assert a
+    # checked conclusion that no faithful source path exists, which nothing here
+    # established.
+    assert all(record["source_resolution"]["rung"] == NO_RUNG_SELECTED for record in models)
+    assert all(record["implementation"]["recipe_type"] == "none" for record in models)
+    assert all(
+        record["input_contract"]["semantic_description"] == "Input contract unresolved."
+        for record in models
+    )
+    assert all(record["external_metadata"] is None for record in models)
+    assert all(record["status"]["attempted_rungs"] == ["R1_LIBRARY"] for record in models)
+    assert all(record["untrusted_attempt"]["proposal"]["proposed_facts"] for record in models)
+    gates = scan_jsonl(paths.ledgers.gates)
+    # Three rounds per calibrated batch: the initial adjudication plus one per
+    # granted repair; the gate cap then terminalizes before a fourth buy.
+    assert len(gates) == 3 * -(-10 // METADATA_BATCH_MAX)
+    for stable_id in (item.stable_id for item in snapshot.items):
+        lineage_items = [
+            gate_item
+            for gate in gates
+            for gate_item in gate["items"]
+            if gate_item["stable_id"] == stable_id
+        ]
+        assert len({item["work_id"] for item in lineage_items}) == 3
+        assert len({item["campaign_root_work_id"] for item in lineage_items}) == 1
+
+
+def test_fidelity_rejection_terminalizes_without_aborting(tmp_path: Path) -> None:
+    """Fidelity rejection repairs once before repeated-root terminalization."""
+
+    snapshot = _snapshot(tmp_path)
+    author = FidelityAuthor()
+    checker = ScriptedChecker(script=CheckerScript(reject_fidelity=True))
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=author,
+        checker=checker,
+    ).run()
+    # Fidelity rejection requests human review, which remains active campaign work.
+    assert result.status == "terminal-partition-complete"
+    models = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    assert {record["status"]["code"] for record in models} == {"failed:fidelity"}
+    assert {record["status"]["reason_code"] for record in models} == {"major-drift-cap-exhausted"}
+    assert all(record["status"]["human_review"]["required"] for record in models)
+    assert checker.fidelity_calls == 2 * len(snapshot.items)
+    assert all(author.calls[item.stable_id] == 2 for item in snapshot.items)
+    fidelity_gates = [
+        gate
+        for gate in scan_jsonl(_paths(tmp_path, snapshot).ledgers.gates)
+        if gate["gate_kind"] == "fidelity"
+    ]
+    assert len(fidelity_gates) == 2 * len(snapshot.items)
+
+
+def test_fidelity_repair_metadata_reenters_bounded_repair_loop(tmp_path: Path) -> None:
+    """A repaired-metadata rejection re-enters the loop within the allowance.
+
+    The trajectory spends the full ``AUTHOR_SESSIONS_MAX`` allowance -- the
+    initial authoring, the fidelity repair, and the metadata repair -- and
+    the third session DISPATCHES: it is the allowance's own final repair,
+    so the repaired proposal clears both gates and publishes. The prior pin
+    froze the admission double-charge, where that third session was
+    recorded as bought and then refused before dispatch, terminalizing
+    ``failed:author`` two sessions in.
+    """
+
+    class RepairMetadataChecker(FakeChecker):
+        """Reject one repaired metadata generation, then accept the repair."""
+
+        _rejected_repair = False
+
+        def check_metadata(
+            self,
+            artifacts: Sequence[AuthorArtifact],
+            work_root: Path,
+            config: DriverConfig,
+        ) -> CheckerOutcome:
+            """Make only the first post-fidelity-repair metadata gate inaccurate.
+
+            Keyed on the fidelity lane having run (never on the raw call
+            index): the H-5 blind confirmation of the ORIGINAL acceptance is
+            metadata call two, and scripting a rejection there would settle a
+            duplicate-accept CONFLICT instead of exercising this repair loop.
+            """
+
+            outcome = super().check_metadata(artifacts, work_root, config)
+            assert outcome.gate is not None
+            if self.fidelity_calls >= 1 and not self._rejected_repair:
+                self._rejected_repair = True
+                gate_item = outcome.gate["items"][0]
+                gate_item["verdict"] = "inaccurate"
+                gate_item["required_repairs"] = ["repair changed metadata"]
+                gate_item["field_checks"][0]["verdict"] = "inaccurate"
+                gate_item["field_checks"][0]["reason"] = "changed metadata mismatch"
+                gate_item["field_checks"][0]["required_repair"] = "repair changed metadata"
+            return outcome
+
+        def check_fidelity(
+            self,
+            artifact: AuthorArtifact,
+            work_root: Path,
+            config: DriverConfig,
+        ) -> CheckerOutcome:
+            """Reject the initial fidelity generation and accept the repaired one."""
+
+            outcome = super().check_fidelity(artifact, work_root, config)
+            assert outcome.gate is not None
+            if self.fidelity_calls == 1:
+                gate_item = outcome.gate["items"][0]
+                gate_item["verdict"] = "inaccurate"
+                gate_item["fidelity"]["verdict"] = "major-drift"
+                gate_item["fidelity"]["contradictions"] = ["initial topology mismatch"]
+            return outcome
+
+    snapshot = _snapshot(tmp_path, count=1)
+    author = FidelityAuthor()
+    checker = RepairMetadataChecker()
+    result = _driver(tmp_path, snapshot, author=author, checker=checker).run()
+
+    assert result.status == "complete"
+    # Three primary metadata rounds' worth of flow with H-5 confirmations:
+    # accept+confirm, the scripted repair rejection (no confirmation), then
+    # the repaired accept+confirm; fidelity reject, accept, and its confirm.
+    assert checker.metadata_calls == 5
+    assert checker.fidelity_calls == 3
+    assert author.calls[snapshot.items[0].stable_id] == 3
+    models = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    assert [record["status"]["code"] for record in models] == ["runs"]
+    assert [record["budget"]["author_sessions_used"] for record in models] == [3]
+
+
+@pytest.mark.parametrize(
+    ("checker_type", "driver_status", "status_code", "reason_code"),
+    [
+        (
+            InaccurateChecker,
+            "terminal-partition-complete",
+            "failed:accuracy-gate",
+            "inaccurate-cap-exhausted",
+        ),
+        (
+            CannotVerifyChecker,
+            "terminal-partition-complete",
+            "failed:accuracy-gate",
+            "cannot-verify-cap-exhausted",
+        ),
+    ],
+)
+def test_r3_metadata_terminal_precedes_fidelity_without_driver_abort(
+    tmp_path: Path,
+    checker_type: type[CheckerLane],
+    driver_status: str,
+    status_code: str,
+    reason_code: str,
+) -> None:
+    """R3 metadata rejection terminalizes honestly with no invented fidelity gate."""
+
+    snapshot = _snapshot(tmp_path)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=FidelityAuthor(),
+        checker=checker_type(),
+    ).run()
+    # A rejected checker decision is accuracy-gate authority. A checker
+    # transport/contract exception fabricates NO decision at all: it downshifts
+    # and parks gateless (test_checker_contract_failure_parks_batch_members_gateless).
+    assert result.status == driver_status
+    models = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    assert {record["status"]["code"] for record in models} == {status_code}
+    assert {record["status"]["reason_code"] for record in models} == {reason_code}
+    assert all(record["fidelity"]["current"] is False for record in models)
+    assert all(record["fidelity"]["gate_id"] is None for record in models)
+
+
+def test_partial_multi_attempt_append_resumes_idempotently(tmp_path: Path) -> None:
+    """A kill after attempt one lets the ledger assign sequence two on replay."""
+
+    snapshot = _snapshot(tmp_path)
+    killed = False
+
+    def kill_after_first_attempt(boundary: str, stable_id: str) -> None:
+        """Interrupt exactly after the first durable attempt append."""
+
+        nonlocal killed
+        del stable_id
+        if boundary == "after-attempt" and not killed:
+            killed = True
+            raise InjectedKill("after-attempt")
+
+    with pytest.raises(InjectedKill):
+        _driver(tmp_path, snapshot, boundary=kill_after_first_attempt).run()
+    result = _driver(tmp_path, snapshot).run()
+    assert result.status == "complete"
+    attempts = scan_jsonl(_paths(tmp_path, snapshot).ledgers.attempts)
+    assert len(attempts) == 20
+    assert [record["ledger_seq"] for record in attempts] == list(range(1, 21))
+
+
+def test_failed_notification_is_separate_and_state_wipe_cannot_hide_milestone(
+    tmp_path: Path,
+) -> None:
+    """Canonical count recovers a missed identity and records failed delivery separately."""
+
+    snapshot = _snapshot(tmp_path)
+    killed = False
+
+    def kill_before_progress(boundary: str, stable_id: str) -> None:
+        """Interrupt after the terminal model append but before milestone handling."""
+
+        nonlocal killed
+        del stable_id
+        if boundary == "after-reduce" and not killed:
+            killed = True
+            raise InjectedKill("after-reduce")
+
+    with pytest.raises(InjectedKill):
+        _driver(
+            tmp_path,
+            snapshot,
+            boundary=kill_before_progress,
+            milestones=(1,),
+        ).run()
+    paths = _paths(tmp_path, snapshot)
+    paths.driver_state.unlink(missing_ok=True)
+    notifier = FailingNotifier()
+    result = _driver(
+        tmp_path,
+        snapshot,
+        notifier=notifier,
+        milestones=(1,),
+    ).run()
+    assert result.status == "complete"
+    assert len(notifier.messages) == 1
+    events = scan_jsonl(paths.operational_ledger)
+    progress = [event for event in events if event["event_kind"] == "progress-notification"]
+    deliveries = [event for event in events if event["event_kind"] == "notification-delivery"]
+    assert len(progress) == 1
+    assert progress[0]["status"] == "progress-recorded"
+    assert len(deliveries) == 1
+    assert deliveries[0]["status"] == "notification-failed"
+    assert deliveries[0]["details"]["delivered"] is False
+
+
+def test_notification_outbox_retries_identity_after_crash_before_delivery(
+    tmp_path: Path,
+) -> None:
+    """A crash after identity fsync leaves a resumable idempotent delivery outbox item."""
+
+    snapshot = _snapshot(tmp_path)
+    killed = False
+
+    def kill_after_identity(boundary: str, stable_id: str) -> None:
+        """Simulate SIGKILL between the durable identity and notifier call."""
+
+        nonlocal killed
+        del stable_id
+        if boundary == "after-notification-identity" and not killed:
+            killed = True
+            raise InjectedKill("after-notification-identity")
+
+    with pytest.raises(InjectedKill):
+        _driver(
+            tmp_path,
+            snapshot,
+            boundary=kill_after_identity,
+            milestones=(1,),
+        ).run()
+    paths = _paths(tmp_path, snapshot)
+    before = scan_jsonl(paths.operational_ledger)
+    progress = [event for event in before if event["event_kind"] == "progress-notification"]
+    assert len(progress) == 1
+    assert all(event["event_kind"] != "notification-delivery" for event in before)
+
+    notifier = FakeNotifier()
+    result = _driver(tmp_path, snapshot, notifier=notifier, milestones=(1,)).run()
+    assert result.status == "complete"
+    assert len(notifier.messages) == 1
+    assert len(notifier.idempotency_keys) == 1
+    delivery = next(
+        event
+        for event in scan_jsonl(paths.operational_ledger)
+        if event["event_kind"] == "notification-delivery"
+    )
+    assert delivery["status"] == "notification-delivered"
+    assert delivery["details"]["notification_event_id"] == progress[0]["event_id"]
+    assert delivery["details"]["idempotency_key"] == notifier.idempotency_keys[0]
+
+
+def test_notification_outbox_rehydrates_canonical_identity_after_runtime_loss(
+    tmp_path: Path,
+) -> None:
+    """A canonical undelivered identity remains retryable after `.crawl-local` loss."""
+
+    snapshot = _snapshot(tmp_path)
+
+    def kill_after_identity(boundary: str, stable_id: str) -> None:
+        """Stop after canonical identity publication and before delivery."""
+
+        del stable_id
+        if boundary == "after-notification-identity":
+            raise InjectedKill("after-notification-identity")
+
+    with pytest.raises(InjectedKill):
+        _driver(tmp_path, snapshot, boundary=kill_after_identity, milestones=(1,)).run()
+    paths = _paths(tmp_path, snapshot)
+    shutil.rmtree(paths.runtime_root)
+
+    notifier = FakeNotifier()
+    assert (
+        _driver(tmp_path, snapshot, notifier=notifier, milestones=(1,)).run().status == "complete"
+    )
+    assert len(notifier.messages) == 1
+    from menagerie.crawler.checkpoint import canonical_operational_ledger_path
+
+    canonical = scan_jsonl(canonical_operational_ledger_path(paths.ledgers.models))
+    assert any(
+        event["event_kind"] == "notification-delivery"
+        and event["status"] == "notification-delivered"
+        for event in canonical
+    )
+
+
+def test_command_notifier_timeout_is_short_and_nonblocking(tmp_path: Path) -> None:
+    """A hung notifier is killed by its short timeout and returns promptly."""
+
+    del tmp_path
+    notifier = CommandNotifier(
+        f'{sys.executable} -c "import time; time.sleep(5)"', timeout_seconds=0.05
+    )
+    started = time.monotonic()
+    assert notifier.notify("milestone 1", idempotency_key=HASH) is False
+    assert time.monotonic() - started < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Executor-lane terminal verdicts.
+#
+# The stage-1 discovery arms (NO_USABLE_SOURCE / NEEDS_HIGHER_TIER) are covered
+# above through ``materialize_discovery_artifact``, which never fetches. The
+# tests below cover the OTHER half of the executor lane, which had no coverage
+# at all: stage 1 answers FOUND, the broker fetches and freezes real sources,
+# and only THEN does the author conclude a typed terminal verdict. A live rung
+# recorded exactly that shape as ``failed:author``/``session-crashed`` -- a
+# false crash at the wrong stage -- because the driver-built source manifest
+# published an identity the artifact binder could not accept.
+# ---------------------------------------------------------------------------
+
+_EXECUTOR_LANE_SOURCE = b"ExampleNet is a source-grounded architecture."
+
+
+def _found_broker_pack(
+    request: Mapping[str, Any], digest: str, source_count: int = 1
+) -> dict[str, Any]:
+    """Return one machine broker pack for a stage-1 ``FOUND`` discovery.
+
+    Parameters
+    ----------
+    request:
+        Source-request envelope published to the executor.
+    digest:
+        Content digest the controlled fetch will observe.
+    source_count:
+        Number of frozen sources the broker reports. Production manifests are
+        routinely wide -- the live rung froze 10 to 20 rows per model -- while
+        every fixture here froze exactly ONE, which is the width at which two
+        independent machine derivations of a BLOCKED arm's checked source set
+        happen to coincide. Widening it is what lets a test see them disagree.
+
+    Returns
+    -------
+    dict[str, Any]
+        Broker pack carrying its registered discovery envelope.
+    """
+
+    urls = [f"https://example.com/model{index}.py" for index in range(1, source_count + 1)]
+    source_ids = [f"source-{index}" for index in range(1, source_count + 1)]
+    discovery = {
+        "schema_version": "menagerie.crawler.source-discovery.v1",
+        "stable_id": request["stable_id"],
+        "work_id": request["work_id"],
+        "arm": "FOUND",
+        "payload": {
+            "arm": "FOUND",
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "kind": "raw-url",
+                    "url": url,
+                    "requested_role": "implementation",
+                    "basis": "Fixture implementation source.",
+                }
+                for source_id, url in zip(source_ids, urls)
+            ],
+        },
+    }
+    return {
+        "pack_version": "menagerie.crawler.source-broker-pack.v1",
+        "sources": [
+            {
+                "source_id": source_id,
+                "url": url,
+                "final_url": url,
+                "revision": digest,
+                "expected_sha256": digest,
+                "media_type": "text/x-python",
+                "media_type_method": "path-extension",
+                "broker_role": "implementation",
+            }
+            for source_id, url in zip(source_ids, urls)
+        ],
+        "broker": {"outcomes": [], "derived_citations": [], "total_bytes": 0},
+        "discovery": discovery,
+        "discovery_sha256": stable_hash(discovery),
+    }
+
+
+def _blocked_result_bytes(envelope: Mapping[str, Any], payload: Mapping[str, Any]) -> str:
+    """Return one self-hashed ``BLOCKED`` author result bound to its envelope.
+
+    Parameters
+    ----------
+    envelope:
+        Frozen author envelope the executor was handed.
+    payload:
+        Arm-specific ``BLOCKED`` payload without its recommendation digest.
+
+    Returns
+    -------
+    str
+        Serialized author result ready for the required output path.
+    """
+
+    body = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"evidence_identity", "license_identity"}
+    }
+    source_manifest = envelope["source_manifest"]
+    source_ids = [
+        str(source["source_id"])
+        for source in source_manifest["sources"]
+        if isinstance(source, Mapping)
+    ]
+    evidence_pack = derive_terminal_evidence_pack(
+        source_ids=source_ids,
+        evidence_ids=[str(value) for value in body["evidence_ids"]],
+        predicate="blocked-prerequisite",
+    )
+    license_disposition = derive_terminal_license_disposition(
+        kind="BLOCKED",
+        source_manifest_identity=str(envelope["expected_result"]["source_manifest_identity"]),
+    )
+    body["evidence_identity"] = evidence_pack["evidence_identity"]
+    body["license_identity"] = stable_hash(license_disposition)
+    body["recommendation_sha256"] = stable_hash(body)
+    result = {
+        **dict(envelope["expected_result"]),
+        "kind": "BLOCKED",
+        "created_at": "2026-07-28T23:04:25Z",
+        "payload": body,
+    }
+    result["result_id"] = stable_hash(
+        {"kind": "BLOCKED", "stable_id": result["stable_id"], "payload": body}
+    )
+    result["result_sha256"] = stable_hash(result)
+    return json.dumps(result)
+
+
+def _executor_lane_operator(payload: Mapping[str, Any], source_count: int = 1) -> Any:
+    """Script one executor lane that finds sources and then returns ``BLOCKED``.
+
+    Parameters
+    ----------
+    payload:
+        Stage-2 ``BLOCKED`` payload, minus its recommendation digest.
+    source_count:
+        Frozen manifest width the scripted broker reports.
+
+    Returns
+    -------
+    Callable
+        Replacement for ``_run_operator_command``.
+    """
+
+    digest = hash_bytes(_EXECUTOR_LANE_SOURCE)
+
+    def run(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """Publish the stage-1 broker pack, then the stage-2 typed verdict."""
+
+        del kwargs
+        envelope = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        output = Path(envelope["required_output_path"])
+        if envelope.get("envelope_version") == "menagerie.crawler.author-source-request.v1":
+            output.write_text(
+                json.dumps(_found_broker_pack(envelope, digest, source_count)), encoding="utf-8"
+            )
+        else:
+            output.write_text(_blocked_result_bytes(envelope, payload), encoding="utf-8")
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    return run
+
+
+def _install_executor_lane(
+    monkeypatch: pytest.MonkeyPatch, payload: Mapping[str, Any], source_count: int = 1
+) -> None:
+    """Install the scripted executor transport and its controlled fetch.
+
+    Parameters
+    ----------
+    monkeypatch:
+        Active fixture.
+    payload:
+        Stage-2 ``BLOCKED`` payload the scripted executor publishes.
+    source_count:
+        Frozen manifest width the scripted broker reports.
+    """
+
+    monkeypatch.setattr(
+        driver_admission_module,
+        "_run_operator_command",
+        _executor_lane_operator(payload, source_count),
+    )
+    monkeypatch.setattr(
+        driver_module,
+        "fetch_targets",
+        lambda targets, root: controlled_fetch_targets(
+            targets, root, fetch_bytes=lambda _url: _EXECUTOR_LANE_SOURCE
+        ),
+    )
+
+
+_BLOCKED_SOURCE_PAYLOAD: dict[str, Any] = {
+    "arm": "BLOCKED",
+    "stage": "source",
+    "reason_code": "missing-material-source",
+    "prerequisite_ids": ["faithful-torch-implementation-at-pinned-revision"],
+    "evidence_ids": ["source-1"],
+    "evidence_records": [
+        {
+            "evidence_id": "source-1",
+            "source_id": "source-1",
+            "locator": "fixture source",
+            "text": _EXECUTOR_LANE_SOURCE.decode("utf-8"),
+            "supports": ["blocked-prerequisite"],
+        }
+    ],
+    "evidence_identity": "sha256:" + "3" * 64,
+    "license_identity": "sha256:" + "4" * 64,
+}
+
+#: The exact stage-2 escalation the live executor lane publishes: a ``BLOCKED``
+#: verdict whose reason is ``needs-higher-tier``, reached AFTER stage 1 answered
+#: ``FOUND`` and the broker froze a populated manifest. Shared by the promotion
+#: test and the refused-gate test so both provably drive the identical author
+#: shape and differ in exactly one variable -- whether the disposition gate is
+#: obtained. Keeping them on separate inline copies is how the pair drifted into
+#: covering one half of production each.
+_BLOCKED_NEEDS_HIGHER_TIER_PAYLOAD: dict[str, Any] = {
+    **_BLOCKED_SOURCE_PAYLOAD,
+    "stage": "author",
+    "reason_code": "needs-higher-tier",
+    "research_summary": {
+        "queries": ["ExampleNet architecture implementation"],
+        "places": ["upstream repositories", "introducing paper"],
+        "candidate_links": [
+            {
+                "url": "https://example.com/model.py",
+                "why_rejected": "Faithful authoring needs the Opus tier.",
+                "rejection_class": "no-material-detail",
+            }
+        ],
+        "languages": ["English"],
+        "conclusion": "The source is real; faithful authoring needs the Opus tier.",
+    },
+}
+
+
+def test_found_manifest_publishes_the_identity_the_binder_requires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The frozen FOUND manifest identity is the hash of its exact source rows.
+
+    Every other producer and consumer of a source manifest agrees on one
+    contract: ``manifest_sha256 == stable_hash(sources)``. The author echoes
+    that identity, and ``_validate_context_result`` re-derives it before binding
+    private custody. A manifest that publishes any other identity cannot be
+    staged at all, so an otherwise perfect author result dies at the binder.
+
+    Parameters
+    ----------
+    tmp_path, monkeypatch:
+        Active fixtures.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    driver = _driver(tmp_path, snapshot, author=CommandAuthorLane(("fake-author",)))
+    item = driver._ordered_work(snapshot, {})[0]
+    _install_executor_lane(monkeypatch, _BLOCKED_SOURCE_PAYLOAD)
+
+    manifest = driver.dependencies.author._fetch_author_sources(item, tmp_path / "author")
+
+    assert isinstance(manifest, dict)
+    assert manifest["manifest_sha256"] == stable_hash(manifest["sources"])
+
+
+def test_blocked_source_verdict_keeps_its_own_stage_and_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typed ``BLOCKED(source)`` terminalizes against source, never as a crash.
+
+    The author named its own stage and reason. Recording that as an
+    author-stage ``session-crashed`` is a lie in a terminal record: nothing
+    crashed, and the catalog would misreport why the model is missing.
+
+    Parameters
+    ----------
+    tmp_path, monkeypatch:
+        Active fixtures.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    _install_executor_lane(monkeypatch, _BLOCKED_SOURCE_PAYLOAD)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+        campaign_id="c1-mech",
+    ).run()
+
+    assert result.status == "complete"
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[0]
+    assert model["status"]["code"] == "failed:source"
+    assert model["status"]["reason_code"] == "missing-material-source"
+    assert model["status"]["stage"] == "source"
+
+
+def test_accepted_blocked_disposition_terminalizes_on_a_wide_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ACCEPTED terminal disposition reaches the author's own stage and reason.
+
+    The sibling test above drives the identical author payload against a manifest
+    holding ONE source, and that single row is the width at which the two
+    machine-side derivations of a BLOCKED arm's checked source set coincide.
+    Production manifests are wide: the live rung froze 10 to 20 rows per model.
+    At any width greater than the result's evidence-ID count the gate's own
+    reference derivation projected the set back out of the round-robin citation
+    table -- ``manifest[i % len(manifest)]`` -- while the envelope the checker was
+    handed declared the whole manifest. No value a checker could write satisfied
+    both, so ``validate_terminal_disposition_gate`` raised on every wide model and
+    the surrounding handler recorded ``failed:runner``/``protocol-violation`` --
+    a runner protocol violation on a lane where no runner ever executed, with
+    every retry counter at zero.
+
+    This drives the wide shape end to end. The assertions below are exactly the
+    single-source test's assertions, which is the point: manifest width must not
+    change the terminal a model reaches. Before the fix the ``code`` assertion
+    reads ``failed:runner`` and the ``stage`` assertion reads ``runner``.
+
+    Parameters
+    ----------
+    tmp_path, monkeypatch:
+        Active fixtures.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    # Three frozen sources against one evidence ID: the round-robin projection
+    # resolves to ``{source-1}`` while the envelope declares all three, so the
+    # two derivations are provably distinguishable in this fixture.
+    assert len(_BLOCKED_SOURCE_PAYLOAD["evidence_ids"]) == 1
+    _install_executor_lane(monkeypatch, _BLOCKED_SOURCE_PAYLOAD, source_count=3)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+        campaign_id="c1-mech",
+    ).run()
+
+    assert result.status == "complete"
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[0]
+    status = model["status"]
+    assert status["code"] == "failed:source"
+    assert status["reason_code"] == "missing-material-source"
+    assert status["stage"] == "source"
+    # The mis-attribution this test exists to prevent, asserted directly rather
+    # than only by implication: a lane whose runner never started must not
+    # publish a runner failure, and must not publish one with an all-zero retry
+    # ledger and a null detail either.
+    assert status["code"] != "failed:runner"
+    assert status["reason_code"] != "protocol-violation"
+    # The manifest really was wide, so the fixture cannot silently regress into
+    # the single-source shape that hid the defect.
+    assert len(model["source_resolution"]["sources"]) == 3
+
+
+@pytest.mark.smoke
+def test_rejected_blocked_disposition_terminalizes_on_its_own_adjudication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checker refusal on the merits records an adjudicated terminal, not a crash.
+
+    The exact production shape the pilot produced five times over: stage 1 answers
+    ``FOUND``, the broker freezes a WIDE manifest, the author publishes a well-formed
+    ``BLOCKED`` recommendation, and the checker reads the frozen sources and REFUSES the
+    predicate. That is a real, evidenced campaign outcome.
+
+    Before this rule the arm routed to ``failed:accuracy-gate`` with
+    ``inaccurate-cap-exhausted`` -- a bounded REPAIR cap, over a single adjudication with
+    no ``metadata_batch`` lineage and nothing to repair -- so terminal-proof derivation
+    refused it, ``_terminalize`` could not write the record even on its minimal retry, and
+    the model became a partition hole that stops the campaign.
+
+    The manifest is deliberately wide: the single-source width is exactly where the two
+    machine-side derivations of a BLOCKED arm's checked source set coincide, and a
+    one-source fixture here would prove nothing about production.
+
+    Parameters
+    ----------
+    tmp_path, monkeypatch:
+        Active fixtures.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    assert len(_BLOCKED_SOURCE_PAYLOAD["evidence_ids"]) == 1
+    _install_executor_lane(monkeypatch, _BLOCKED_SOURCE_PAYLOAD, source_count=3)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+        checker=ScriptedChecker(script=CheckerScript(terminal_verdict="rejected")),
+        campaign_id="c1-mech",
+    ).run()
+
+    # The campaign reaches a COMPLETE TERMINAL PARTITION: every model has a terminal and
+    # `assert_partition` found no hole -- which is the entire point, since the defect this
+    # covers made the model unrecordable and the run die on `missing=[...]`. It stops short
+    # of plain `complete` only because a refusal on the merits is flagged for human review,
+    # which is the honest disposition for a refused claim rather than a defect.
+    assert result.status == "terminal-partition-complete"
+    models = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    # The partition hole this test exists to prevent: the record must EXIST.
+    assert len(models) == 1
+    status = models[0]["status"]
+    # W13: a refusal ON THE MERITS of the author's terminal claim is the
+    # disposition-review hold -- kind blocked, no failure stage -- never an
+    # accuracy-gate failure (the accuracy gate rendered no verdict here).
+    assert status["code"] == "blocked:disposition-review"
+    assert status["kind"] == "blocked"
+    assert status["stage"] is None
+    assert status["reason_code"] == TERMINAL_DISPOSITION_REJECTED_REASON_CODE
+    # No cap was exhausted and nothing was repaired, so no cap may be claimed.
+    assert "cap-exhausted" not in status["reason_code"]
+    # Nor is this the lane-level mislabel the pre-fix masking produced.
+    assert status["code"] != "failed:runner"
+    assert status["reason_code"] != "protocol-violation"
+    # The refusal is recorded with the evidence that produced it.
+    assert status["root_cause_fingerprint"]
+    assert status["human_review"]["required"] is True
+    # The manifest really was wide, so this cannot regress into the degenerate
+    # single-source shape that hid the width-dependent defect for a whole sprint.
+    assert len(models[0]["source_resolution"]["sources"]) == 3
+
+    gates = scan_jsonl(_paths(tmp_path, snapshot).ledgers.gates)
+    terminal = [gate for gate in gates if gate["gate_kind"] == "terminal_disposition"]
+    assert len(terminal) == 1
+    disposition = terminal[0]["items"][0]["terminal_disposition"]
+    assert disposition["verdict"] == "rejected"
+    # The proof obligation the terminal rests on: a real refusal names findings.
+    assert disposition["findings"]
+    # No metadata_batch repair lineage exists, which is precisely why the repair rule
+    # could not have proved this terminal.
+    assert not [gate for gate in gates if gate["gate_kind"] == "metadata_batch"]
+
+
+def test_blocked_needs_higher_tier_promotes_through_the_executor_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage-2 escalation reaches the Opus lineage the promotion path built.
+
+    The stage-1 ``NEEDS_HIGHER_TIER`` arm is covered elsewhere. This is the
+    other entry point: sources were found and frozen, and only the authoring
+    itself needs the higher tier. If that arm cannot promote, the mechanism
+    covering the C1/C2 escalation population is dead through the lane that
+    actually runs in production.
+
+    Parameters
+    ----------
+    tmp_path, monkeypatch:
+        Active fixtures.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    _install_executor_lane(monkeypatch, _BLOCKED_NEEDS_HIGHER_TIER_PAYLOAD)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+        campaign_id="c1-mech",
+    ).run()
+
+    assert result.status == "complete"
+    paths = _paths(tmp_path, snapshot)
+    model = scan_jsonl(paths.ledgers.models)[0]
+    assert model["status"]["code"] == "deferred:needs-opus-tier"
+    promotions = scan_jsonl(
+        paths.ledgers.models.parent.parent / "intake-extensions" / "c3-classics.jsonl",
+        validate=False,
+    )
+    assert len(promotions) == 1
+    assert promotions[0]["stable_id"] == snapshot.items[0].stable_id
+    assert promotions[0]["destination_campaign_id"] == "c3-classics"
+    # This lane promotes only because its disposition gate was obtained and
+    # accepted. The sibling test drives the identical author payload with a
+    # refusing checker, which is the production shape this one cannot reach.
+    assert model["source_resolution"]["sources"], "an accepted escalation retains its sources"
+
+
+def test_blocked_verdict_bytes_survive_into_the_terminal_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later pass can still read what the author actually concluded.
+
+    The published result is the only record of the author's reasoning. A
+    terminal that discards it leaves the campaign unable to tell a blocked
+    model from a broken one.
+
+    Parameters
+    ----------
+    tmp_path, monkeypatch:
+        Active fixtures.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    _install_executor_lane(monkeypatch, _BLOCKED_SOURCE_PAYLOAD)
+    _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+        campaign_id="c1-mech",
+    ).run()
+
+    paths = _paths(tmp_path, snapshot)
+    stable_id = snapshot.items[0].stable_id
+    published = json.loads(
+        (paths.work_root / stable_id / "author" / "result.json").read_text(encoding="utf-8")
+    )
+    assert published["kind"] == "BLOCKED"
+    assert published["payload"]["reason_code"] == "missing-material-source"
+    model = scan_jsonl(paths.ledgers.models)[0]
+    assert model["dependency_vector"]["author_result_identity"] == published["result_id"]
+
+
+def test_top_tier_escalation_fails_honestly_instead_of_crashing_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An escalation with nowhere to escalate to is an author failure, not a crash.
+
+    ``c3-classics`` is already the top tier, so no promotion lineage can exist.
+    The verdict still has to land somewhere truthful: it is an author-stage
+    blocker. Before the mapping was made total this pair reached the reducer
+    unrecordable and took the whole run down with it.
+
+    Parameters
+    ----------
+    tmp_path, monkeypatch:
+        Active fixtures.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    _install_executor_lane(
+        monkeypatch,
+        {
+            **_BLOCKED_SOURCE_PAYLOAD,
+            "stage": "author",
+            "reason_code": "needs-higher-tier",
+            "research_summary": {
+                "queries": ["ExampleNet architecture implementation"],
+                "places": ["upstream repositories"],
+                "candidate_links": [
+                    {
+                        "url": "https://example.com/model.py",
+                        "why_rejected": "Beyond the top authoring tier.",
+                        "rejection_class": "no-material-detail",
+                    }
+                ],
+                "languages": ["English"],
+                "conclusion": "Faithful authoring exceeds even the top tier.",
+            },
+        },
+    )
+    _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+        campaign_id="c3-classics",
+    ).run()
+
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[0]
+    assert model["status"]["code"] == "failed:author"
+    assert model["status"]["reason_code"] == "needs-higher-tier"
+
+
+def test_an_unrecordable_blocked_reason_is_named_not_reported_as_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A well-formed result with an unmappable reason keeps its stage and names
+    the checked prerequisite.
+
+    The session completed and published valid bytes; only its reason is outside
+    the closed record vocabulary. ``session-crashed`` would assert the session
+    died; ``failed:author``/``malformed-result`` (the previous fallback)
+    asserted an authoring defect for a verdict the checker adjudicated ACCURATE
+    (pilot m1777). The terminal now stays on the author's own named stage with
+    the closed stage-suffixed ``blocked-prerequisite:<stage>`` member (AL-6:
+    new mints name the blocking stage in the reason; the bare member is
+    read-side legacy), and the author's exact reason string survives on the
+    attempt cause and terminal detail.
+
+    Parameters
+    ----------
+    tmp_path, monkeypatch:
+        Active fixtures.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    _install_executor_lane(
+        monkeypatch,
+        {**_BLOCKED_SOURCE_PAYLOAD, "reason_code": "some-reason-the-record-cannot-express"},
+    )
+    _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+        campaign_id="c1-mech",
+    ).run()
+
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[0]
+    assert model["status"]["code"] == "failed:source"
+    assert model["status"]["reason_code"] == "blocked-prerequisite:source"
+
+
+def test_a_driver_side_binding_refusal_is_not_a_crashed_session() -> None:
+    """Binding refusals are attributed by ownership, and only one side is engine.
+
+    ``session-crashed`` is the catch-all for the author reason vocabulary.
+    Letting the ENGINE's own manifest inconsistency land on it too would make
+    the field describe two unrelated causes, and would report a session that ran
+    to a clean typed verdict as having died. The split must stay narrow in the
+    other direction as well: a binding refusal of content the AUTHOR supplied is
+    still author-owned, and moving it to the engine would hide a real authoring
+    defect behind an engine fault -- but it is the PUBLISHED CONTENT that was
+    refused, so the reason is ``malformed-result``, never ``session-crashed``
+    (rung 7, m9617: a replay-valid published proposal whose source set
+    contradicted the frozen manifest was recorded as a dead session).
+    """
+
+    engine = _author_lane_failure(SourceManifestBindingError("source manifest identity changed"))
+    author = _author_lane_failure(ArtifactBindingError("invalid typed author result"))
+
+    assert engine == ("runner", "internal-error")
+    assert author == ("author", "malformed-result")
+    for stage, reason_code in (engine, author):
+        assert reason_code in FAILURE_REASON_CODES[stage]
+        assert f"failed:{stage}" in TERMINAL_STATUS_CODES
+
+
+def test_a_genuinely_crashed_author_session_still_records_session_crashed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The honest crash case keeps the code that names it.
+
+    Parameters
+    ----------
+    tmp_path, monkeypatch:
+        Active fixtures.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    digest = hash_bytes(_EXECUTOR_LANE_SOURCE)
+
+    def crash_in_stage_two(argv: Sequence[str], **kwargs: Any) -> Any:
+        """Answer stage 1, then die without publishing a result."""
+
+        del kwargs
+        envelope = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        if envelope.get("envelope_version") == "menagerie.crawler.author-source-request.v1":
+            Path(envelope["required_output_path"]).write_text(
+                json.dumps(_found_broker_pack(envelope, digest)), encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(list(argv), 0, "", "")
+        raise RuntimeError("provider session crashed")
+
+    monkeypatch.setattr(driver_admission_module, "_run_operator_command", crash_in_stage_two)
+    monkeypatch.setattr(
+        driver_module,
+        "fetch_targets",
+        lambda targets, root: controlled_fetch_targets(
+            targets, root, fetch_bytes=lambda _url: _EXECUTOR_LANE_SOURCE
+        ),
+    )
+    _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+        campaign_id="c1-mech",
+    ).run()
+
+    model = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)[0]
+    assert model["status"]["code"] == "failed:author"
+    assert model["status"]["reason_code"] == "session-crashed"
+
+
+class TerminalGateRefusingChecker(FakeChecker):
+    """Refuse every terminal disposition the way a stale gate binding does."""
+
+    def check_terminal(
+        self, artifact: AuthorArtifact, work_root: Path, config: DriverConfig
+    ) -> CheckerOutcome:
+        """Raise the routing error a mismatched terminal gate produces."""
+
+        del artifact, work_root, config
+        raise GateRoutingError("synthetic stale terminal gate binding")
+
+
+def test_terminal_checker_lane_failure_parks_models_and_campaign_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refused terminal-disposition lane calls park models, not the campaign.
+
+    The terminal arm was the only author outcome with no model-local handler, so
+    a single refused gate unwound the whole run and every other scheduled model
+    was lost with it.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    monkeypatch:
+        Fixture used to publish synthetic discovery envelopes.
+    """
+
+    snapshot = _snapshot(tmp_path, count=2)
+
+    def publish_negative(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """Publish a registered negative discovery envelope for every request."""
+
+        del kwargs
+        request = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        Path(request["required_output_path"]).write_text(
+            json.dumps(
+                {
+                    "schema_version": "menagerie.crawler.source-discovery.v1",
+                    "stable_id": request["stable_id"],
+                    "work_id": request["work_id"],
+                    "arm": "NO_USABLE_SOURCE",
+                    "payload": {
+                        "arm": "NO_USABLE_SOURCE",
+                        "search_evidence": {
+                            "queries": [
+                                "ExampleNet architecture",
+                                '"ExampleNet" neural network',
+                            ],
+                            "places": ["publisher index", "code hosts", "web archive"],
+                            "candidate_links": [],
+                            "languages": ["en", "zh"],
+                            "conclusion": (
+                                "No usable architecture source exists after the bounded search."
+                            ),
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    monkeypatch.setattr(driver_admission_module, "_run_operator_command", publish_negative)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+        checker=TerminalGateRefusingChecker(),
+    ).run()
+
+    paths = _paths(tmp_path, snapshot)
+    assert result.status == "complete-with-deferrals"
+    assert scan_jsonl(paths.ledgers.models) == []
+    rows = scan_jsonl(checker_lane_deferral_path(paths.ledgers.models.parent.parent))
+    assert {row["stable_id"] for row in rows} == {item.stable_id for item in snapshot.items}
+    assert {row["checker_lane"]["gate_kind"] for row in rows} == {"terminal_disposition"}
+
+
+class TerminalContractRefusingChecker(FakeChecker):
+    """Refuse the terminal-disposition gate the way the live checker refused it.
+
+    Rung 1e produced four terminal records and all four were identical. In every
+    case the author had published a complete typed verdict against a populated
+    broker manifest, and the terminal checker then returned a gate that failed
+    ``gate.v3`` validation -- an unexpected ``excerpt_discrepancies`` property, a
+    missing ``campaign_root_work_id`` -- which the operator lane classifies as a
+    permanent contract rejection. This reproduces that exact refusal.
+    """
+
+    def check_terminal(
+        self, artifact: AuthorArtifact, work_root: Path, config: DriverConfig
+    ) -> CheckerOutcome:
+        """Raise the contract rejection the live gate.v3 validation produced."""
+
+        del artifact, work_root, config
+        raise GateRoutingError(
+            "menagerie.crawler.gate.v3 validation failed at items.0: Additional "
+            "properties are not allowed ('excerpt_discrepancies' was unexpected)"
+        )
+
+
+def test_refused_terminal_checker_lane_preserves_the_broker_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused disposition lane parks without rewriting the broker artifact.
+
+    This is the live rung-1e shape, which no fixture reproduced: stage 1 answers
+    ``FOUND``, the broker freezes a populated manifest, the author publishes
+    ``BLOCKED(needs-higher-tier)``, and only then does the terminal checker refuse
+    its contract. The promotion test drives this same author payload against an
+    accepting checker; the model-local terminal test drives a refusing checker
+    against a ``NO_USABLE_SOURCE`` discovery that genuinely has no sources. Each
+    covered one half, so production -- the intersection -- was untested, and every
+    completed model in the rung recorded ``sources: []`` with "source resolution
+    did not complete" over a manifest holding real fetched bytes.
+
+    The gate is NOT weakened here: the verdict stays unadjudicated, no promotion
+    row is written, and no checked rung is awarded. Only the invented facts go.
+
+    Parameters
+    ----------
+    tmp_path, monkeypatch:
+        Active fixtures.
+    """
+
+    snapshot = _snapshot(tmp_path, count=1)
+    _install_executor_lane(monkeypatch, _BLOCKED_NEEDS_HIGHER_TIER_PAYLOAD)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=CommandAuthorLane(("fake-author",)),
+        checker=TerminalContractRefusingChecker(),
+        campaign_id="c1-mech",
+    ).run()
+
+    paths = _paths(tmp_path, snapshot)
+    stable_id = snapshot.items[0].stable_id
+    published = json.loads(
+        (paths.work_root / stable_id / "author" / "result.json").read_text(encoding="utf-8")
+    )
+    frozen = json.loads(
+        (paths.work_root / stable_id / "author" / "request.json").read_text(encoding="utf-8")
+    )["source_manifest"]["sources"]
+    assert published["payload"]["reason_code"] == "needs-higher-tier"
+    assert frozen, "the fixture must freeze a populated manifest or it cannot reproduce the bug"
+
+    assert scan_jsonl(paths.ledgers.models) == []
+    rows = scan_jsonl(checker_lane_deferral_path(paths.ledgers.models.parent.parent))
+    assert rows[0]["stable_id"] == stable_id
+    assert rows[0]["checker_lane"]["gate_kind"] == "terminal_disposition"
+    assert not (
+        paths.ledgers.models.parent.parent / "intake-extensions" / "c3-classics.jsonl"
+    ).exists()
+    assert result.status == "complete-with-deferrals"
+
+
+class FidelityGateRoutingErrorChecker(ScriptedChecker):
+    """Refuse to route the fidelity gate for exactly one named model."""
+
+    def __init__(self, refused_id: str) -> None:
+        """Bind the single model whose fidelity gate cannot be routed."""
+
+        super().__init__()
+        self.refused_id = refused_id
+
+    def check_fidelity(
+        self, artifact: AuthorArtifact, work_root: Path, config: DriverConfig
+    ) -> CheckerOutcome:
+        """Raise the routing error an unroutable fidelity gate produces."""
+
+        if str(artifact.proposal["stable_id"]) == self.refused_id:
+            raise GateRoutingError("synthetic unroutable fidelity gate")
+        return super().check_fidelity(artifact, work_root, config)
+
+
+class FidelityStaleBindingChecker(ScriptedChecker):
+    """Return a delivered fidelity gate whose item binds a stale proposal."""
+
+    def check_fidelity(
+        self, artifact: AuthorArtifact, work_root: Path, config: DriverConfig
+    ) -> CheckerOutcome:
+        """Stale the delivered gate's machine-bound vet identity."""
+
+        outcome = super().check_fidelity(artifact, work_root, config)
+        gate = outcome.gate
+        assert gate is not None
+        gate["items"][0]["vet_identity"] = "sha256:" + "b" * 64
+        gate["result_envelope_sha256"] = stable_hash(
+            {
+                key: value
+                for key, value in gate.items()
+                if key not in {"result_envelope_sha256", "payload_sha256", "ledger_seq"}
+            }
+        )
+        return CheckerOutcome(gate=gate)
+
+
+def test_fidelity_checker_lane_failure_parks_model_and_campaign_continues(
+    tmp_path: Path,
+) -> None:
+    """One unroutable fidelity lane parks its model; the siblings still land.
+
+    The fidelity lane's handler existed but claimed ``failed:fidelity`` /
+    ``identity-mismatch`` with no fidelity gate to witness it, so terminal-proof
+    derivation raised ``AuthorityDerivationError``, which escaped ``_ensure_gates``
+    and ended the run. A lane that never obtained a gate cannot assert a fidelity
+    verdict; the provable fact is a runner protocol violation.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    """
+
+    snapshot = _snapshot(tmp_path, count=3)
+    refused_id = sorted(item.stable_id for item in snapshot.items)[1]
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=FidelityAuthor(),
+        checker=FidelityGateRoutingErrorChecker(refused_id),
+    ).run()
+
+    paths = _paths(tmp_path, snapshot)
+    models = {record["stable_id"]: record for record in scan_jsonl(paths.ledgers.models)}
+    assert refused_id not in models
+    survivors = [record for key, record in models.items() if key != refused_id]
+    assert len(survivors) == 2
+    assert all(record["status"]["code"] != "failed:runner" for record in survivors)
+    rows = scan_jsonl(checker_lane_deferral_path(paths.ledgers.models.parent.parent))
+    assert rows[0]["stable_id"] == refused_id
+    assert rows[0]["checker_lane"]["gate_kind"] == "fidelity"
+    assert result.status == "complete-with-deferrals"
+
+
+def test_fidelity_stale_binding_remains_a_model_terminal(tmp_path: Path) -> None:
+    """A delivered stale binding remains attributable to its single model."""
+
+    snapshot = _snapshot(tmp_path, count=1)
+    result = _driver(
+        tmp_path,
+        snapshot,
+        author=FidelityAuthor(),
+        checker=FidelityStaleBindingChecker(),
+    ).run()
+
+    paths = _paths(tmp_path, snapshot)
+    model = scan_jsonl(paths.ledgers.models)[0]
+    assert model["status"]["code"] == "failed:runner"
+    assert model["status"]["reason_code"] == "protocol-violation"
+    assert scan_jsonl(checker_lane_deferral_path(paths.ledgers.models.parent.parent)) == []
+    assert result.status == "terminal-partition-complete"
+
+
+def test_an_unroutable_gate_record_does_not_end_the_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``emit_gate_records`` raising is lane-owned: parked, never a run abort.
+
+    ``emit_gate_records`` raises ``GateRoutingError`` and sat OUTSIDE every
+    model-local handler in the metadata lanes, so one unroutable gate record fell
+    through to the CLI catch-all and the campaign ended having written zero model
+    records. It now belongs to the checker-lane failure route: the batch
+    downshifts and, when every size is unroutable, the members park gateless
+    with typed valve rows instead of fabricated terminals.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    monkeypatch:
+        Fixture used to make the gate record unroutable.
+    """
+
+    snapshot = _snapshot(tmp_path, count=3)
+
+    def refuse(gate: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+        """Refuse every proposed gate record the way an invalid payload does."""
+
+        del gate
+        raise GateRoutingError("synthetic unroutable gate record")
+
+    monkeypatch.setattr(driver_admission_module, "emit_gate_records", refuse)
+    result = _driver(tmp_path, snapshot).run()
+
+    paths = _paths(tmp_path, snapshot)
+    assert scan_jsonl(paths.ledgers.models) == []
+    valve_rows = scan_jsonl(
+        paths.ledgers.models.parent.parent / "intake-extensions" / "checker-lane-deferrals.jsonl"
+    )
+    assert {row["stable_id"] for row in valve_rows} == {item.stable_id for item in snapshot.items}
+    assert {row["checker_lane"]["failure_class"] for row in valve_rows} == {"invalid-gate-result"}
+    assert result.status == "complete-with-deferrals"
+
+
+class OneStaleBindingChecker(ScriptedChecker):
+    """Return a metadata batch gate whose ONE named item binds a stale identity."""
+
+    def __init__(self, stale_id: str) -> None:
+        """Bind the single model whose gate item goes stale."""
+
+        super().__init__()
+        self.stale_id = stale_id
+
+    def check_metadata(
+        self, artifacts: Sequence[AuthorArtifact], work_root: Path, config: DriverConfig
+    ) -> CheckerOutcome:
+        """Answer the batch, then stale exactly one item's dependent identity."""
+
+        outcome = super().check_metadata(artifacts, work_root, config)
+        gate = outcome.gate
+        assert gate is not None
+        for item in gate["items"]:
+            if item["stable_id"] == self.stale_id:
+                item["vet_identity"] = "sha256:" + "b" * 64
+        gate["result_envelope_sha256"] = stable_hash(
+            {
+                key: value
+                for key, value in gate.items()
+                if key not in {"result_envelope_sha256", "payload_sha256", "ledger_seq"}
+            }
+        )
+        return CheckerOutcome(gate=gate)
+
+
+def test_one_stale_gate_binding_does_not_discard_its_batch_siblings(tmp_path: Path) -> None:
+    """A stale binding belongs to its own item; the rest of the batch proceeds.
+
+    Metadata gates are batched up to twenty models wide, so raising a whole-batch
+    ``DriverIntegrationError`` for one stale member discarded up to nineteen innocent
+    models -- and the same stale member recurred on the retry.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    """
+
+    snapshot = _snapshot(tmp_path, count=4)
+    stale_id = sorted(item.stable_id for item in snapshot.items)[2]
+    result = _driver(tmp_path, snapshot, checker=OneStaleBindingChecker(stale_id)).run()
+
+    models = {
+        record["stable_id"]: record
+        for record in scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    }
+    assert len(models) == 4
+    assert models[stale_id]["status"]["code"] == "failed:runner"
+    assert models[stale_id]["status"]["reason_code"] == "protocol-violation"
+    survivors = [record for key, record in models.items() if key != stale_id]
+    assert len(survivors) == 3
+    assert all(record["status"]["kind"] != "failed" for record in survivors)
+    assert result.status in {"complete", "terminal-partition-complete"}
+
+
+@dataclass(frozen=True)
+class _BindingStub:
+    """Minimal artifact stand-in exercising the binding check directly."""
+
+    proposal: Mapping[str, Any]
+    campaign_root_work_id: Optional[str] = None
+
+
+def test_a_gate_that_is_unusable_for_every_member_is_a_named_batch_condition() -> None:
+    """A missing item list is the whole-batch condition; a stale item is not.
+
+    The distinction is structural rather than incidental: ``GateBatchUnusableError``
+    names the case that genuinely costs every member, so no per-item failure can
+    reach that arm as a by-product. Every stale member is also named, so no member
+    is silently dropped by an early return.
+    """
+
+    artifacts = (
+        _BindingStub({"stable_id": "m_alpha", "work_id": "w_alpha"}),
+        _BindingStub({"stable_id": "m_beta", "work_id": "w_beta"}),
+    )
+    with pytest.raises(GateBatchUnusableError):
+        driver_models_module._require_gate_bindings(
+            {"items": None}, artifacts, "metadata_batch"  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(StaleGateBindingError) as raised:
+        driver_models_module._require_gate_bindings(
+            {"items": [{"stable_id": "m_alpha"}]}, artifacts, "metadata_batch"
+        )
+    assert set(raised.value.stale_ids) == {"m_alpha", "m_beta"}
+    assert not isinstance(raised.value, GateBatchUnusableError)
+
+
+@dataclass(frozen=True)
+class _PackStub:
+    """Artifact stand-in complete enough for the production item-pack builder."""
+
+    proposal: Mapping[str, Any]
+    source_manifest: Mapping[str, Any]
+    model_dir: Path
+    campaign_root_work_id: Optional[str] = None
+
+
+def _fidelity_bearing_artifact(fidelity_identity: Optional[str]) -> AuthorArtifact:
+    """Return a pack-complete artifact stand-in for a fidelity-declaring R1 author."""
+
+    proposal = _fidelity_bearing_proposal(fidelity_identity)
+    return cast(
+        AuthorArtifact,
+        _PackStub(
+            proposal=proposal,
+            source_manifest={"sources": []},
+            model_dir=Path("model-dir"),
+        ),
+    )
+
+
+def _fidelity_bearing_proposal(fidelity_identity: Optional[str]) -> dict[str, Any]:
+    """Return a minimal proposal shaped like a fidelity-declaring R1 author's."""
+
+    return {
+        "work_id": "work-m_fid",
+        "stable_id": "m_fid",
+        "vet_identity": "sha256:" + "a" * 64,
+        "fidelity_identity": fidelity_identity,
+        "proposal_sha256": "sha256:" + "d" * 64,
+        "verified_hashes": {"code": "sha256:" + "e" * 64},
+        "proposed_facts": {
+            "identity": {"family_representative_id": "fam-m_fid"},
+            "source_resolution": {"rung": "R1_LIBRARY"},
+            "fidelity": {"required": fidelity_identity is not None},
+        },
+    }
+
+
+def _echoed_gate_item(artifact: AuthorArtifact) -> dict[str, Any]:
+    """Build a gate item the way the real lane does: pack, then checker echo."""
+
+    item = dict(driver_models_module._checker_item(artifact))
+    item["rung_check"] = {
+        "selected_rung": "R1_LIBRARY",
+        "highest_applicable": "R1_LIBRARY",
+        "verdict": "accurate",
+        "findings": [],
+    }
+    return item
+
+
+def test_a_fidelity_required_proposal_is_not_stale_at_the_metadata_gate() -> None:
+    """A checker item faithfully echoing a fidelity-bearing proposal binds it.
+
+    The two sides of this contract are both production code: the driver's own
+    ``_checker_item`` pack carries ``proposal["fidelity_identity"]`` whenever the
+    author declared fidelity required -- R1 library recipes legitimately do --
+    and the checker echoes the pack. The old matcher expected ``None`` for
+    metadata gates, so the faithful echo was judged stale and every
+    fidelity-required member of the batch was terminalized
+    ``failed:runner / protocol-violation`` (pilot 2026-08-04: m4334, m7362,
+    m9304, all bound byte-exactly through ``verified_hashes["proposal"]``).
+    No test double is involved here, so the two sides cannot drift in tandem.
+    """
+
+    artifact = _fidelity_bearing_artifact("sha256:" + "c" * 64)
+    item = _echoed_gate_item(artifact)
+    assert item["fidelity_identity"] == artifact.proposal["fidelity_identity"]
+
+    driver_models_module._require_gate_bindings({"items": [item]}, (artifact,), "metadata_batch")
+    driver_models_module._require_gate_bindings({"items": [item]}, (artifact,), "fidelity")
+
+    # A genuinely stale echo -- a fidelity identity from some other proposal
+    # generation -- still refuses. The tripwire is scoped, not weakened.
+    stale_item = dict(item)
+    stale_item["fidelity_identity"] = "sha256:" + "f" * 64
+    with pytest.raises(StaleGateBindingError):
+        driver_models_module._require_gate_bindings(
+            {"items": [stale_item]}, (artifact,), "metadata_batch"
+        )
+
+
+def test_a_fidelity_gate_cannot_bind_a_proposal_without_a_fidelity_identity() -> None:
+    """A fidelity gate certifies a fidelity identity, so ``None`` cannot bind.
+
+    A proposal that never derived a fidelity identity has nothing a fidelity
+    gate could have checked; an item echoing ``None`` must refuse for the
+    ``fidelity`` kind while still binding an ordinary metadata gate.
+    """
+
+    artifact = _fidelity_bearing_artifact(None)
+    item = _echoed_gate_item(artifact)
+    assert item["fidelity_identity"] is None
+
+    driver_models_module._require_gate_bindings({"items": [item]}, (artifact,), "metadata_batch")
+    with pytest.raises(StaleGateBindingError):
+        driver_models_module._require_gate_bindings({"items": [item]}, (artifact,), "fidelity")
+
+
+class RetryableMetadataChecker(ScriptedChecker):
+    """Fail every metadata batch with a typed retryable transport error."""
+
+    def check_metadata(
+        self, artifacts: Sequence[AuthorArtifact], work_root: Path, config: DriverConfig
+    ) -> CheckerOutcome:
+        """Raise the campaign-level retryable operator failure."""
+
+        del artifacts, work_root, config
+        raise RetryableOperatorError("checker command failed (exit 75): transport")
+
+
+def test_campaign_level_signals_still_stop_the_run(tmp_path: Path) -> None:
+    """Retryable-infrastructure and provider backoff are NOT model-local.
+
+    Scoping a per-model failure to its model must not swallow the signals that are
+    genuinely campaign-wide. A retryable transport failure still propagates out of
+    the driver, and a provider backoff still pauses the whole run rather than
+    burning the in-flight models.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    """
+
+    snapshot = _snapshot(tmp_path, count=3)
+    with pytest.raises(RetryableOperatorError):
+        _driver(tmp_path, snapshot, checker=RetryableMetadataChecker()).run()
+    retry_models = scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    assert all(record["status"]["code"] != "failed:runner" for record in retry_models)
+
+    backoff_root = tmp_path / "backoff"
+    backoff_root.mkdir()
+    backoff_snapshot = _snapshot(backoff_root, count=3)
+    scheduler = FakePauseScheduler(_paths(backoff_root, backoff_snapshot).wakeup_root)
+    paused = _driver(
+        backoff_root,
+        backoff_snapshot,
+        checker=FakeChecker(quota=True),
+        pause_scheduler=scheduler,
+    ).run()
+    assert paused.status == "paused:usage-limit"
+    paused_models = scan_jsonl(_paths(backoff_root, backoff_snapshot).ledgers.models)
+    assert {record["status"]["code"] for record in paused_models} == {"runs"}
+
+
+def test_a_checker_wrapper_that_cannot_run_is_still_an_integration_error(
+    tmp_path: Path,
+) -> None:
+    """A wrapper that cannot execute at all remains a typed integration failure.
+
+    Attributing a per-model failure to its model must not soften a genuine
+    environment/wrapper defect into something that quietly passes.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    """
+
+    lane = CommandCheckerLane((sys.executable, "-c", "import sys; sys.exit(1)"))
+    root = tmp_path / "checker-root"
+    root.mkdir(parents=True, exist_ok=True)
+    with _authorized_direct_paid_dispatch(tmp_path, lane="checker"):
+        with pytest.raises(DriverIntegrationError):
+            lane._run({"envelope_version": "x"}, root)
+
+
+def _model_records(tmp_path: Path, snapshot: IntakeSnapshot) -> dict[str, Mapping[str, Any]]:
+    """Return the current canonical model record for every stable id.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory holding the campaign root.
+    snapshot:
+        Intake snapshot whose ledgers are read.
+
+    Returns
+    -------
+    dict[str, Mapping[str, Any]]
+        Last-write-wins model record per stable id.
+    """
+
+    return {
+        record["stable_id"]: record
+        for record in scan_jsonl(_paths(tmp_path, snapshot).ledgers.models)
+    }
+
+
+def test_a_representative_run_assembly_failure_is_model_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A representative whose run assembly refuses terminalizes alone.
+
+    ``_assemble_run_model`` raises ``DriverIntegrationError`` for conditions that are
+    not variant-specific -- a missing fidelity gate, worker receipts that disagree with
+    the proposal-declared meaningful-mode set, and accepted attempts that do not satisfy
+    the clean execution policy. Family variants had a model-local handler while
+    representatives re-raised unconditionally, so one worker reporting an unexpected
+    mode ended the campaign.
+
+    The failure is injected at the guarded call itself, which is the exact seam the
+    unconditional re-raise guarded; the message is one the real assembler emits.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    monkeypatch:
+        Fixture used to refuse assembly for exactly one representative.
+    """
+
+    snapshot = _snapshot(tmp_path, count=3)
+    refused_id = sorted(item.stable_id for item in snapshot.items)[1]
+    real = driver_receipts_module._assemble_run_model
+
+    def guard(item: Any, artifact: Any, *args: Any, **kwargs: Any) -> Any:
+        """Refuse assembly for the named model and delegate for every other."""
+
+        if str(artifact.proposal["stable_id"]) == refused_id:
+            raise DriverIntegrationError(
+                "worker receipts differ from the proposal-declared meaningful-mode set"
+            )
+        return real(item, artifact, *args, **kwargs)
+
+    monkeypatch.setattr(driver_receipts_module, "_assemble_run_model", guard)
+    result = _driver(tmp_path, snapshot).run()
+
+    models = _model_records(tmp_path, snapshot)
+    assert len(models) == 3
+    assert models[refused_id]["status"]["code"] == "failed:runner"
+    assert models[refused_id]["status"]["reason_code"] == "protocol-violation"
+    survivors = [record for key, record in models.items() if key != refused_id]
+    assert len(survivors) == 2
+    assert all(record["status"]["kind"] != "failed" for record in survivors)
+    assert result.status in {"complete", "terminal-partition-complete"}
+
+
+class _TerminalBookkeepingFailure(reducer_module.ReductionError):
+    """Synthetic reduction failure raised while recording one model's terminal."""
+
+
+def test_a_terminal_whose_bookkeeping_fails_does_not_end_the_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recording a failure may itself fail; the model is still recorded.
+
+    ``_terminalize`` protects the original failure but not the bookkeeping that records
+    it: it calls ``reducer.append_model`` and can raise ``ReductionError``, which has no
+    handler anywhere between its raise sites and the CLI catch-all. The fix for a
+    per-model failure could therefore re-abort inside the handler meant to contain it.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    monkeypatch:
+        Fixture used to refuse the first terminal append for one model.
+    """
+
+    snapshot = _snapshot(tmp_path, count=3)
+    victim_id = sorted(item.stable_id for item in snapshot.items)[1]
+
+    real_append = reducer_module.CanonicalReducer.append_model
+    seen: dict[str, int] = {}
+
+    def failing_append(self: Any, model: Mapping[str, Any]) -> Any:
+        """Refuse the first terminal append for the named model only."""
+
+        stable_id = str(model["stable_id"])
+        if stable_id == victim_id:
+            seen[stable_id] = seen.get(stable_id, 0) + 1
+            if seen[stable_id] == 1:
+                raise _TerminalBookkeepingFailure("synthetic terminal bookkeeping failure")
+        return real_append(self, model)
+
+    monkeypatch.setattr(reducer_module.CanonicalReducer, "append_model", failing_append)
+    # The stale-binding arm is the terminal vehicle: it is a per-ITEM fact that
+    # still mints a real terminal (a batch-level checker failure now parks
+    # instead, so it can no longer drive models into `_terminalize`).
+    result = _driver(tmp_path, snapshot, checker=OneStaleBindingChecker(victim_id)).run()
+
+    models = _model_records(tmp_path, snapshot)
+    assert set(models) == {item.stable_id for item in snapshot.items}
+    assert len(models) == 3
+    assert models[victim_id]["status"]["kind"] == "failed"
+    assert result.status in {"complete", "terminal-partition-complete"}
+
+
+def test_a_terminal_that_can_never_be_recorded_is_still_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unrecordable model is itself a fact, and every other model still lands.
+
+    When EVERY append for a model refuses, no canonical record can exist for it -- so
+    the honest outcome is not a green run. The model must not vanish silently: it is
+    named on the operational ledger with both failures, a durable terminal-refusal
+    park row claims it as machine-withheld, and the close completes under the
+    distinct ``...-with-refusal-parks`` status that never reads ``complete``. The
+    blast radius stays contained: every OTHER model is processed and durably
+    recorded first, where the campaign once died at the first refusal with one
+    record written -- and, before the parks landed, died again at the final
+    partition with ``PartitionError``.
+
+    Nothing is softened: the reducer refusal stays a refusal, no record is minted
+    for the victim, and a model with NO terminal and NO valid park row still dies
+    at the partition (``test_partition_still_raises_without_a_valid_park_row``).
+    Release is a real landed revision or an explicit operator void, never machine
+    time.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    monkeypatch:
+        Fixture used to refuse every terminal append for one model.
+    """
+
+    from menagerie.crawler.refusal_parks import load_refusal_park_rows, refusal_park_path
+
+    snapshot = _snapshot(tmp_path, count=3)
+    victim_id = sorted(item.stable_id for item in snapshot.items)[1]
+
+    real_append = reducer_module.CanonicalReducer.append_model
+
+    def failing_append(self: Any, model: Mapping[str, Any]) -> Any:
+        """Refuse every terminal append for the named model."""
+
+        if str(model["stable_id"]) == victim_id:
+            raise _TerminalBookkeepingFailure("synthetic permanent bookkeeping failure")
+        return real_append(self, model)
+
+    monkeypatch.setattr(reducer_module.CanonicalReducer, "append_model", failing_append)
+    # The stale-binding arm is the terminal vehicle: it is a per-ITEM fact that
+    # still mints a real terminal (a batch-level checker failure now parks
+    # instead, so it can no longer drive models into `_terminalize`).
+    result = _driver(tmp_path, snapshot, checker=OneStaleBindingChecker(victim_id)).run()
+
+    # The distinct, never-"complete" close: the park claims the victim so the
+    # partition holds, and the pending operator decision stays named.
+    assert result.status == "terminal-partition-complete-with-refusal-parks"
+
+    models = _model_records(tmp_path, snapshot)
+    assert victim_id not in models
+    assert len(models) == 2
+    paths = _paths(tmp_path, snapshot)
+    park_rows = load_refusal_park_rows([refusal_park_path(paths.ledgers.models.parent.parent)])
+    assert [str(row["stable_id"]) for row in park_rows] == [victim_id]
+    park = park_rows[0]
+    assert park["refusal"]["refusal_class"] == "_TerminalBookkeepingFailure"
+    events = scan_jsonl(paths.operational_ledger)
+    unrecordable = [
+        event
+        for event in events
+        if event.get("event_kind") == OperationalEventKind.TERMINAL_UNRECORDABLE.value
+    ]
+    assert unrecordable
+    assert {event["details"]["stable_id"] for event in unrecordable} == {victim_id}
+    first = unrecordable[0]["details"]
+    assert first["intended_status_code"].startswith("failed:")
+    assert "synthetic permanent bookkeeping failure" in first["record_error"]
+    assert "synthetic permanent bookkeeping failure" in first["fallback_error"]
+    assert first["canonical_revision_recorded"] is False
+    assert first["refusal_parked"] is True
+    assert first["park_row_sha256"] == park["row_sha256"]
+
+
+def test_terminal_artifact_failure_is_not_absorbed_by_the_record_ladder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal artifact failure lands the AUTHOR'S record, contained model-scoped.
+
+    `_terminalize`'s ladder contains failures of the RECORD -- construction and canonical
+    append. Artifact FINALIZATION is a different kind of failure. The history here has
+    three layers: absorbing it into the minimal artifact-free retry kept the original
+    `skipped:`/`deferred:` status while dropping the artifact -- a record the reducer
+    rightly refuses -- so a recordable model was reported unrecordable (the first
+    regression). Re-raising it past the ladder let the AUTHOR lane's handler rewrite the
+    verdict to `failed:runner`, discarding the adjudicated recommendation -- and on the
+    `_forward_and_reduce` arms, which have no such handler, one model's refusal aborted
+    the whole campaign (rung 11, 2026-08-07). The fixed boundary: the SAME record lands
+    with the artifact KEPT and only finalization withheld, flagged for human review,
+    with the refusal durable on the operational ledger. The author's typed verdict
+    survives, nothing is reported unrecordable, and the campaign continues.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    monkeypatch:
+        Fixture used to refuse one model's terminal artifact publication.
+    """
+
+    snapshot = _snapshot(tmp_path, count=3)
+    victim_id = sorted(item.stable_id for item in snapshot.items)[1]
+    original = driver_module.publish_authorized_artifact
+
+    def fail_one_publication(staged: StagedArtifact, authorization: Any, **kwargs: Any) -> Any:
+        """Refuse the authorized writer for one stable id and preserve the tail."""
+
+        if staged.event["stable_id"] == victim_id:
+            raise DriverIntegrationError("synthetic terminal publication failure")
+        return original(staged, authorization, **kwargs)
+
+    monkeypatch.setattr(driver_module, "publish_authorized_artifact", fail_one_publication)
+    result = _driver(tmp_path, snapshot, author=ScriptedAuthor(_TERMINAL_OUTCOME_SCRIPT)).run()
+
+    models = _model_records(tmp_path, snapshot)
+    # The first regression was 2 of 3 records with the victim absent and reported
+    # unrecordable; the second was the victim's verdict rewritten to `failed:runner`.
+    assert len(models) == 3
+    assert victim_id in models
+    # The containment keeps the author's adjudicated verdict (whichever scripted
+    # terminal outcome the victim drew) and flags the withheld finalization for
+    # human review instead of discarding either.
+    assert models[victim_id]["status"]["code"] in {
+        "deferred:needs-cuda",
+        "skipped:no-description",
+    }
+    assert models[victim_id]["status"]["code"] != "failed:runner"
+    assert models[victim_id]["status"]["human_review"]["required"] is True
+    events = scan_jsonl(_paths(tmp_path, snapshot).operational_ledger)
+    assert not [
+        event
+        for event in events
+        if event.get("event_kind") == OperationalEventKind.TERMINAL_UNRECORDABLE.value
+    ]
+    refusals = [
+        event
+        for event in events
+        if event.get("details", {}).get("disposition") == "terminal-finalization-refused"
+        and event.get("details", {}).get("stable_id") == victim_id
+    ]
+    assert refusals, "the withheld finalization must be durable, not inferred"
+    assert "synthetic terminal publication failure" in refusals[0]["details"]["error"]
+    # The scripted fixture yields one inherent `failed:runner` regardless of injection,
+    # so the meaningful sibling claim is that real terminal outcomes still land.
+    survivors = [record for key, record in models.items() if key != victim_id]
+    assert len(survivors) == 2
+    assert any(record["status"]["kind"] != "failed" for record in survivors)
+    assert result.status in {"complete", "terminal-partition-complete"}
+
+
+def _refuse_every_terminal_append(
+    monkeypatch: pytest.MonkeyPatch, exception: type[BaseException], message: str
+) -> None:
+    """Make every canonical model append refuse.
+
+    Callers drive every model into ``_terminalize`` through a checker whose
+    verdicts terminalize on the merits (``InaccurateChecker``); a batch-level
+    checker contract failure no longer reaches ``_terminalize`` at all -- it
+    parks the members gateless instead.
+
+    Parameters
+    ----------
+    monkeypatch:
+        Fixture applying the refusal.
+    exception:
+        Exception type raised by every canonical model append.
+    message:
+        Message carried by that exception.
+    """
+
+    def failing_append(self: Any, model: Mapping[str, Any]) -> Any:
+        """Refuse every canonical model append."""
+
+        del self, model
+        raise exception(message)
+
+    monkeypatch.setattr(reducer_module.CanonicalReducer, "append_model", failing_append)
+
+
+def test_a_systemically_broken_recording_path_stops_the_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three distinct unrecordable models mean the path is broken, not the models.
+
+    The ladder converts a per-model recording failure into a named hole instead of a
+    campaign abort, which is right for a per-model fact. Applied to a SYSTEMIC failure it
+    is wrong in a new way: at 28,482 models it would emit 28,482 `terminal-unrecordable`
+    events and zero records while the run looked like it was working through the roster.
+
+    This backstop is type-agnostic on purpose -- it bounds the damage without depending on
+    classifying exceptions correctly up front.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    monkeypatch:
+        Fixture used to refuse every canonical append.
+    """
+
+    snapshot = _snapshot(tmp_path, count=6)
+    _refuse_every_terminal_append(
+        monkeypatch, reducer_module.ReductionError, "synthetic systemic refusal"
+    )
+
+    with pytest.raises(TerminalRecordingUnavailable) as raised:
+        _driver(tmp_path, snapshot, checker=InaccurateChecker()).run()
+
+    events = scan_jsonl(_paths(tmp_path, snapshot).operational_ledger)
+    unrecordable = [
+        event
+        for event in events
+        if event.get("event_kind") == OperationalEventKind.TERMINAL_UNRECORDABLE.value
+    ]
+    # Bounded at the limit rather than one per model: that ratio IS the fix.
+    assert len(unrecordable) == TERMINAL_UNRECORDABLE_STREAK_LIMIT
+    assert len(unrecordable) < len(snapshot.items)
+    # The evidence for the decision is durable BEFORE the stop the decision causes.
+    assert {event["details"]["stable_id"] for event in unrecordable} <= {
+        item.stable_id for item in snapshot.items
+    }
+    assert len({event["details"]["stable_id"] for event in unrecordable}) == len(unrecordable)
+    assert "recording path is broken" in str(raised.value)
+
+
+def test_a_broken_program_is_not_recorded_as_a_model_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `NameError` in the terminal path fails loudly with its own type, immediately.
+
+    A programming error is never a fact about a model's data and recurs identically for
+    every model after it. Absorbing it into the ladder turned a one-line defect into an
+    unexplained partition hole -- the exact incident this guards.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    monkeypatch:
+        Fixture used to raise a programming error from every canonical append.
+    """
+
+    snapshot = _snapshot(tmp_path, count=6)
+    _refuse_every_terminal_append(
+        monkeypatch, NameError, "name 'terminal_gate_obtained' is not defined"
+    )
+
+    with pytest.raises(NameError, match="terminal_gate_obtained"):
+        _driver(tmp_path, snapshot, checker=InaccurateChecker()).run()
+
+    events = scan_jsonl(_paths(tmp_path, snapshot).operational_ledger)
+    # Not one single model was blamed for it.
+    assert not [
+        event
+        for event in events
+        if event.get("event_kind") == OperationalEventKind.TERMINAL_UNRECORDABLE.value
+    ]
+
+
+def test_wake_callback_replays_the_readiness_receipt(tmp_path: Path) -> None:
+    """The wake callback carries --environment-readiness-receipt when launched with one.
+
+    Step-200 leg 10 (2026-08-21): the callback dropped the flag, so every
+    supervisor restart of a production leg crashed at the CLI readiness gate
+    (three flat restarts, circuit open). The COMPLETE launching config
+    includes the receipt path.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary directory.
+    """
+
+    from dataclasses import replace
+
+    snapshot = _snapshot(tmp_path, count=1)
+    driver = _driver(tmp_path, snapshot)
+    receipt = tmp_path / "readiness-seal.json"
+
+    driver.config = replace(driver.config, environment_readiness_receipt_path=receipt)
+    callback = driver._wakeup_callback_argv()  # noqa: SLF001
+    index = callback.index("--environment-readiness-receipt")
+    assert callback[index + 1] == str(receipt)
+
+    driver.config = replace(driver.config, environment_readiness_receipt_path=None)
+    assert "--environment-readiness-receipt" not in driver._wakeup_callback_argv()  # noqa: SLF001

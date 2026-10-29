@@ -1,0 +1,16 @@
+{
+ "field": "modality",
+ "source": "docs/metadata/SCHEMA_v2.md column 8 (modality_primary), closed for describe (2026-10-08)",
+ "values": [
+  "image",
+  "text",
+  "audio",
+  "video",
+  "graph",
+  "point-cloud",
+  "tabular",
+  "time-series",
+  "multimodal",
+  "other"
+ ]
+}

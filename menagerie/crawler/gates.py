@@ -1,0 +1,1014 @@
+"""Bounded block-at-write routing for immutable metadata and fidelity gates."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any, Collection, Iterable, Mapping, Optional
+
+from menagerie.crawler.author_dispatch import (
+    AuthorResult,
+    BlockedRecommendation,
+    DeferRecommendation,
+    ProposedAuthorResult,
+    SkipRecommendation,
+)
+from menagerie.crawler.checker_dispatch import metadata_complaint_fields
+from menagerie.crawler.constants import (
+    GATE_SCHEMA_VERSION_V3,
+    AccuracyVerdict,
+    FidelityVerdict,
+    GateKind,
+    GateRoute,
+    fidelity_gate_failure_reason,
+    fidelity_item_accepted,
+    metadata_item_accepted,
+)
+from menagerie.crawler.identity import compute_recipe_revision, hash_bytes, stable_hash
+from menagerie.crawler.metadata import canonical_meaningful_modes
+from menagerie.crawler.models import JsonObject, manifest_source_rows
+from menagerie.crawler.recipe import RecipeError
+from menagerie.crawler.schema import PayloadValidationError, validate_payload
+
+
+class GateRoutingError(ValueError):
+    """Raised when an immutable gate cannot be routed safely."""
+
+
+@dataclass(frozen=True)
+class MetadataRouteDecision:
+    """Per-item block-at-write decision.
+
+    Parameters
+    ----------
+    stable_id:
+        Independently gated model.
+    verdict:
+        Checker metadata verdict.
+    route:
+        Accept, next-batch repair, or terminal human failure.
+    canonical_write_allowed:
+        True only for a current accurate item.
+    repair_count:
+        Failure count including this verdict.
+    required_repairs:
+        Checker-provided repair instructions.
+    human_review_required:
+        Whether bounded repair is exhausted.
+    """
+
+    stable_id: str
+    verdict: AccuracyVerdict
+    route: GateRoute
+    canonical_write_allowed: bool
+    repair_count: int
+    required_repairs: tuple[str, ...]
+    human_review_required: bool
+
+
+@dataclass(frozen=True)
+class FidelityRouteDecision:
+    """Per-model five-way fidelity route.
+
+    Parameters
+    ----------
+    stable_id:
+        Checked model.
+    verdict:
+        One frozen five-way fidelity verdict.
+    route:
+        Accept for match/minor drift; block otherwise.
+    accepted_for_fidelity:
+        Whether fidelity permits later driver consideration.
+    canonical_write_allowed:
+        True only when both fidelity and source-rung checks permit a canonical write.
+    permanent_scar:
+        True only for slop or a checker-preserved prior scar.
+    failure_reason_code:
+        Closed fidelity failure reason when blocked.
+    """
+
+    stable_id: str
+    verdict: FidelityVerdict
+    route: GateRoute
+    accepted_for_fidelity: bool
+    canonical_write_allowed: bool
+    permanent_scar: bool
+    failure_reason_code: str | None
+
+
+@dataclass(frozen=True)
+class TerminalDispositionDecision:
+    """Exact terminal-gate result over one advisory author-result arm.
+
+    Parameters
+    ----------
+    stable_id, work_id, campaign_id:
+        Exact author-result identities checked by the gate.
+    gate_id:
+        Immutable v3 gate identity.
+    predicate:
+        Closed independently checked terminal predicate.
+    accepted:
+        Whether the checker accepted the recommendation. This is not a terminal
+        award; the authority kernel must still derive a :class:`TerminalProof`.
+    source_ids, evidence_ids:
+        Exact resolved status-candidate references. Verdict-bound: an accepted
+        decision carries the result's full machine-derived sets; a non-accepted
+        decision carries the checker's adjudicated subset -- the cited evidence
+        and exactly the sources it resolves to in the literal excerpt table
+        (both empty only for a ``cannot-verify`` over an unresolved pack).
+    findings:
+        Checker findings retained for repair or audit.
+    """
+
+    stable_id: str
+    work_id: str
+    campaign_id: str
+    gate_id: str
+    predicate: str
+    accepted: bool
+    source_ids: tuple[str, ...]
+    evidence_ids: tuple[str, ...]
+    findings: tuple[str, ...]
+
+
+def revalidate_recipe_revision_pin(
+    proposal: Mapping[str, Any],
+    *,
+    adapter_bytes: Optional[bytes] = None,
+    adapter_path_name: Optional[str] = None,
+) -> Optional[str]:
+    """Recompute the accepted recipe pin from the proposal's OWN components.
+
+    This is the admission-time tripwire the rung-11 census asked for: a
+    ``recipe_revision`` that does not reproduce from the proposal's own
+    ``proposed_facts`` and ``source_identity`` -- a pin copied from a prior
+    attempt whose sources were re-frozen underneath it (the rung-8 m538 class)
+    -- must be refused HERE, where the refusal can route to a bounded author
+    repair, never discovered downstream as a masked worker exception.
+
+    For typed adapters it additionally binds the STAGED adapter bytes to the
+    accepted ``implementation.code_sha256`` and derives the adapter-flavor
+    revision -- the exact value ``recipe.load_typed_adapter`` recomputes from
+    those bytes at load time -- so the execution lane can hand the worker a
+    loader expectation that is coherent by construction instead of the
+    accepted-facts hash, which is a structurally different flavor and
+    mismatched on every typed adapter ever executed.
+
+    Parameters
+    ----------
+    proposal:
+        Complete accepted author proposal.
+    adapter_bytes:
+        Exact staged adapter bytes; required for typed adapters, refused for
+        declarative recipes.
+    adapter_path_name:
+        Staged adapter file name bound into the adapter-flavor revision;
+        required exactly when ``adapter_bytes`` is required.
+
+    Returns
+    -------
+    str | None
+        The derived adapter-flavor ``recipe_revision`` for typed adapters;
+        ``None`` for declarative recipes, which carry no adapter bytes.
+
+    Raises
+    ------
+    RecipeError
+        If the declared pin is stale for the proposal's own components, the
+        staged adapter bytes do not reproduce the accepted digest, or the
+        proposal is too malformed to derive either.
+    """
+
+    facts = proposal.get("proposed_facts")
+    if not isinstance(facts, Mapping):
+        raise RecipeError("recipe pin revalidation requires proposed_facts")
+    implementation = facts.get("implementation")
+    input_contract = facts.get("input_contract")
+    modes = facts.get("modes")
+    if (
+        not isinstance(implementation, Mapping)
+        or not isinstance(input_contract, Mapping)
+        or not isinstance(modes, Mapping)
+    ):
+        raise RecipeError(
+            "recipe pin revalidation requires implementation, input_contract, and modes facts"
+        )
+    source_identity = proposal.get("source_identity")
+    if not isinstance(source_identity, str) or not source_identity:
+        raise RecipeError("recipe pin revalidation requires the proposal source_identity")
+    recipe_facts = {
+        "implementation": {
+            key: value for key, value in implementation.items() if key != "recipe_revision"
+        },
+        "input_contract": input_contract,
+        "modes": {
+            "meaningful_modes": canonical_meaningful_modes(
+                modes.get("meaningful_modes"), field="modes.meaningful_modes"
+            )
+        },
+    }
+    reproduced = compute_recipe_revision(recipe_facts, source_identity)
+    declared = proposal.get("recipe_revision")
+    embedded = implementation.get("recipe_revision")
+    if declared != reproduced or embedded != reproduced:
+        raise RecipeError(
+            "recipe revision pin is stale for the proposal's own components: "
+            f"declared {declared!r}, embedded {embedded!r}, reproduced {reproduced!r} "
+            "-- rerun the identity calculator on the FINAL facts"
+        )
+    if implementation.get("recipe_type") == "declarative-library":
+        if adapter_bytes is not None or adapter_path_name is not None:
+            raise RecipeError("declarative recipes stage no adapter bytes to revalidate")
+        return None
+    if adapter_bytes is None or not adapter_path_name:
+        raise RecipeError(
+            "typed-adapter pin revalidation requires the staged adapter bytes and file name"
+        )
+    staged_digest = hash_bytes(adapter_bytes)
+    accepted_digest = implementation.get("code_sha256")
+    if staged_digest != accepted_digest:
+        raise RecipeError(
+            "staged adapter bytes do not reproduce the accepted code digest: "
+            f"accepted {accepted_digest!r}, staged {staged_digest!r}"
+        )
+    return compute_recipe_revision(
+        {"recipe_type": "typed-adapter", "path": adapter_path_name},
+        source_identity,
+        adapter_bytes=adapter_bytes,
+    )
+
+
+def route_metadata_gate(
+    gate: Mapping[str, Any],
+    repair_counts: Mapping[str, int],
+    *,
+    max_repairs: int,
+    prior_complaint_fields: Optional[Mapping[str, Optional[Collection[str]]]] = None,
+) -> tuple[MetadataRouteDecision, ...]:
+    """Apply bounded per-item metadata block-at-write decisions.
+
+    A failed item is scheduled for a different next batch until the bound is
+    exhausted. No decision grants execution status.
+
+    The bound counts CHARGEABLE failures under the complaint-disclosure rule:
+    a repair round may only be charged against complaints disclosed in the
+    round it answers. A failing item whose complaint set is disjoint from what
+    its prior round disclosed is a first disclosure -- it still blocks the
+    write and requeues (no verdict is weakened), but it does not consume the
+    author's bounded repair allowance, because the author fixed everything the
+    prior round asked. Rung 9b burned two models to
+    ``cannot-verify-cap-exhausted`` on exactly that churn.
+
+    Parameters
+    ----------
+    gate:
+        Schema-valid ``metadata_batch`` gate record.
+    repair_counts:
+        Prior CHARGEABLE failed-gate counts keyed by stable ID.
+    max_repairs:
+        Maximum chargeable repair requeues before terminal human failure.
+    prior_complaint_fields:
+        Per-model complaint keys disclosed by the immediately preceding gate
+        round in the same lineage. A missing key or ``None`` value means the
+        model has no prior round, so a failure is chargeable (first
+        disclosure). An empty collection means the prior round accepted, so a
+        fresh failure discloses new complaints and is not chargeable. When the
+        whole mapping is ``None`` the caller supplied no disclosure history and
+        every failure charges, which is the pre-disclosure-rule bound.
+
+    Returns
+    -------
+    tuple[MetadataRouteDecision, ...]
+        One independent route per gate item.
+
+    Raises
+    ------
+    GateRoutingError
+        If the gate kind, schema, or repair counts are invalid.
+    """
+
+    _validate_gate(gate, GateKind.METADATA_BATCH)
+    if max_repairs < 0:
+        raise GateRoutingError("max_repairs must be non-negative")
+    decisions: list[MetadataRouteDecision] = []
+    for item in _items(gate):
+        stable_id = str(item["stable_id"])
+        prior = repair_counts.get(stable_id, 0)
+        if prior < 0:
+            raise GateRoutingError(f"negative repair count for {stable_id}")
+        verdict = AccuracyVerdict(str(item["verdict"]))
+        rung_check = item.get("rung_check")
+        if not isinstance(rung_check, Mapping):
+            raise GateRoutingError("metadata gate item must require a rung check")
+        rung_verdict = AccuracyVerdict(str(rung_check.get("verdict")))
+        if rung_verdict is AccuracyVerdict.ACCURATE and (
+            rung_check.get("highest_applicable") != rung_check.get("selected_rung")
+        ):
+            raise GateRoutingError(
+                "accurate rung check requires highest_applicable == selected_rung"
+            )
+        repairs = tuple(str(value) for value in item.get("required_repairs", []))
+        # Acceptance comes from the ONE shared kernel every other authority
+        # consults (the bounded repair census, the terminal-proof derivation, the
+        # reuse eligibility tripwire, the canonical write door). This site used to
+        # restate it as verdict+rung and omit the integrity conjunct, so a
+        # content-accurate item over DISPUTED EVIDENCE was published here while
+        # every downstream authority scored the same bytes a rejection -- and,
+        # being non-accepted for reuse, was also replayable into a second marked
+        # row over publishable item bytes.
+        if metadata_item_accepted(item):
+            route = GateRoute.ACCEPT
+            count = prior
+            allowed = True
+            human = False
+        else:
+            chargeable = True
+            if prior_complaint_fields is not None:
+                disclosed = prior_complaint_fields.get(stable_id)
+                if disclosed is not None:
+                    chargeable = bool(metadata_complaint_fields(item) & frozenset(disclosed))
+            count = prior + 1 if chargeable else prior
+            allowed = False
+            human = count > max_repairs
+            route = GateRoute.HUMAN_FAIL if human else GateRoute.REQUEUE_NEXT_BATCH
+        decisions.append(
+            MetadataRouteDecision(
+                stable_id=stable_id,
+                verdict=verdict,
+                route=route,
+                canonical_write_allowed=allowed,
+                repair_count=count,
+                required_repairs=repairs,
+                human_review_required=human,
+            )
+        )
+    return tuple(decisions)
+
+
+def next_metadata_batch_ids(
+    decisions: Iterable[MetadataRouteDecision],
+) -> tuple[str, ...]:
+    """Return failed item IDs that must enter the next fresh batch.
+
+    Parameters
+    ----------
+    decisions:
+        Per-item metadata routes.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Stable IDs requiring bounded repair and rebatching.
+    """
+
+    return tuple(
+        decision.stable_id
+        for decision in decisions
+        if decision.route is GateRoute.REQUEUE_NEXT_BATCH
+    )
+
+
+def route_fidelity_gate(
+    gate: Mapping[str, Any], proposal: Mapping[str, Any]
+) -> FidelityRouteDecision:
+    """Route the frozen five-way fidelity verdict without editing its proposal.
+
+    Parameters
+    ----------
+    gate:
+        Schema-valid one-item fidelity gate.
+    proposal:
+        Immutable staged proposal checked for accidental mutation.
+
+    Returns
+    -------
+    FidelityRouteDecision
+        Deterministic fidelity route; never an execution award.
+
+    Raises
+    ------
+    GateRoutingError
+        If the gate is invalid or routing mutates the proposal.
+    """
+
+    _validate_gate(gate, GateKind.FIDELITY)
+    before = stable_hash(proposal)
+    item = _items(gate)[0]
+    fidelity = item.get("fidelity")
+    if not isinstance(fidelity, Mapping) or fidelity.get("required") is not True:
+        raise GateRoutingError("fidelity gate item must require fidelity")
+    rung_check = item.get("rung_check")
+    if not isinstance(rung_check, Mapping):
+        raise GateRoutingError("fidelity gate item must require a rung check")
+    # The enum constructions stay: they REFUSE a verdict outside either closed
+    # vocabulary before anything is derived from it, so an out-of-vocabulary
+    # rung verdict raises here rather than reading as a bare non-acceptance.
+    # Acceptance ITSELF comes from the shared kernel, so this router and the
+    # proof kernels cannot drift.
+    verdict = FidelityVerdict(str(fidelity.get("verdict")))
+    _reject_unknown_rung_verdict = AccuracyVerdict(str(rung_check.get("verdict")))
+    del _reject_unknown_rung_verdict
+    accepted = fidelity_item_accepted(item)
+    # The failure reason comes from the ONE shared kernel the terminal-proof
+    # derivation in ``authority`` and the driver's terminalization candidate also
+    # consult, so routing and terminal proof cannot disagree on the same item (a
+    # rung-inaccurate finding over matching content stays an identity dispute, and
+    # a rung cannot-verify stays a could-not-determine outcome -- never the
+    # reverse, which is the m1359 write-side incoherence).
+    failure_reason_code: str | None = None
+    if not accepted:
+        failure_reason_code = fidelity_gate_failure_reason(item)
+    permanent_scar = bool(fidelity.get("permanent_scar")) or verdict is FidelityVerdict.SLOP
+    decision = FidelityRouteDecision(
+        stable_id=str(item["stable_id"]),
+        verdict=verdict,
+        route=GateRoute.ACCEPT if accepted else GateRoute.BLOCK_FIDELITY,
+        accepted_for_fidelity=accepted,
+        canonical_write_allowed=accepted,
+        permanent_scar=permanent_scar,
+        failure_reason_code=failure_reason_code,
+    )
+    if stable_hash(proposal) != before:
+        raise GateRoutingError("fidelity routing mutated the staged proposal")
+    return decision
+
+
+def emit_gate_records(gate: Mapping[str, Any]) -> tuple[JsonObject, ...]:
+    """Return defensive immutable gate records for reducer append.
+
+    Parameters
+    ----------
+    gate:
+        Validated metadata or fidelity gate.
+
+    Returns
+    -------
+    tuple[dict[str, Any], ...]
+        One append-only record. The API is tuple-shaped for later lane batching.
+
+    Raises
+    ------
+    GateRoutingError
+        If the proposed record is not a complete gate.
+    """
+
+    try:
+        validate_payload(gate)
+    except PayloadValidationError as exc:
+        raise GateRoutingError(str(exc)) from exc
+    return (deepcopy(dict(gate)),)
+
+
+def validate_terminal_disposition_gate(
+    gate: Mapping[str, Any],
+    result: AuthorResult,
+    *,
+    source_manifest: Mapping[str, Any],
+    evidence_pack: Mapping[str, Any],
+    license_identity: str,
+) -> TerminalDispositionDecision:
+    """Resolve a v3 terminal gate to exact result/source/evidence/license facts.
+
+    Parameters
+    ----------
+    gate:
+        Single-item ``terminal_disposition`` gate.v3 record.
+    result:
+        Exact typed advisory author result under review.
+    source_manifest:
+        Exact private-staged source manifest bound by the result.
+    evidence_pack:
+        Exact evidence object containing ``evidence_identity`` and ``excerpts``.
+    license_identity:
+        Independently derived exact license-disposition identity.
+
+    Returns
+    -------
+    TerminalDispositionDecision
+        Exact checked candidate for the authority kernel. It cannot award a terminal.
+
+    Raises
+    ------
+    GateRoutingError
+        If any result, source, evidence, license, kind, or predicate reference differs.
+    """
+
+    if isinstance(result, ProposedAuthorResult):
+        raise GateRoutingError("PROPOSED author results cannot use a terminal-disposition gate")
+    _validate_gate(gate, GateKind.TERMINAL_DISPOSITION)
+    if gate.get("schema_version") != GATE_SCHEMA_VERSION_V3:
+        raise GateRoutingError("terminal dispositions require gate.v3")
+    item = _items(gate)[0]
+    binding = result.binding
+    expected_item = {
+        "stable_id": binding.stable_id,
+        "work_id": binding.work_id,
+        "campaign_root_work_id": binding.campaign_id,
+    }
+    for item_field, item_value in expected_item.items():
+        if item.get(item_field) != item_value:
+            raise GateRoutingError(f"terminal gate item {item_field} does not match author result")
+    terminal = item.get("terminal_disposition")
+    if not isinstance(terminal, Mapping):
+        raise GateRoutingError("terminal gate item lacks terminal_disposition")
+    (
+        expected_kind,
+        expected_predicate,
+        result_source_ids,
+        result_evidence_ids,
+        support_claims,
+    ) = _terminal_result_references(result, evidence_pack, source_manifest)
+    exact = {
+        "author_result_id": binding.result_id,
+        "author_result_sha256": binding.result_sha256,
+        "handoff_proposal_id": (
+            result.handoff_execution.proposal["proposal_id"]
+            if isinstance(result, DeferRecommendation) and result.handoff_execution is not None
+            else None
+        ),
+        "handoff_sha256": (
+            result.handoff_execution.handoff_sha256
+            if isinstance(result, DeferRecommendation) and result.handoff_execution is not None
+            else None
+        ),
+        "kind": expected_kind,
+        "predicate": expected_predicate,
+        "source_manifest_identity": binding.source_manifest_identity,
+        "evidence_identity": result.evidence_identity,
+        "license_identity": result.license_identity,
+    }
+    for terminal_field, terminal_value in exact.items():
+        if terminal.get(terminal_field) != terminal_value:
+            raise GateRoutingError(
+                f"terminal disposition {terminal_field} does not match author result"
+            )
+    verdict = str(terminal.get("verdict"))
+    gate_source_ids = _unique_string_tuple(terminal.get("source_ids"), "terminal source_ids")
+    gate_evidence_ids = _unique_string_tuple(terminal.get("evidence_ids"), "terminal evidence_ids")
+    if verdict == "accepted":
+        # BL-10 (d) / audit B-4: identities are the MACHINE's, verdicts are the
+        # checker's. The accepted arm's checked sets are derived machine-side
+        # from the frozen result and manifest -- exactly as the BLOCKED arm
+        # derives its own -- and the checker's echoed ``source_ids`` /
+        # ``evidence_ids`` are treated as the transcription they are, never as
+        # an authority. This arm previously demanded an exact echo of up to 19
+        # machine-known strings from a stochastic model and converted one flub
+        # into ``failed:runner / protocol-violation`` for a model whose ACCEPT
+        # had just been validated (the rung-7 wrong-blame shape, measured at 2
+        # of 8 terminal items). Nothing is weakened: every downstream check --
+        # manifest membership, evidence-reference validation, integrity
+        # lockstep -- runs on the machine-derived sets below, so a poisoned
+        # reference still refuses; only the checker's authority over a fact it
+        # never owned is removed.
+        checked_source_ids = result_source_ids
+        checked_evidence_ids = result_evidence_ids
+    else:
+        checked_source_ids = gate_source_ids
+        checked_evidence_ids = gate_evidence_ids
+        _validate_terminal_rejection_subset(
+            evidence_pack,
+            verdict=verdict,
+            gate_source_ids=gate_source_ids,
+            gate_evidence_ids=gate_evidence_ids,
+            result_source_ids=result_source_ids,
+            result_evidence_ids=result_evidence_ids,
+            support_claims=support_claims,
+        )
+    if _source_manifest_identity(source_manifest) != binding.source_manifest_identity:
+        raise GateRoutingError("terminal source manifest identity does not match author result")
+    # Coverage, so supplementary rows count: a terminal arm citing a source the
+    # executor's ONE granted supplementary round fetched for it is quoting OUR
+    # fetch, not an outside document.
+    manifest_source_ids = _manifest_source_ids(source_manifest, include_supplementary=True)
+    if not set(result_source_ids).issubset(manifest_source_ids):
+        raise GateRoutingError("terminal recommendation references a source outside its manifest")
+    if evidence_pack.get("evidence_identity") != result.evidence_identity:
+        raise GateRoutingError("terminal evidence-pack identity does not match author result")
+    if verdict == "accepted":
+        _validate_terminal_evidence_references(
+            evidence_pack,
+            evidence_ids=checked_evidence_ids,
+            source_ids=checked_source_ids,
+            support_claims=support_claims,
+        )
+    if license_identity != result.license_identity:
+        raise GateRoutingError("terminal license identity does not match staged license facts")
+    if verdict == "accepted":
+        integrity = item.get("integrity")
+        if (
+            item.get("verdict") != "accurate"
+            or not isinstance(integrity, Mapping)
+            or (integrity.get("verdict") != "accurate")
+        ):
+            raise GateRoutingError("accepted terminal disposition requires accurate item integrity")
+    findings = terminal.get("findings")
+    if not isinstance(findings, list) or not all(isinstance(value, str) for value in findings):
+        raise GateRoutingError("terminal disposition findings are invalid")
+    return TerminalDispositionDecision(
+        stable_id=binding.stable_id,
+        work_id=binding.work_id,
+        campaign_id=binding.campaign_id,
+        gate_id=str(gate["gate_id"]),
+        predicate=expected_predicate,
+        accepted=verdict == "accepted",
+        source_ids=checked_source_ids,
+        evidence_ids=checked_evidence_ids,
+        findings=tuple(findings),
+    )
+
+
+def _terminal_result_references(
+    result: DeferRecommendation | SkipRecommendation | BlockedRecommendation,
+    evidence_pack: Mapping[str, Any],
+    source_manifest: Mapping[str, Any],
+) -> tuple[str, str, tuple[str, ...], tuple[str, ...], frozenset[str]]:
+    """Derive exact terminal gate references from one advisory union arm."""
+
+    if isinstance(result, DeferRecommendation):
+        predicate = f"needs-{result.platform}"
+        return (
+            "DEFER_RECOMMENDATION",
+            predicate,
+            result.source_ids,
+            result.evidence_ids,
+            frozenset({predicate, f"deferred:{predicate}", f"platform.{result.platform}"}),
+        )
+    if isinstance(result, SkipRecommendation):
+        predicate = result.status_code.removeprefix("skipped:")
+        return (
+            "SKIP_RECOMMENDATION",
+            predicate,
+            result.source_ids,
+            result.evidence_ids,
+            frozenset({predicate, result.status_code}),
+        )
+    # A BLOCKED arm declares NO ``source_ids`` of its own -- the schema gives it
+    # none -- so the checked set is the whole frozen manifest, which is exactly
+    # what ``driver_models._terminal_checker_item`` puts in the envelope's
+    # ``checked_source_ids`` and hashes into ``verified_hashes.source_to_code_map``.
+    # It is also the set whose round-robin pairing produces the author-declared
+    # ``evidence_identity`` that the same function re-derives and refuses to bind
+    # unless it matches, so the manifest set is already hash-bound on this arm.
+    #
+    # This used to project the set back out of the citation table instead, which
+    # returned ``manifest[i % len(manifest)]`` for each evidence ID -- an artifact
+    # of the round-robin derivation that the checker prompt itself documents as
+    # carrying no provenance. Whenever a manifest held more sources than the
+    # result held evidence IDs the two machine-side derivations disagreed, no
+    # ``terminal.source_ids`` a checker could write satisfied both, and the gate
+    # died on a field it owned. Single-source fixtures hid it because there the
+    # projection and the manifest coincide.
+    source_ids = tuple(sorted(_manifest_source_ids(source_manifest)))
+    return (
+        "BLOCKED",
+        "blocked-prerequisite",
+        source_ids,
+        result.evidence_ids,
+        frozenset(
+            {
+                "blocked-prerequisite",
+                f"blocked.{result.stage}.{result.reason_code}",
+            }
+        ),
+    )
+
+
+def _source_manifest_identity(source_manifest: Mapping[str, Any]) -> str:
+    """Return the exact source-manifest identity used by author dispatch."""
+
+    explicit = source_manifest.get("manifest_sha256") or source_manifest.get(
+        "source_manifest_identity"
+    )
+    return (
+        str(explicit) if explicit is not None else stable_hash(source_manifest.get("sources", []))
+    )
+
+
+def _manifest_source_ids(
+    source_manifest: Mapping[str, Any], *, include_supplementary: bool = False
+) -> frozenset[str]:
+    """Return unique source IDs from an exact staged manifest.
+
+    Parameters
+    ----------
+    source_manifest:
+        Frozen manifest, optionally carrying ``supplementary_sources``.
+    include_supplementary:
+        Widen to every citable row. Answer the COVERAGE question ("may this
+        result name that source?") with ``True``; leave it ``False`` for the
+        BLOCKED arm's machine DERIVATION, which must stay byte-identical to the
+        two sibling derivations in :mod:`~menagerie.crawler.author_executor` and
+        :func:`~menagerie.crawler.driver_models._terminal_checker_item`. Those
+        both read the dispatch envelope's frozen ``sources``, and the three-way
+        agreement is what binds ``evidence_identity``; widening one of them alone
+        would break a good BLOCKED result on an identity nobody derived.
+    """
+
+    sources = source_manifest.get("sources")
+    if not isinstance(sources, list):
+        raise GateRoutingError("terminal source manifest has no sources")
+    rows: list[Any] = (
+        manifest_source_rows(source_manifest) if include_supplementary else list(sources)
+    )
+    source_ids = [source.get("source_id") for source in rows if isinstance(source, Mapping)]
+    if (
+        len(source_ids) != len(rows)
+        or not all(isinstance(source_id, str) and source_id for source_id in source_ids)
+        or len(source_ids) != len(set(source_ids))
+    ):
+        raise GateRoutingError("terminal source manifest IDs are incomplete or duplicated")
+    return frozenset(str(source_id) for source_id in source_ids)
+
+
+def _evidence_source_ids(
+    evidence_pack: Mapping[str, Any], evidence_ids: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Resolve exact source IDs for blocked-result evidence references."""
+
+    excerpts = _citation_table(evidence_pack)
+    if not isinstance(excerpts, list):
+        raise GateRoutingError("terminal evidence pack has no excerpts")
+    by_id = {
+        str(excerpt.get("evidence_id")): excerpt
+        for excerpt in excerpts
+        if isinstance(excerpt, Mapping) and isinstance(excerpt.get("evidence_id"), str)
+    }
+    if len(by_id) != len(excerpts):
+        raise GateRoutingError("terminal evidence IDs are incomplete or duplicated")
+    sources: set[str] = set()
+    for evidence_id in evidence_ids:
+        excerpt = by_id.get(evidence_id)
+        if excerpt is None or not isinstance(excerpt.get("source_id"), str):
+            raise GateRoutingError(f"terminal evidence reference is unresolved: {evidence_id}")
+        sources.add(str(excerpt["source_id"]))
+    return tuple(sorted(sources))
+
+
+def _validate_terminal_evidence_references(
+    evidence_pack: Mapping[str, Any],
+    *,
+    evidence_ids: tuple[str, ...],
+    source_ids: tuple[str, ...],
+    support_claims: frozenset[str],
+) -> None:
+    """Resolve the machine-derived citation table and require predicate support."""
+
+    resolved_sources = _evidence_source_ids(evidence_pack, evidence_ids)
+    if not set(resolved_sources).issubset(source_ids):
+        raise GateRoutingError("terminal evidence resolves outside the checked source set")
+    excerpts = _citation_table(evidence_pack)
+    assert isinstance(excerpts, list)
+    by_id = {
+        str(excerpt["evidence_id"]): excerpt
+        for excerpt in excerpts
+        if isinstance(excerpt, Mapping) and "evidence_id" in excerpt
+    }
+    for evidence_id in evidence_ids:
+        supports = by_id[evidence_id].get("supports")
+        if not isinstance(supports, list) or not support_claims.intersection(supports):
+            raise GateRoutingError(
+                f"terminal evidence {evidence_id} does not support its typed predicate"
+            )
+
+
+def _validate_terminal_rejection_subset(
+    evidence_pack: Mapping[str, Any],
+    *,
+    verdict: str,
+    gate_source_ids: tuple[str, ...],
+    gate_evidence_ids: tuple[str, ...],
+    result_source_ids: tuple[str, ...],
+    result_evidence_ids: tuple[str, ...],
+    support_claims: frozenset[str],
+) -> None:
+    """Require a non-accepted terminal verdict to bind an adjudicated evidence subset.
+
+    This is the ONE ``source_ids`` semantics for non-accepted terminal verdicts:
+    the checker names the evidence it actually adjudicated, and ``source_ids``
+    is exactly the source set those cited excerpts resolve to in the literal
+    excerpt table. The full checked set is already hash-bound on the same item
+    twice (``source_manifest_identity`` and ``verified_hashes.source_to_code_map``),
+    so a copy of it here carries no adjudication and is refused -- the equality
+    against literal resolution is the tripwire that catches a rejection citing
+    sources its own evidence never touched.
+
+    One state has nothing citable: an unresolved pack ships EMPTY literal
+    excerpts, and the prompt instructs ``cannot-verify`` as the honest verdict
+    there. Demanding a bound subset from a verdict that asserts adjudication
+    FAILED would make the contract unsatisfiable (the leg-1 disease in its
+    cannot-verify form), so exactly that state -- ``cannot-verify`` with empty
+    ``evidence_ids`` AND empty ``source_ids`` AND an empty excerpt table --
+    binds the empty subset. Whenever any excerpt resolved, or the verdict is
+    ``rejected`` (which requires a resolved pack), an empty citation is still
+    refused.
+
+    Parameters
+    ----------
+    evidence_pack:
+        Terminal checker evidence pack containing literal excerpts.
+    verdict:
+        Non-accepted closed verdict (``rejected`` or ``cannot-verify``); the
+        gate schema already enforced the vocabulary.
+    gate_source_ids:
+        Source IDs the checker declared in its terminal disposition.
+    gate_evidence_ids:
+        Evidence IDs the checker declared in its terminal disposition.
+    result_source_ids:
+        Machine-derived source set for the full author terminal result.
+    result_evidence_ids:
+        Author-declared evidence IDs for the full author terminal result.
+    support_claims:
+        Predicate-support vocabulary for this terminal arm.
+
+    Raises
+    ------
+    GateRoutingError
+        If the non-accepted verdict does not bind a non-empty exact subset of
+        the result's declared terminal evidence, outside the one empty-pack
+        cannot-verify state.
+    """
+
+    if not gate_evidence_ids:
+        excerpts = evidence_pack.get("excerpts")
+        if not isinstance(excerpts, list):
+            raise GateRoutingError("terminal evidence pack has no literal excerpts")
+        if verdict == "cannot-verify" and not excerpts and not gate_source_ids:
+            return
+        raise GateRoutingError(f"{verdict} terminal disposition must cite adjudicated evidence")
+    if not set(gate_source_ids).issubset(result_source_ids):
+        raise GateRoutingError("terminal disposition source IDs are outside result")
+    if not set(gate_evidence_ids).issubset(result_evidence_ids):
+        raise GateRoutingError("terminal disposition evidence IDs are outside result")
+    resolved_sources = _literal_evidence_source_ids(evidence_pack, gate_evidence_ids)
+    if set(resolved_sources) != set(gate_source_ids):
+        raise GateRoutingError("terminal disposition source IDs do not match adjudicated evidence")
+    _validate_literal_terminal_evidence_support(
+        evidence_pack,
+        evidence_ids=gate_evidence_ids,
+        support_claims=support_claims,
+    )
+
+
+def _literal_evidence_source_ids(
+    evidence_pack: Mapping[str, Any], evidence_ids: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Resolve source IDs from the checker-visible literal excerpt table.
+
+    Parameters
+    ----------
+    evidence_pack:
+        Terminal evidence pack containing an ``excerpts`` list.
+    evidence_ids:
+        Evidence IDs to resolve.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Sorted unique source IDs attached to the requested literal excerpts.
+    """
+
+    excerpts = evidence_pack.get("excerpts")
+    if not isinstance(excerpts, list):
+        raise GateRoutingError("terminal evidence pack has no literal excerpts")
+    by_id = {
+        str(excerpt.get("evidence_id")): excerpt
+        for excerpt in excerpts
+        if isinstance(excerpt, Mapping) and isinstance(excerpt.get("evidence_id"), str)
+    }
+    if len(by_id) != len(excerpts):
+        raise GateRoutingError("terminal literal evidence IDs are incomplete or duplicated")
+    sources: set[str] = set()
+    for evidence_id in evidence_ids:
+        excerpt = by_id.get(evidence_id)
+        if excerpt is None or not isinstance(excerpt.get("source_id"), str):
+            raise GateRoutingError(f"terminal evidence reference is unresolved: {evidence_id}")
+        sources.add(str(excerpt["source_id"]))
+    return tuple(sorted(sources))
+
+
+def _validate_literal_terminal_evidence_support(
+    evidence_pack: Mapping[str, Any],
+    *,
+    evidence_ids: tuple[str, ...],
+    support_claims: frozenset[str],
+) -> None:
+    """Require checker-adjudicated literal excerpts to name the terminal predicate.
+
+    Parameters
+    ----------
+    evidence_pack:
+        Terminal evidence pack containing an ``excerpts`` list.
+    evidence_ids:
+        Evidence IDs the checker adjudicated.
+    support_claims:
+        Predicate-support vocabulary for this terminal arm.
+
+    Raises
+    ------
+    GateRoutingError
+        If any adjudicated excerpt does not support the terminal predicate.
+    """
+
+    excerpts = evidence_pack.get("excerpts")
+    if not isinstance(excerpts, list):
+        raise GateRoutingError("terminal evidence pack has no literal excerpts")
+    by_id = {
+        str(excerpt["evidence_id"]): excerpt
+        for excerpt in excerpts
+        if isinstance(excerpt, Mapping) and "evidence_id" in excerpt
+    }
+    for evidence_id in evidence_ids:
+        supports = by_id[evidence_id].get("supports")
+        if not isinstance(supports, list) or not support_claims.intersection(supports):
+            raise GateRoutingError(
+                f"terminal evidence {evidence_id} does not support its typed predicate"
+            )
+
+
+def _citation_table(evidence_pack: Mapping[str, Any]) -> object:
+    """Return the machine-derived evidence/source citation table.
+
+    ``derive_terminal_evidence_pack`` owns this table and its hash IS
+    ``evidence_identity``, so it is what the driver's reference check must read.
+    The envelope ships it as ``identity_preimage`` alongside a separate list of
+    literal excerpts the machine re-derived from frozen bytes; those two are not
+    interchangeable, and resolving a source ID from a literal excerpt would make
+    this check depend on whether grounding happened to succeed. Packs supplied
+    directly, without the split, keep their existing meaning.
+
+    Parameters
+    ----------
+    evidence_pack:
+        Terminal evidence pack built for the checker envelope.
+
+    Returns
+    -------
+    object
+        Citation-table rows, unvalidated; the caller enforces their shape.
+    """
+
+    preimage = evidence_pack.get("identity_preimage")
+    return evidence_pack.get("excerpts") if preimage is None else preimage
+
+
+def _unique_string_tuple(value: object, field: str) -> tuple[str, ...]:
+    """Return one duplicate-free string array from a schema-valid gate."""
+
+    if (
+        not isinstance(value, list)
+        or not all(isinstance(item, str) and item for item in value)
+        or len(value) != len(set(value))
+    ):
+        raise GateRoutingError(f"{field} must contain unique strings")
+    return tuple(value)
+
+
+def _validate_gate(gate: Mapping[str, Any], expected_kind: GateKind) -> None:
+    """Validate a gate schema and exact lane kind.
+
+    Parameters
+    ----------
+    gate:
+        Candidate gate record.
+    expected_kind:
+        Required lane.
+
+    Raises
+    ------
+    GateRoutingError
+        If schema or kind is invalid.
+    """
+
+    try:
+        validate_payload(gate)
+    except PayloadValidationError as exc:
+        raise GateRoutingError(str(exc)) from exc
+    if gate.get("gate_kind") != expected_kind.value:
+        raise GateRoutingError(f"expected {expected_kind.value} gate")
+
+
+def _items(gate: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return gate items as validated mappings.
+
+    Parameters
+    ----------
+    gate:
+        Schema-valid gate.
+
+    Returns
+    -------
+    list[Mapping[str, Any]]
+        Gate items.
+
+    Raises
+    ------
+    GateRoutingError
+        If an item is unexpectedly not an object.
+    """
+
+    raw = gate.get("items")
+    if not isinstance(raw, list) or not all(isinstance(item, Mapping) for item in raw):
+        raise GateRoutingError("gate items must be objects")
+    return list(raw)

@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://torchlens.org/schemas/menagerie/crawler/text-corpus-index-v1.schema.json",
+  "title": "Menagerie crawler durable text-corpus index v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "corpus_row_id",
+    "stable_id",
+    "work_id",
+    "source_id",
+    "role",
+    "origin",
+    "content_sha256",
+    "bytes_len",
+    "media_type",
+    "url",
+    "retrieved_at",
+    "license_disposition"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "menagerie.crawler.text-corpus-index.v1",
+      "description": "Closed corpus-index payload version."
+    },
+    "corpus_row_id": {
+      "$ref": "#/$defs/hash",
+      "description": "Deterministic row identity: the stable hash of the type tag plus stable_id, content_sha256, source_id, role, and origin. Two hosts promoting the same document for the same model mint the same row, so cross-host replays stay idempotent and a conflicting replay is refused by the ledger."
+    },
+    "stable_id": {
+      "$ref": "#/$defs/nonempty_string",
+      "description": "Durable identifier of the model whose crawl retained this document."
+    },
+    "work_id": {
+      "type": "string",
+      "description": "Work identity recorded by the author custody envelope, empty when the source envelope predates work identity."
+    },
+    "source_id": {
+      "$ref": "#/$defs/nonempty_string",
+      "description": "Per-model source identifier from the broker pack or the reserved discovery identifier. Excerpt evidence binds to documents through this id plus the manifest digest, so excerpt-to-document resolution never needs the scratch tree."
+    },
+    "role": {
+      "enum": [
+        "implementation",
+        "introducing-paper",
+        "documentation",
+        "probe",
+        "discovery",
+        "machine-inventory",
+        "uncatalogued"
+      ],
+      "description": "Closed retained-role vocabulary. The three broker manifest roles are kept verbatim; probe covers fetched-but-unmanifested candidate bytes, discovery the frozen discovery envelope, machine-inventory the routed-environment inventory document, and uncatalogued a CAS object present in custody with no surviving manifest or outcome row to classify it."
+    },
+    "requested_role": {
+      "type": "string",
+      "description": "The author's requested role for this source, when an outcome row recorded one. Advisory provenance only; role is the machine-bound authority."
+    },
+    "origin": {
+      "enum": [
+        "custody-promotion",
+        "broker-evidence",
+        "discovery-evidence",
+        "source-cas"
+      ],
+      "description": "Closed vocabulary naming which retention class produced the bytes: a custody-manifest promotion, a fetched broker evidence blob with no manifest row, the frozen discovery envelope, or a source-cas object swept without an outcome row."
+    },
+    "content_sha256": {
+      "$ref": "#/$defs/hash",
+      "description": "Exact digest of the stored payload bytes. The payload lives at the two-level content address under the corpus root and is re-hashed on every read; this field is the join key for excerpt resolution and cross-shard union."
+    },
+    "bytes_len": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Exact payload byte length, recomputed from the admitted bytes rather than copied from any producer field."
+    },
+    "media_type": {
+      "type": "string",
+      "description": "Media type recorded by the broker outcome, or application/octet-stream when no outcome row survives."
+    },
+    "url": {
+      "type": "string",
+      "description": "Locator the bytes were fetched from, or the urn the discovery envelope was frozen under. Empty only for swept CAS objects with no surviving outcome row."
+    },
+    "final_url": {
+      "type": "string",
+      "description": "Post-redirect locator when the outcome row recorded one."
+    },
+    "locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "forge": {
+          "type": "string",
+          "description": "Forge host that answered the resolver receipt (for example ``github.com``); the document's provenance authority, not a fetch URL."
+        },
+        "repo": {
+          "type": "string",
+          "description": "Repository the document was resolved from, as the resolver receipt recorded it."
+        },
+        "ref": {
+          "type": "string",
+          "description": "Ref the author requested (tag, branch, or commit) before resolution."
+        },
+        "resolved_sha": {
+          "type": "string",
+          "description": "Exact commit the forge resolved that ref to, so a later reader can re-fetch the identical bytes."
+        }
+      },
+      "description": "Resolver-receipt subset for forge-file sources: enough to re-derive the exact upstream revision without the scratch tree."
+    },
+    "retrieved_at": {
+      "type": "string",
+      "description": "Broker-clock instant the exact bytes finished fetching, carried verbatim from the outcome row; empty when the retention class has no fetch instant (a frozen discovery envelope, a swept CAS object). Never minted at promotion time, so replays are byte-identical."
+    },
+    "license_disposition": {
+      "enum": [
+        "public-compatible",
+        "restricted-private",
+        "manifest-only",
+        "not-applicable"
+      ],
+      "description": "Redistribution class mirrored from the artifact-authority license decision when one covers this digest, else the conservative manifest-only default. Advisory metadata for corpus consumers; it grants no publication authority of its own -- the artifact ledger remains the only authority."
+    },
+    "custody_disposition": {
+      "type": "string",
+      "description": "The source-custody disposition observed for this document when the row originates from a custody promotion."
+    },
+    "ledger_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Local append sequence stamped by the ledger."
+    },
+    "payload_sha256": {
+      "$ref": "#/$defs/hash",
+      "description": "Row self-digest stamped by the ledger."
+    },
+    "shadow_rehearsal": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional W3 shadow-rehearsal marker: the declared rehearsal generation namespace stamped by the write-side producer while MENAGERIE_SHADOW_REHEARSAL_RUN is set. Presence excludes the record from every reuse/authority seam (W44); it grants nothing."
+    }
+  },
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonempty_string": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

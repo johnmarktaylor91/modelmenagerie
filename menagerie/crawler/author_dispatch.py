@@ -1,0 +1,2163 @@
+"""Deterministic v3 author requests, advisory results, caches, and repairs."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence, TypeAlias, Union
+
+from menagerie.crawler.authority import AuthorityContext
+from menagerie.crawler.constants import (
+    ACCESS_BARRIER_REJECTION_CLASS,
+    ACCESS_BLOCKED_REASON_CODE,
+    AUTHOR_MAX_FETCH_TARGETS,
+    AUTHOR_MAX_TOOL_CALLS,
+    AUTHOR_PROPOSAL_SCHEMA_VERSION_V3,
+    AUTHOR_PROMPT_NAME,
+    AUTHOR_RESULT_SCHEMA_VERSION,
+    AUTHOR_SESSION_WALL_SECONDS,
+    EFFORT_EXHAUSTION_REASON_CODES,
+    EXHAUSTION_TERMINAL_REASON_BY_STAGE,
+    AuthorPauseReason,
+)
+from menagerie.crawler.identity import durable_fsync, fsync_directory, hash_bytes, stable_hash
+from menagerie.crawler.models import JsonObject, manifest_source_rows
+from menagerie.crawler.package_namespace import (
+    canonical_distribution_name,
+    inventory_disclosure,
+    inventory_row_provides_distribution,
+)
+from menagerie.crawler.evidence import (
+    LOCATOR_AUTHORITY_LEGACY_MEMBERSHIP,
+    LOCATOR_AUTHORITY_TEXT_LINE,
+)
+from menagerie.crawler.proposal import ProposalValidationReport, validate_author_proposal
+from menagerie.crawler.schema import (
+    MODEL_SCHEMA_VERSION_V3,
+    PayloadValidationError,
+    validate_payload,
+)
+
+PROMPT_PATH = Path(__file__).with_name("prompts") / f"{AUTHOR_PROMPT_NAME}.txt"
+# v2 (AT-10): the cache binds its exact generation and lifecycle -- stable_id,
+# work_id, repair generation, result id, manifest identity, staged transaction
+# id, and the capture-time lifecycle observation. A v1 cache (m12646's
+# surviving repair_generation:null shape) FAILS CLOSED for authority-bearing
+# reuse via the version check; diagnostic reads may still parse the JSON.
+_CACHE_VERSION = "menagerie.crawler.author-result-cache.v2"
+
+#: Closed capture-time lifecycle vocabulary for the cache's staging state.
+_CACHE_LIFECYCLES = frozenset({"unstaged", "staged-pending"})
+_ENVELOPE_VERSION = "menagerie.crawler.author-envelope.v3"
+
+
+class AuthorDispatchError(ValueError):
+    """Raised when an author envelope, result, cache, or repair is not exact.
+
+    This base type is the OWNERSHIP-AMBIGUOUS catch-all and nothing else. It stays
+    the base of every sibling below so that existing ``except AuthorDispatchError``
+    handlers keep catching the whole family, but a site that raises it BARE is
+    asserting only "something in the author lane was not exact" -- which is what the
+    author lane's blanket arm records as ``failed:author`` /``session-crashed``.
+
+    Raising it bare from a site whose ownership IS known is the defect this hierarchy
+    exists to prevent: ``session-crashed`` is a field the reducer counts, so every
+    unrelated cause it absorbs makes the campaign's own failure census wrong. Pick
+    :class:`AuthorResultMalformedError`, :class:`AuthorEngineFaultError`, or
+    :class:`AuthorInfrastructureFaultError` whenever the raise site knows who owns
+    the input it just refused.
+    """
+
+
+class AuthorResultMalformedError(AuthorDispatchError):
+    """Raised when AUTHOR-SUPPLIED bytes fail a contract the author is bound to.
+
+    The session ran to completion and published something; what it published does not
+    satisfy the frozen contract. Recording that as ``session-crashed`` states a fact
+    that did not occur. The author lane routes this to ``failed:author`` /
+    ``malformed-result``, the reason the vocabulary already carries for exactly this
+    ("the author published a well-formed result naming a reason the closed record
+    vocabulary cannot express" generalised to every author-owned contract refusal).
+
+    This is NOT a weakening of any check. Every refusal that raised before still
+    refuses, at the same boundary, with the same message. Only the recorded ownership
+    changes, from a false claim about the session's liveness to a true one about its
+    content.
+    """
+
+
+class AuthorExecutorContractError(AuthorResultMalformedError):
+    """The EXECUTOR'S OWN validator refused the bytes one author session published.
+
+    Same ownership as :class:`AuthorResultMalformedError` -- the session ran to
+    completion and what it published fails a frozen contract -- but observed one
+    process boundary further out: the author executor validated the session's
+    discovery or result payload itself, refused it, and relayed that refusal
+    through its retryable exit code. ``classify_author_exit`` used to convert
+    that exit into a ``RetryableOperatorError``, which every author-lane handler
+    treats as CAMPAIGN-scoped transport failure. On 2026-07-27 one model whose
+    two sessions each published schema-invalid payloads (an empty discovery
+    ``notes`` string, then a proposal missing ``fidelity.permanent_scar``)
+    therefore terminated a 20-model rung with zero records written, and every
+    resume re-aborted on the same model.
+
+    The evidence carried by this class is confined to ONE model's authoring
+    content, so its blast radius is that model: the driver still grants one
+    fresh bounded session (the author is stochastic; the second session
+    routinely gets further than the first), and a repeat refusal terminalizes
+    the model as ``failed:author`` / ``malformed-result`` while the campaign
+    continues. The executor's validator itself is untouched -- an invalid result
+    is still refused at the same boundary with the same message; only which
+    party the refusal indicts has changed.
+
+    Deliberately NOT a ``RetryableOperatorError``: that class means "the
+    machine, not the model, is broken", and every catch site that re-raises it
+    campaign-wide is correct for genuine transport failure. Sessions that died
+    without publishing (``session-crashed``, ``wall-exceeded``,
+    ``no-result-output``) stay ambiguous between the two readings and keep
+    their campaign-scoped classification.
+
+    Parameters
+    ----------
+    stable_id:
+        Model whose published payload the executor refused.
+    detail:
+        Exact bounded diagnostic tail supplied by the trusted operator protocol.
+    """
+
+    def __init__(self, stable_id: str, detail: str) -> None:
+        """Attach the affected model and the executor's bounded diagnostic."""
+
+        super().__init__(
+            f"author session for {stable_id} published a contract-invalid payload: {detail}"
+        )
+        self.stable_id = stable_id
+        self.detail = detail
+
+
+class AuthorSourceDeterministicallyUnfetchableError(AuthorDispatchError):
+    """Two consecutive attempts hit byte-identical deterministic fetch refusals.
+
+    The executor's broker recorded the SAME deterministic per-target refusals
+    (bad-ref, oversized, redirect-refused -- :data:`~menagerie.crawler.
+    source_broker.BROKER_DETERMINISTIC_OUTCOMES`) with the same evidence
+    digests on two consecutive attempts, and relayed it through its PERMANENT
+    exit. A third paid session would buy the same bytes and the same refusal:
+    200a's leg-27 chain retried a ceiling-clipped forge response as three paid
+    sessions before exhausting the member and feeding the no-publication
+    streak that killed the leg (AL-3).
+
+    Deliberately member-scoped and non-retryable: the evidence is confined to
+    this one model's declared targets, so the terminal lands on the source
+    stage's existing ``source-target-invalid`` -- the author named targets the
+    controlled fetch contract deterministically cannot accept -- and the
+    campaign continues. Never a ``RetryableOperatorError``: the machine is not
+    broken, and re-buying a deterministic refusal is exactly the waste the
+    short-circuit exists to stop.
+
+    Parameters
+    ----------
+    stable_id:
+        Model whose declared targets refused deterministically twice.
+    detail:
+        Exact bounded diagnostic tail supplied by the trusted operator protocol.
+    """
+
+    def __init__(self, stable_id: str, detail: str) -> None:
+        """Attach the affected model and the executor's bounded diagnostic."""
+
+        super().__init__(
+            f"author source targets for {stable_id} refused deterministically on two "
+            f"consecutive attempts: {detail}"
+        )
+        self.stable_id = stable_id
+        self.detail = detail
+
+
+class AuthorEngineFaultError(AuthorDispatchError):
+    """Raised when TORCHLENS-SUPPLIED inputs to the author lane are inconsistent.
+
+    The envelope, the effort grant, the intake context, the shipped prompt identity,
+    and the disposable result cache are all built by the engine from machine-held
+    facts. When one of those refuses its own self-consistency check, the author is not
+    implicated at all: no author session has necessarily even run. Following the
+    ``SourceManifestBindingError`` precedent, the lane records ``failed:runner`` /
+    ``internal-error`` so the author-stage census counts author failures only.
+    """
+
+
+class AuthorInfrastructureFaultError(AuthorDispatchError):
+    """Raised when the host, not the author or the engine's own data, refused.
+
+    Unreadable shipped prompt bytes and a corrupt on-disk result cache are host
+    faults: the same campaign on a healthy host would not produce them. They share
+    ``failed:runner`` / ``internal-error`` with :class:`AuthorEngineFaultError`
+    because the ``runner`` reason vocabulary has no retryable member to name and
+    inventing one would be a vocabulary change, not a taxonomy fix. The two stay
+    DISTINCT TYPES so the operational event's top-level ``error_summary`` still tells
+    an operator whether to fix the host or fix the code -- the exception type is the
+    discriminator, and it travels.
+    """
+
+
+class AuthorEffortExhaustionClaim(AuthorDispatchError):
+    """Raised when a BLOCKED advisory arm claims an effort or budget outcome.
+
+    Refusing the claim is only half the fix. Falling through to the author lane's blanket
+    arm would record ``identity-unresolved`` -- a different false statement about the same
+    model. This type exists so the lane can route the session to the terminal the doctrine
+    already names, ``failed:<stage>`` with ``effort-cap-exhausted``, which
+    ``tools/requeue --grant ...`` can reissue.
+
+    Parameters
+    ----------
+    args:
+        Standard exception arguments.
+    stage:
+        Closed blocking stage the author named. Carried for the same reason
+        :class:`~menagerie.crawler.driver_contracts.AuthorEffortCapExceeded` carries it:
+        recording every exhaustion as ``failed:source`` asserts that the model's source
+        could not be resolved, which is routinely false. Defaults to ``"source"``.
+    reason_code:
+        Stage-valid exhaustion reason for the terminal. Resolved from ``stage`` because the
+        vocabularies differ -- ``author`` carries the ``effort-exhausted:`` family while the
+        other stages carry ``effort-cap-exhausted`` -- so a single hardcoded reason would
+        record an invalid ``(stage, reason_code)`` pair.
+    """
+
+    def __init__(
+        self,
+        *args: object,
+        stage: str = "source",
+        reason_code: Optional[str] = None,
+    ) -> None:
+        """Attach the closed stage and its stage-valid exhaustion reason."""
+
+        super().__init__(*args)
+        self.stage = stage if stage in EXHAUSTION_TERMINAL_REASON_BY_STAGE else "source"
+        self.reason_code = reason_code or EXHAUSTION_TERMINAL_REASON_BY_STAGE[self.stage]
+
+
+class AuthorResultKind(str, Enum):
+    """Closed advisory author-result arms."""
+
+    PROPOSED = "PROPOSED"
+    DEFER_RECOMMENDATION = "DEFER_RECOMMENDATION"
+    SKIP_RECOMMENDATION = "SKIP_RECOMMENDATION"
+    BLOCKED = "BLOCKED"
+
+
+@dataclass(frozen=True)
+class AuthorResultBinding:
+    """Common immutable authority bindings carried by every author-result arm.
+
+    Parameters
+    ----------
+    result_id, result_sha256:
+        Exact advisory result identity and digest.
+    stable_id, work_id, campaign_id:
+        Trusted model, work-generation, and repair-lineage identities.
+    author_identity, prompt_identity, dispatcher_identity:
+        Exact author contract identities from :class:`AuthorityContext`.
+    source_manifest_identity:
+        Exact private-staging source manifest identity.
+    intake_snapshot_id, intake_snapshot_sha256, intake_item_sha256:
+        Exact active intake trust roots.
+    created_at:
+        Author-reported result creation timestamp.
+    raw_result:
+        Defensive copy of the complete schema-valid result.
+    """
+
+    result_id: str
+    result_sha256: str
+    stable_id: str
+    work_id: str
+    campaign_id: str
+    author_identity: str
+    prompt_identity: str
+    dispatcher_identity: str
+    source_manifest_identity: str
+    intake_snapshot_id: str
+    intake_snapshot_sha256: str
+    intake_item_sha256: str
+    created_at: str
+    raw_result: JsonObject
+
+
+@dataclass(frozen=True)
+class ProposedAuthorResult:
+    """A complete v3 proposal recommendation and its deterministic validation."""
+
+    binding: AuthorResultBinding
+    proposal: JsonObject
+    validation_report: ProposalValidationReport
+
+
+@dataclass(frozen=True)
+class HandoffExecution:
+    """Separately authenticated executable proposal carried by a terminal deferral."""
+
+    proposal: JsonObject
+    proposal_sha256: str
+    code_manifest_identity: str
+    source_manifest_identity: str
+    handoff_sha256: str
+
+
+@dataclass(frozen=True)
+class DeferRecommendation:
+    """A hash-bound CUDA/x86 recommendation awaiting a terminal gate."""
+
+    binding: AuthorResultBinding
+    platform: str
+    source_ids: tuple[str, ...]
+    evidence_ids: tuple[str, ...]
+    evidence_identity: str
+    license_identity: str
+    recommendation_sha256: str
+    # REQUIRED, and deliberately ahead of the defaulted fields. A deferral is the
+    # one terminal arm that will later be RUN on the deferred platform and publish
+    # an artifact, so its executable authority -- and therefore its licensing --
+    # must be settled BEFORE it is deferred. ``license_identity`` above is the
+    # stable hash of ``handoff_execution.proposal.proposed_facts.licenses``, which
+    # is why ``_terminal_checker_item`` can only source the license disposition
+    # from here and refuses a deferral that lacks one. Four independent layers
+    # already treat a handoff-less DEFER as invalid: ``defer_payload`` lists
+    # ``handoff_execution`` in ``required`` (author-result-v4) while the skip and
+    # blocked payloads do not, ``parse_author_result`` below refuses it,
+    # ``AuthorArtifact.proposal`` cannot produce an executable proposal without it,
+    # and ``_assert_persisted_handoff_authority_available`` refuses to START the
+    # Linux deferred sweep when any persisted deferral is missing its handoff.
+    # An ``Optional`` here made that unrepresentable state representable; a
+    # TRAILING default additionally let a positionally-supplied handoff silently
+    # rebind onto ``evidence_records`` when that field was later inserted ahead of
+    # it. Keep this field ahead of every defaulted field.
+    handoff_execution: HandoffExecution
+    evidence_records: tuple[JsonObject, ...] = ()
+    license_record: JsonObject | None = None
+
+
+@dataclass(frozen=True)
+class SkipRecommendation:
+    """A closed R5 recommendation awaiting a terminal gate."""
+
+    binding: AuthorResultBinding
+    status_code: str
+    source_ids: tuple[str, ...]
+    evidence_ids: tuple[str, ...]
+    evidence_identity: str
+    search_report_identity: str
+    license_identity: str
+    recommendation_sha256: str
+    evidence_records: tuple[JsonObject, ...] = ()
+    license_record: JsonObject | None = None
+
+
+@dataclass(frozen=True)
+class BlockedRecommendation:
+    """A prerequisite-blocked recommendation awaiting a terminal gate."""
+
+    binding: AuthorResultBinding
+    stage: str
+    reason_code: str
+    prerequisite_ids: tuple[str, ...]
+    evidence_ids: tuple[str, ...]
+    evidence_identity: str
+    license_identity: str
+    recommendation_sha256: str
+    evidence_records: tuple[JsonObject, ...] = ()
+    license_record: JsonObject | None = None
+    research_summary: JsonObject | None = None
+
+
+AuthorResult: TypeAlias = (
+    ProposedAuthorResult | DeferRecommendation | SkipRecommendation | BlockedRecommendation
+)
+
+
+def _declared_evidence_records(payload: Mapping[str, Any]) -> tuple[JsonObject, ...]:
+    """Return the terminal payload's declared excerpt channel, defensively copied.
+
+    Parameters
+    ----------
+    payload:
+        Schema-valid terminal payload.
+
+    Returns
+    -------
+    tuple[dict[str, Any], ...]
+        Declared excerpt records, empty when the payload declares none. Absence
+        is a named gap downstream, never a silent claim of grounding.
+    """
+
+    records = payload.get("evidence_records")
+    if not isinstance(records, list):
+        return ()
+    return tuple(deepcopy(dict(record)) for record in records if isinstance(record, Mapping))
+
+
+def _declared_license_record(payload: Mapping[str, Any]) -> JsonObject | None:
+    """Return the terminal payload's declared license excerpt, defensively copied.
+
+    Parameters
+    ----------
+    payload:
+        Schema-valid terminal payload.
+
+    Returns
+    -------
+    dict[str, Any] | None
+        Declared license record, or ``None`` when the payload declares none.
+    """
+
+    record = payload.get("license_record")
+    return deepcopy(dict(record)) if isinstance(record, Mapping) else None
+
+
+def derive_terminal_evidence_pack(
+    *,
+    source_ids: Sequence[str],
+    evidence_ids: Sequence[str],
+    predicate: str,
+) -> JsonObject:
+    """Build the exact machine-owned terminal evidence pack.
+
+    Parameters
+    ----------
+    source_ids:
+        Manifest-bound sources supporting the terminal recommendation.
+    evidence_ids:
+        Author correlation labels for the cited terminal evidence.
+    predicate:
+        Closed terminal predicate the evidence supports.
+
+    Returns
+    -------
+    dict[str, Any]
+        Evidence pack whose identity is derived from its exact excerpt inventory.
+    """
+
+    normalized_sources = tuple(str(source_id) for source_id in source_ids)
+    if evidence_ids and not normalized_sources:
+        # DELIBERATELY on the ownership-ambiguous base. This derivation is called from
+        # the author executor, the driver's terminal assembly, and discovery, with id
+        # lists that are author-declared in some callers and engine-derived in others.
+        # The helper cannot see which, and no caller currently passes ownership, so a
+        # guess here would be exactly the kind of wrong-census claim this split exists
+        # to remove. Narrow it by threading ownership from the callers, not by guessing.
+        raise AuthorDispatchError("terminal evidence cannot bind IDs without a source")
+    excerpts = [
+        {
+            "evidence_id": str(evidence_id),
+            "source_id": normalized_sources[index % len(normalized_sources)],
+            "supports": [predicate],
+        }
+        for index, evidence_id in enumerate(evidence_ids)
+    ]
+    return {
+        "evidence_identity": stable_hash(excerpts),
+        "excerpts": excerpts,
+    }
+
+
+def derive_terminal_license_disposition(
+    *,
+    kind: str,
+    source_manifest_identity: str,
+    licenses: Mapping[str, Any] | None = None,
+) -> JsonObject:
+    """Return the exact machine-owned terminal license disposition.
+
+    Parameters
+    ----------
+    kind:
+        Closed author-result arm.
+    source_manifest_identity:
+        Frozen source manifest bound by the result.
+    licenses:
+        Exact proposal license facts for a handoff deferral, when present.
+
+    Returns
+    -------
+    dict[str, Any]
+        Exact disposition whose stable hash becomes ``license_identity``.
+    """
+
+    if licenses is not None:
+        return deepcopy(dict(licenses))
+    return {
+        "arm": kind,
+        "disposition": "not-applicable-no-license-claim",
+        "source_manifest_identity": source_manifest_identity,
+    }
+
+
+# Operator protocol exit codes (PLAN_RECONCILED section 3.0). ``0`` publishes a
+# valid result at the exact required path; every other code is a typed refusal.
+AUTHOR_EXIT_OK = 0
+AUTHOR_EXIT_PERMANENT = 64
+AUTHOR_EXIT_RETRYABLE = 75
+AUTHOR_EXIT_BACKOFF = 76
+AUTHOR_EXIT_UNAVAILABLE = 78
+
+#: Closed paid-session ATTEMPT-refund outcome for an executor that died TYPED
+#: before any author session ran (DECIDED_PLAN item 9 / recovery F1). Pilot:
+#: 82 author sessions settled ``failed`` after a sub-10 s machine wall and were
+#: charged as model attempts; the R6b clone: 742 such rows, root cause an unset
+#: ``MENAGERIE_AUTHOR_CLAUDE_BIN`` -> exit 78 in ~2 s. Every leg of the proof
+#: rule (:func:`executor_typed_outage_outcome`) is a driver-observed fact.
+AUTHOR_EXECUTOR_TYPED_OUTAGE_LOCAL_OUTCOME = "failed-executor-typed-outage"
+#: The executor's own pre-session typed lines (``author_executor.main``): an
+#: ``AuthorExecutorError`` before any session (config/pin refusal) exits 78 with
+#: the first prefix; an ``OSError`` exits 75 with the second. Every
+#: attempt-scoped executor failure prints ``author executor <stage> failed:``
+#: instead, so these two prefixes are only ever printed before a session exists.
+AUTHOR_EXECUTOR_UNAVAILABLE_LINE_PREFIX = "author executor error: "
+AUTHOR_EXECUTOR_IO_ERROR_LINE_PREFIX = "author executor io error: "
+_AUTHOR_EXECUTOR_TYPED_OUTAGE_LINES: Mapping[int, str] = {
+    AUTHOR_EXIT_UNAVAILABLE: AUTHOR_EXECUTOR_UNAVAILABLE_LINE_PREFIX,
+    AUTHOR_EXIT_RETRYABLE: AUTHOR_EXECUTOR_IO_ERROR_LINE_PREFIX,
+}
+#: Any line proving the executor reached an ATTEMPT (a ``_fail`` stage or
+#: broker line) refutes the pre-session claim, whatever else was printed.
+_AUTHOR_EXECUTOR_ATTEMPT_LINE_PREFIXES = (
+    "author executor stage",
+    "author executor broker",
+)
+
+
+def executor_typed_outage_outcome(
+    returncode: int,
+    combined_stdio: str,
+    *,
+    published_payload: Optional[bool],
+) -> Optional[str]:
+    """Return the typed-outage refund outcome, or ``None`` to charge the attempt.
+
+    The closed proof rule for :data:`AUTHOR_EXECUTOR_TYPED_OUTAGE_LOCAL_OUTCOME`.
+    Every leg is machine-observed by the driver -- the subprocess exit status,
+    the executor's own typed line, the envelope output path's state -- and no
+    model or checker text participates. Ambiguity fails toward charging.
+
+    Parameters
+    ----------
+    returncode:
+        Executor exit status as the driver observed it.
+    combined_stdio:
+        Full combined executor stdout/stderr (unsliced).
+    published_payload:
+        Whether a non-empty regular file exists at the envelope's required
+        output path (``False`` refunds; ``True`` charges; ``None`` -- the
+        caller could not observe the path -- charges).
+
+    Returns
+    -------
+    str | None
+        The closed outcome exactly when: the exit is 75 or 78, a line opens
+        with the prefix bound to THAT exit code, no attempt-scoped executor
+        line and no harness session-failure notice were printed, and no
+        payload was published. ``None`` otherwise.
+    """
+
+    if published_payload is not False:
+        return None
+    prefix = _AUTHOR_EXECUTOR_TYPED_OUTAGE_LINES.get(returncode)
+    if prefix is None:
+        return None
+    lines = [raw.rstrip() for raw in combined_stdio.splitlines()]
+    if _executor_stdio_proves_a_session(lines):
+        return None
+    if not any(line.startswith(prefix) for line in lines):
+        return None
+    return AUTHOR_EXECUTOR_TYPED_OUTAGE_LOCAL_OUTCOME
+
+
+def _executor_stdio_proves_a_session(lines: Sequence[str]) -> bool:
+    """Return whether the executor's output proves an attempt or session existed.
+
+    Parameters
+    ----------
+    lines:
+        Combined executor stdio, line by line.
+
+    Returns
+    -------
+    bool
+        ``True`` on any attempt-scoped stage/broker line or any structured
+        ``author-session-failure`` notice -- either refutes a pre-session death.
+    """
+
+    for line in lines:
+        if line.startswith(_AUTHOR_EXECUTOR_ATTEMPT_LINE_PREFIXES):
+            return True
+        stripped = line.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, Mapping) and payload.get("subtype") == "author-session-failure":
+            return True
+    return False
+
+_AUTHOR_QUOTA_MARKERS = ("usage limit", "quota")
+# A billing failure is checked before the usage markers because it is NOT a usage
+# window: "credit balance is too low" never resets on its own, so classifying it
+# QUOTA_EXHAUSTED minted a guessed one-hour reset and a futile hourly wake loop
+# (T4-T3). The distinct reason buys the sparse operator recheck.
+_AUTHOR_BILLING_MARKERS = ("credit balance",)
+_AUTHOR_RATE_MARKERS = ("rate limit", "too many requests", "retry after", "overloaded")
+_AUTHOR_RESET_PATTERNS = (
+    re.compile(r"try again at ([^.\n]+)", re.IGNORECASE),
+    re.compile(r"resets? at ([^.\n]+)", re.IGNORECASE),
+)
+_AUTHOR_RESET_MAX_AHEAD = timedelta(days=8)
+
+
+@dataclass(frozen=True)
+class AuthorBackoffSignal:
+    """Typed author rate/quota pause signal for the wakeup layer.
+
+    The author-side analogue of
+    :class:`menagerie.crawler.checker_dispatch.CheckerBackoffSignal`. It exists so
+    Claude usage exhaustion becomes a scheduler pause with a reset time instead of
+    a permanent ``failed:source`` terminal for the model that happened to be in
+    flight.
+
+    Parameters
+    ----------
+    reason:
+        Closed rate-limit or quota-exhaustion reason.
+    retry_after_seconds:
+        Provider retry delay when supplied.
+    reset_at:
+        Provider reset timestamp when supplied.
+    response_excerpt:
+        Bounded diagnostic response text.
+    provider:
+        Closed usage-limit provider vocabulary member owning the pause.
+    """
+
+    reason: AuthorPauseReason
+    retry_after_seconds: Optional[int] = None
+    reset_at: Optional[str] = None
+    response_excerpt: str = ""
+    provider: str = "anthropic"
+
+
+@dataclass(frozen=True)
+class AuthorEffortGrant:
+    """Bounded per-session author effort budget (``PLAN.md`` LP-13.2).
+
+    Parameters
+    ----------
+    tool_calls:
+        Maximum agent tool calls in one author session.
+    fetch_targets:
+        Maximum pinned controlled-fetch source targets.
+    wall_seconds:
+        Maximum author session wall time.
+    """
+
+    tool_calls: int = AUTHOR_MAX_TOOL_CALLS
+    fetch_targets: int = AUTHOR_MAX_FETCH_TARGETS
+    wall_seconds: float = float(AUTHOR_SESSION_WALL_SECONDS)
+
+    def __post_init__(self) -> None:
+        """Reject a non-positive grant.
+
+        Raises
+        ------
+        ValueError
+            If any dimension is not strictly positive.
+        """
+
+        if min(self.tool_calls, self.fetch_targets, self.wall_seconds) <= 0:
+            raise AuthorEngineFaultError("author effort grant dimensions must be positive")
+
+    def to_dict(self) -> JsonObject:
+        """Return the JSON grant published to the operator.
+
+        Returns
+        -------
+        dict[str, Any]
+            Closed grant payload.
+        """
+
+        return {
+            "tool_calls": self.tool_calls,
+            "fetch_targets": self.fetch_targets,
+            "wall_seconds": self.wall_seconds,
+        }
+
+
+def _structured_author_error(response_body: str) -> Optional[str]:
+    """Extract only the error-bearing fields from one Claude JSON result.
+
+    Parameters
+    ----------
+    response_body:
+        Exact candidate ``claude -p --output-format json`` result.
+
+    Returns
+    -------
+    str | None
+        Joined structured error fields, or ``None`` when the payload is not a
+        provider-declared error result.
+    """
+
+    try:
+        payload = json.loads(response_body)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, Mapping) or payload.get("is_error") is not True:
+        return None
+    fields: list[str] = []
+    for key in ("result", "message"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            fields.append(value)
+    error = payload.get("error")
+    if isinstance(error, str) and error.strip():
+        fields.append(error)
+    elif isinstance(error, Mapping):
+        for key in ("type", "code", "message"):
+            value = error.get(key)
+            if isinstance(value, str) and value.strip():
+                fields.append(value)
+    return "\n".join(fields) if fields else None
+
+
+def plausible_author_reset_at(
+    reset_at: str,
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Admit only a parseable future provider reset in the plausible usage window.
+
+    Parameters
+    ----------
+    reset_at:
+        Candidate ISO-8601 provider reset timestamp.
+    now:
+        Injectable aware UTC clock used by deterministic tests.
+
+    Returns
+    -------
+    str | None
+        The stripped timestamp when it is plausible, otherwise ``None``.
+    """
+
+    candidate = reset_at.strip()
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("author reset validation clock must be timezone-aware")
+    parsed_utc = parsed.astimezone(timezone.utc)
+    current_utc = current.astimezone(timezone.utc)
+    if not current_utc < parsed_utc <= current_utc + _AUTHOR_RESET_MAX_AHEAD:
+        return None
+    return candidate
+
+
+def parse_author_reset_at(
+    response_body: str,
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Extract and validate a provider reset from an authoritative error field.
+
+    Parameters
+    ----------
+    response_body:
+        Structured provider error text already established as authoritative.
+    now:
+        Injectable aware UTC clock used by deterministic tests.
+
+    Returns
+    -------
+    str | None
+        First matched reset phrase, or ``None`` when the provider named none.
+    """
+
+    for pattern in _AUTHOR_RESET_PATTERNS:
+        matched = pattern.search(response_body)
+        if matched is not None:
+            value = matched.group(1).strip()
+            if value:
+                return plausible_author_reset_at(value, now=now)
+    return None
+
+
+def classify_author_response(
+    status_code: int,
+    response_body: str,
+    *,
+    retry_after_seconds: Optional[int] = None,
+    reset_at: Optional[str] = None,
+    provider: str = "anthropic",
+) -> Optional[AuthorBackoffSignal]:
+    """Classify author rate/quota responses without treating them as model facts.
+
+    Mirrors :func:`menagerie.crawler.checker_dispatch.classify_checker_response`.
+
+    Parameters
+    ----------
+    status_code:
+        Typed operator process exit code.
+    response_body:
+        Exact structured provider JSON result. For typed exit 76 this remains
+        diagnostic-only unless it is valid provider JSON.
+    retry_after_seconds:
+        Parsed retry delay, if supplied.
+    reset_at:
+        Provider reset timestamp, if supplied.
+    provider:
+        Closed usage-limit provider vocabulary member.
+
+    Returns
+    -------
+    AuthorBackoffSignal | None
+        Typed pause signal, or ``None`` for non-rate/quota responses.
+    """
+
+    structured_error = _structured_author_error(response_body)
+    if status_code != AUTHOR_EXIT_BACKOFF and structured_error is None:
+        return None
+    classification_text = structured_error or ""
+    lowered = classification_text.lower()
+    reason: Optional[AuthorPauseReason] = None
+    if any(marker in lowered for marker in _AUTHOR_BILLING_MARKERS):
+        reason = AuthorPauseReason.BILLING_FAILURE
+    elif any(marker in lowered for marker in _AUTHOR_QUOTA_MARKERS):
+        reason = AuthorPauseReason.QUOTA_EXHAUSTED
+    elif any(marker in lowered for marker in _AUTHOR_RATE_MARKERS):
+        reason = AuthorPauseReason.RATE_LIMIT
+    elif status_code == AUTHOR_EXIT_BACKOFF:
+        reason = AuthorPauseReason.QUOTA_EXHAUSTED
+    else:
+        return None
+    if retry_after_seconds is None:
+        try:
+            response_payload = json.loads(response_body)
+        except (json.JSONDecodeError, TypeError):
+            response_payload = None
+        raw_retry_after = (
+            response_payload.get("retry_after_seconds")
+            if isinstance(response_payload, Mapping)
+            else None
+        )
+        if (
+            isinstance(raw_retry_after, (int, float))
+            and not isinstance(raw_retry_after, bool)
+            and 0 <= raw_retry_after <= 8 * 24 * 60 * 60
+        ):
+            retry_after_seconds = int(raw_retry_after)
+    validated_reset = (
+        plausible_author_reset_at(reset_at)
+        if reset_at is not None
+        else parse_author_reset_at(classification_text)
+    )
+    return AuthorBackoffSignal(
+        reason=reason,
+        retry_after_seconds=retry_after_seconds,
+        reset_at=validated_reset,
+        response_excerpt=response_body[:1_500],
+        provider=provider,
+    )
+
+
+def build_author_envelope(
+    *,
+    context: AuthorityContext,
+    work_id: str,
+    stable_id: str,
+    campaign_id: str,
+    created_at: str,
+    untrusted_hints: Mapping[str, Any],
+    source_manifest: Mapping[str, Any],
+    allowed_model_dir: Union[str, Path],
+    output_path: Union[str, Path],
+    prior_attempts: Optional[Sequence[Mapping[str, Any]]] = None,
+    routed_environment_intent: Optional[str] = None,
+    routed_environment_packages: Sequence[Mapping[str, Any]] = (),
+) -> JsonObject:
+    """Build one v3 author packet from the mandatory active authority context.
+
+    Parameters
+    ----------
+    context:
+        Frozen active trust roots and author contract identities.
+    work_id, stable_id, campaign_id:
+        Exact work generation, model identity, and stable repair lineage.
+    created_at:
+        Driver-owned request creation timestamp.
+    untrusted_hints:
+        Preserved discovery hints, explicitly unusable as authority.
+    source_manifest:
+        Frozen controlled-fetch manifest destined for private custody.
+    allowed_model_dir:
+        Staged-code path sandbox for this model.
+    output_path:
+        Exact atomic result path the author must write.
+    prior_attempts:
+        The ONE retry feedback channel (SEAM_REDESIGN 3.4): per earlier
+        attempt, its outcome, failure reason, verbatim checker findings, and
+        prior result hash. Every retry kind — infrastructure requeues and
+        checker repairs alike — rides here, hash-bound with the envelope.
+    routed_environment_intent:
+        Name of the environment intent this work item is routed to, when the
+        driver has routed one.
+    routed_environment_packages:
+        Exact resolved-export package rows for that intent, empty when the
+        target is unlocked or unrouted. Disclosed to the author through
+        :func:`~menagerie.crawler.package_namespace.inventory_disclosure`, which
+        withholds the machine-derived artifact digest.
+
+    Returns
+    -------
+    dict[str, Any]
+        Hash-bound author envelope whose result expectations are fully closed.
+    """
+
+    prompt_identity = hash_bytes(_read_prompt())
+    if context.author_prompt_identity != prompt_identity:
+        raise AuthorEngineFaultError(
+            "active author prompt identity does not match shipped prompt bytes"
+        )
+    intake = context.intake_by_stable_id.get(stable_id)
+    if not isinstance(intake, Mapping) or intake.get("stable_id") != stable_id:
+        raise AuthorEngineFaultError("author stable_id is absent from the active intake context")
+    return _assemble_author_envelope(
+        context=context,
+        work_id=work_id,
+        stable_id=stable_id,
+        campaign_id=campaign_id,
+        created_at=created_at,
+        untrusted_hints=untrusted_hints,
+        source_manifest=source_manifest,
+        allowed_model_dir=allowed_model_dir,
+        output_path=output_path,
+        prior_attempts=prior_attempts,
+        routed_environment_intent=routed_environment_intent,
+        routed_environment_packages=routed_environment_packages,
+        author_identity=context.author_model_identity,
+        prompt_identity=prompt_identity,
+        dispatcher_identity=context.author_dispatcher_identity,
+        intake_snapshot_id=context.active_intake_snapshot_id,
+        intake_snapshot_sha256=context.active_intake_snapshot_sha256,
+        intake_item_sha256=stable_hash(intake),
+        locator_authority=LOCATOR_AUTHORITY_TEXT_LINE,
+    )
+
+
+#: Closed key set a recorded-result envelope must receive from its transaction.
+RECORDED_RESULT_BINDING_KEYS = (
+    "author_identity",
+    "prompt_identity",
+    "dispatcher_identity",
+    "intake_snapshot_id",
+    "intake_snapshot_sha256",
+    "intake_item_sha256",
+)
+
+
+def build_recorded_result_envelope(
+    *,
+    context: AuthorityContext,
+    work_id: str,
+    stable_id: str,
+    campaign_id: str,
+    created_at: str,
+    untrusted_hints: Mapping[str, Any],
+    source_manifest: Mapping[str, Any],
+    allowed_model_dir: Union[str, Path],
+    output_path: Union[str, Path],
+    recorded_bindings: Mapping[str, Any],
+    routed_environment_intent: Optional[str] = None,
+    routed_environment_packages: Sequence[Mapping[str, Any]] = (),
+) -> JsonObject:
+    """Build a validation envelope for a RECORDED author result at its own basis.
+
+    Canonical rehydration revalidates append-only history: the result's
+    prompt, dispatcher, author, and intake identities are facts of the
+    RECORDED transaction (already tamper-evident through the reconstruction
+    anchor and the final event's dependency-vector commitment), so this
+    envelope stamps ``expected_result`` from those recorded bindings instead
+    of the live context, and deliberately skips the live prompt-bytes
+    assertion -- nothing here dispatches an author session against the
+    shipped prompt. Re-imposing the live identities on recorded results is
+    the rung-11 history-vs-live family: one author-prompt re-pin or
+    dispatcher edit turned every finalized transaction into a permanent
+    rehydration refusal. Live context still supplies the machine dispatch
+    disclosures (checker binding, schema names, routed environment), which
+    describe what the CURRENT engine will do with the result, not what the
+    recorded author bound. NEVER use this envelope to dispatch a session.
+
+    Parameters
+    ----------
+    context, work_id, stable_id, campaign_id, created_at, untrusted_hints,
+    source_manifest, allowed_model_dir, output_path, routed_environment_intent,
+    routed_environment_packages:
+        As :func:`build_author_envelope`.
+    recorded_bindings:
+        The transaction's recorded identity fields
+        (:data:`RECORDED_RESULT_BINDING_KEYS`), typically the validated
+        recorded author result's own echoes.
+
+    Returns
+    -------
+    dict[str, Any]
+        Hash-bound envelope whose result expectations are the recorded basis.
+
+    Raises
+    ------
+    AuthorEngineFaultError
+        If any recorded binding is missing or empty.
+    """
+
+    bindings = {field: recorded_bindings.get(field) for field in RECORDED_RESULT_BINDING_KEYS}
+    if any(not isinstance(value, str) or not value for value in bindings.values()):
+        raise AuthorEngineFaultError(
+            "recorded result bindings must carry every non-empty identity field"
+        )
+    return _assemble_author_envelope(
+        context=context,
+        work_id=work_id,
+        stable_id=stable_id,
+        campaign_id=campaign_id,
+        created_at=created_at,
+        untrusted_hints=untrusted_hints,
+        source_manifest=source_manifest,
+        allowed_model_dir=allowed_model_dir,
+        output_path=output_path,
+        prior_attempts=None,
+        routed_environment_intent=routed_environment_intent,
+        routed_environment_packages=routed_environment_packages,
+        author_identity=str(bindings["author_identity"]),
+        prompt_identity=str(bindings["prompt_identity"]),
+        dispatcher_identity=str(bindings["dispatcher_identity"]),
+        intake_snapshot_id=str(bindings["intake_snapshot_id"]),
+        intake_snapshot_sha256=str(bindings["intake_snapshot_sha256"]),
+        intake_item_sha256=str(bindings["intake_item_sha256"]),
+    )
+
+
+def routed_environment_block(
+    intent: Optional[str],
+    packages: Sequence[Mapping[str, Any]],
+) -> JsonObject:
+    """Return the routed-environment capability block, one spelling for both stages.
+
+    Item 13 (author R-3): stage 1 gets the SAME routed_environment object stage 2
+    receives, so the author pins library files at the INSTALLED version up front
+    instead of freezing a guessed tag and paying a supplement round to re-fetch
+    the installed file -- 432 of 573 production supplement requests were that
+    forced version re-fetch. ``inventory_disclosed`` distinguishes "this
+    environment installs nothing you named" (an empty inventory the machine holds)
+    from "the machine holds no inventory here" (an unlocked or unrouted target).
+    """
+
+    disclosed_packages = [dict(row) for row in inventory_disclosure(packages)]
+    legal_distributions = sorted(
+        {
+            str(distribution)
+            for row in disclosed_packages
+            for distribution in row.get("provides", [])
+            if isinstance(distribution, str) and distribution
+        }
+    )
+    return {
+        "intent": intent,
+        "inventory_disclosed": bool(packages),
+        "legal_distributions": legal_distributions,
+        "packages": disclosed_packages,
+    }
+
+
+def host_capacity_block() -> JsonObject:
+    """Return a coarse host-capacity hint (RAM, accelerator) for the author.
+
+    Item 13 (section 4): 6 of 52 R6b members ended ``needs-more-memory`` on tiny
+    configs because the author had no host-capacity hint and could not size
+    ``make_dummy_call`` to the host. The crawl runs CPU-only (the routed
+    environment declares ``device_policy: cpu``), so ``accelerator`` is null; RAM
+    is read from the host and rounded to a coarse gibibyte hint. A platform that
+    does not expose the sysconf keys reports ``null`` rather than a guess.
+    """
+
+    ram_gib: Optional[float]
+    try:
+        ram_gib = round(
+            os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024**3), 1
+        )
+    except (ValueError, OSError, AttributeError):
+        ram_gib = None
+    return {"ram_gib": ram_gib, "accelerator": None}
+
+
+def _assemble_author_envelope(
+    *,
+    context: AuthorityContext,
+    work_id: str,
+    stable_id: str,
+    campaign_id: str,
+    created_at: str,
+    untrusted_hints: Mapping[str, Any],
+    source_manifest: Mapping[str, Any],
+    allowed_model_dir: Union[str, Path],
+    output_path: Union[str, Path],
+    prior_attempts: Optional[Sequence[Mapping[str, Any]]],
+    routed_environment_intent: Optional[str],
+    routed_environment_packages: Sequence[Mapping[str, Any]],
+    author_identity: str,
+    prompt_identity: str,
+    dispatcher_identity: str,
+    intake_snapshot_id: str,
+    intake_snapshot_sha256: str,
+    intake_item_sha256: str,
+    locator_authority: Optional[str] = None,
+) -> JsonObject:
+    """Assemble one hash-bound envelope from explicit identity bindings.
+
+    The ONE spelling of the envelope body. Identity bindings arrive as
+    explicit parameters so the two entry points cannot drift: the dispatch
+    entry (:func:`build_author_envelope`) binds the LIVE context, and the
+    revalidation entry (:func:`build_recorded_result_envelope`) binds a
+    recorded transaction's own commitments.
+
+    ``locator_authority`` is the machine-stamped locator-adjudication era for
+    this envelope's evidence validation: the LIVE dispatch entry stamps the
+    current authority so new packs are held to strict positional locators,
+    while the recorded-result entry passes ``None`` (key omitted) so
+    append-only history keeps rehydrating at its own recorded basis --
+    exactly the recorded-basis philosophy that already governs the skipped
+    live-prompt assertion. History is never reinterpreted.
+    """
+
+    if not all(value.strip() for value in (work_id, stable_id, campaign_id, created_at)):
+        raise AuthorEngineFaultError("author envelope identities must be non-empty")
+    source_manifest_identity = _source_manifest_identity(source_manifest)
+    expected_result: JsonObject = {
+        "schema_version": AUTHOR_RESULT_SCHEMA_VERSION,
+        "stable_id": stable_id,
+        "work_id": work_id,
+        "campaign_id": campaign_id,
+        "author_identity": author_identity,
+        "prompt_identity": prompt_identity,
+        "dispatcher_identity": dispatcher_identity,
+        "source_manifest_identity": source_manifest_identity,
+        "intake_snapshot_id": intake_snapshot_id,
+        "intake_snapshot_sha256": intake_snapshot_sha256,
+        "intake_item_sha256": intake_item_sha256,
+    }
+    body: JsonObject = {
+        "envelope_version": _ENVELOPE_VERSION,
+        "work_id": work_id,
+        "stable_id": stable_id,
+        "campaign_id": campaign_id,
+        "created_at": created_at,
+        "untrusted_hints": deepcopy(dict(untrusted_hints)),
+        "legacy_claims_untrusted": True,
+        "source_manifest": deepcopy(dict(source_manifest)),
+        "source_manifest_identity": source_manifest_identity,
+        "prompt": {
+            "name": AUTHOR_PROMPT_NAME,
+            "path": str(PROMPT_PATH),
+            "identity": prompt_identity,
+        },
+        "author_schema_identity": context.author_schema_identity,
+        # Machine-held dispatch facts the author cannot know, disclosed as their
+        # PREIMAGES rather than as digests.
+        #
+        # ``author`` is the exact four-key object ``expected_result.author_identity``
+        # already publishes the digest of, so disclosing it is strictly weaker than
+        # what this envelope has always shipped. It exists here so the executor can
+        # stamp ``proposal.author`` from one place; it is deliberately NOT a member of
+        # ``expected_result``, whose keys are splatted verbatim into the
+        # ``author-result.v4`` body (``additionalProperties: false``).
+        #
+        # ``checker`` feeds the author-side identity calculator: ``vet_identity`` and
+        # ``fidelity_identity`` are functions of the author's own facts AND of the
+        # checker binding the driver will recompute against, and no author can guess
+        # the latter. Disclosing it cannot manufacture a passing identity -- the
+        # driver still recomputes from the published facts with the binding it holds,
+        # so a calculator fed fabricated facts still yields a refused identity.
+        "identity_inputs": {
+            "author": dict(context.author_model_fields),
+            "checker": dict(context.checker_model_fields),
+            "model_schema_version": MODEL_SCHEMA_VERSION_V3,
+        },
+        "prior_attempts": [deepcopy(dict(entry)) for entry in (prior_attempts or ())],
+        # The routed environment's capability sheet: the second machine-held
+        # dispatch fact the author cannot know, and the one the R1 recipe pin is
+        # later resolved against. Before it existed, `library_recipe.distribution`
+        # and `version` were authored blind and a CORRECT author could be refused
+        # for naming a distribution the routed environment does not install (the
+        # `segmentation-models-pytorch` and `dgl` refusals) or a version it does
+        # not install (`transformers 4.57.1` against an installed 5.14.1). That is
+        # an unsatisfiable rule rather than a check, and the fix is to publish the
+        # fact, never to relax the resolution.
+        #
+        # `inventory_disclosed` distinguishes "this environment installs nothing
+        # you named" from "the machine holds no inventory here" -- an unlocked or
+        # unrouted target, where the digest honestly resolves to null. Collapsing
+        # the two into an empty list would read as the former.
+        "routed_environment": routed_environment_block(
+            routed_environment_intent, routed_environment_packages
+        ),
+        "expected_result": expected_result,
+        "allowed_model_dir": str(Path(allowed_model_dir).resolve()),
+        "allowed_output_root": str(Path(output_path).resolve().parent),
+        "required_output_path": str(Path(output_path).resolve()),
+        "required_result_schema": AUTHOR_RESULT_SCHEMA_VERSION,
+        "required_proposal_schema": AUTHOR_PROPOSAL_SCHEMA_VERSION_V3,
+    }
+    if locator_authority is not None:
+        body["locator_authority"] = locator_authority
+    return {**body, "envelope_sha256": stable_hash(body)}
+
+
+#: Closed key set of ``identity_inputs.author`` / ``identity_inputs.checker``.
+IDENTITY_BINDING_KEYS = frozenset({"provider", "model", "version", "prompt_sha256"})
+
+
+def _identity_binding(envelope: Mapping[str, Any], role: str) -> Mapping[str, str]:
+    """Return one closed machine-held identity preimage from an author envelope.
+
+    Both consumers -- the executor's ``proposal.author`` stamp and the author's
+    identity calculator -- read the disclosure through this ONE accessor, so a
+    shape the envelope does not actually publish cannot be tolerated in one
+    place and refused in the other.
+
+    Parameters
+    ----------
+    envelope:
+        Author request envelope built by :func:`build_author_envelope`.
+    role:
+        ``"author"`` or ``"checker"``.
+
+    Returns
+    -------
+    Mapping[str, str]
+        The exact four-key preimage.
+
+    Raises
+    ------
+    AuthorEngineFaultError
+        If the block is absent, is not an object, or is not exactly the closed
+        key set with string values. An envelope that does not disclose the
+        binding is an engine fault, never a reason to guess one.
+    """
+
+    inputs = envelope.get("identity_inputs")
+    binding = inputs.get(role) if isinstance(inputs, Mapping) else None
+    if (
+        not isinstance(binding, Mapping)
+        or set(binding) != IDENTITY_BINDING_KEYS
+        or not all(isinstance(value, str) and value for value in binding.values())
+    ):
+        raise AuthorEngineFaultError(
+            f"author envelope does not disclose the closed identity_inputs.{role} binding "
+            f"{sorted(IDENTITY_BINDING_KEYS)!r}"
+        )
+    return {key: str(binding[key]) for key in sorted(binding)}
+
+
+def author_identity_binding(envelope: Mapping[str, Any]) -> Mapping[str, str]:
+    """Return the exact ``proposal.author`` preimage the envelope discloses."""
+
+    return _identity_binding(envelope, "author")
+
+
+def checker_identity_binding(envelope: Mapping[str, Any]) -> Mapping[str, str]:
+    """Return the exact checker preimage the envelope discloses."""
+
+    return _identity_binding(envelope, "checker")
+
+
+def _validate_routed_distribution(proposal: Mapping[str, Any], envelope: Mapping[str, Any]) -> None:
+    """Require an R1 distribution to come from the disclosed routed inventory.
+
+    Parameters
+    ----------
+    proposal:
+        Authored proposal carrying an optional declarative-library recipe.
+    envelope:
+        Machine-authenticated author envelope carrying the routed capability sheet.
+
+    Raises
+    ------
+    AuthorResultMalformedError
+        If a disclosed inventory does not name the recipe's distribution, or if
+        the envelope's redundant legal-value list disagrees with its package rows.
+    """
+
+    routed = envelope.get("routed_environment")
+    if not isinstance(routed, Mapping) or routed.get("inventory_disclosed") is not True:
+        return
+    packages = routed.get("packages")
+    legal_value = routed.get("legal_distributions")
+    if not isinstance(packages, list) or not isinstance(legal_value, list):
+        raise AuthorEngineFaultError(
+            "disclosed routed environment lacks packages or legal_distributions"
+        )
+    derived_legal = sorted(
+        {
+            str(distribution)
+            for row in packages
+            if isinstance(row, Mapping)
+            for distribution in row.get("provides", [])
+            if isinstance(distribution, str) and distribution
+        }
+    )
+    if legal_value != derived_legal:
+        raise AuthorEngineFaultError(
+            "routed environment legal_distributions disagrees with its package inventory"
+        )
+    facts = proposal.get("proposed_facts")
+    implementation = facts.get("implementation") if isinstance(facts, Mapping) else None
+    recipe = implementation.get("library_recipe") if isinstance(implementation, Mapping) else None
+    if not isinstance(recipe, Mapping):
+        return
+    distribution = recipe.get("distribution")
+    if not isinstance(distribution, str):
+        return
+    legal_by_name = {
+        canonical_distribution_name(str(candidate)): str(candidate) for candidate in derived_legal
+    }
+    if canonical_distribution_name(distribution) not in legal_by_name:
+        raise AuthorResultMalformedError(
+            "library_recipe.distribution must name a Python distribution from "
+            "routed_environment.legal_distributions; "
+            f"got {distribution!r}, legal values are {derived_legal!r}. Package indexes "
+            "such as 'pypi' and 'conda' are not distributions."
+        )
+    # LIB-VERSION-DRIFT (m8189): the same disclosed rows carry the installed
+    # version, so a paper-era pin (timm 0.6.13 against an installed 1.0.x) is
+    # refused HERE, pre-publication and author-repairable, instead of dying at
+    # forward against a vendored layer written for the older API. The row
+    # matching and version aggregation mirror
+    # ``recipe.resolve_environment_artifact_digest`` exactly; an ambiguous
+    # inventory (more than one distinct version) stays that binding authority's
+    # refusal, so this gate can never disagree with the one it pre-empts.
+    declared_version = recipe.get("version")
+    if not isinstance(declared_version, str):
+        return
+    installed_versions = {
+        str(row.get("version"))
+        for row in packages
+        if isinstance(row, Mapping)
+        and isinstance(row.get("name"), str)
+        and inventory_row_provides_distribution(str(row["name"]), distribution)
+    }
+    if len(installed_versions) != 1:
+        return
+    installed_version = installed_versions.pop()
+    if installed_version != declared_version.strip():
+        raise AuthorResultMalformedError(
+            "library_recipe.version must equal the routed environment's installed "
+            f"version for {distribution!r}: the recipe declares {declared_version!r} "
+            f"but the routed inventory installs {installed_version!r} "
+            "(routed_environment.packages disclosed it). Author against the routed "
+            "environment's pinned library versions; if the recipe needs an "
+            "older-API layer, vendor that layer too instead of re-pinning."
+        )
+
+
+def validate_author_result(
+    result_path: Union[str, Path],
+    envelope: Mapping[str, Any],
+    *,
+    cas_root: Union[str, Path, None] = None,
+    supplementary_sources: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> AuthorResult:
+    """Validate and parse a complete atomic author result into its typed union.
+
+    Parameters
+    ----------
+    result_path:
+        Expected final ``result.json`` path.
+    envelope:
+        V3 author envelope returned by :func:`build_author_envelope`.
+    cas_root:
+        Optional source CAS root used for proposal evidence verification.
+    supplementary_sources:
+        Frozen rows of the ONE supplementary broker pack the executor may grant
+        mid-session, when the lane holds them. Omitting them falls back to the
+        rows carried on the envelope's own manifest. See
+        :func:`_grounding_manifest`.
+
+    Returns
+    -------
+    ProposedAuthorResult | DeferRecommendation | SkipRecommendation | BlockedRecommendation
+        Exact advisory result arm. No arm is a terminal award.
+    """
+
+    _validate_envelope_hash(envelope)
+    path = Path(result_path).resolve()
+    expected_path = Path(str(envelope.get("required_output_path"))).resolve()
+    if path != expected_path or path.name != "result.json":
+        raise AuthorEngineFaultError("author result is not at the envelope's exact atomic path")
+    return _validate_author_result_mapping(
+        _read_json_object(path),
+        envelope,
+        cas_root=cas_root,
+        supplementary_sources=supplementary_sources,
+    )
+
+
+def serialize_author_result_cache(
+    result: AuthorResult,
+    *,
+    source_manifest: Mapping[str, Any],
+    model_dir: Union[str, Path],
+    repair_generation: int | None = None,
+    staged_transaction_id: str | None = None,
+    lifecycle: str = "unstaged",
+) -> JsonObject:
+    """Serialize a disposable cache without projecting optional outcome fields.
+
+    Parameters
+    ----------
+    result:
+        Exact typed author-result union arm.
+    source_manifest:
+        Frozen manifest whose identity is bound by the result.
+    model_dir:
+        Private staged model directory.
+    repair_generation:
+        Optional positive local repair generation for observability only.
+    staged_transaction_id:
+        The PENDING 1-event staging transaction this result is anchored to,
+        when one exists. A cache may only ever reference pending staging: the
+        loader refuses a cache whose named transaction advanced (AT-10).
+    lifecycle:
+        Closed capture-time lifecycle observation: ``unstaged`` or
+        ``staged-pending``.
+
+    Returns
+    -------
+    dict[str, Any]
+        Self-hashed v2 cache entry preserving the complete v3 result verbatim
+        plus its explicit generation binding (AT-10: m12646's surviving cache
+        carried ``repair_generation: null`` and NO generation binding, so a
+        re-drive under a new work generation kept reloading it).
+    """
+
+    if repair_generation is not None and repair_generation < 1:
+        raise AuthorEngineFaultError("cached repair generation must be positive")
+    if lifecycle not in _CACHE_LIFECYCLES:
+        raise AuthorEngineFaultError(
+            f"cache lifecycle {lifecycle!r} is outside the closed vocabulary "
+            f"{sorted(_CACHE_LIFECYCLES)}"
+        )
+    if (staged_transaction_id is not None) != (lifecycle == "staged-pending"):
+        raise AuthorEngineFaultError(
+            "cache lifecycle must be staged-pending exactly when a staging "
+            "transaction is named"
+        )
+    if _source_manifest_identity(source_manifest) != result.binding.source_manifest_identity:
+        raise AuthorEngineFaultError("cache source manifest does not match the author result")
+    body: JsonObject = {
+        "cache_version": _CACHE_VERSION,
+        "result": deepcopy(result.binding.raw_result),
+        "source_manifest": deepcopy(dict(source_manifest)),
+        "model_dir": str(Path(model_dir).resolve()),
+        "repair_generation": repair_generation,
+        "generation_binding": {
+            "stable_id": result.binding.stable_id,
+            "work_id": result.binding.work_id,
+            "result_id": result.binding.result_id,
+            "source_manifest_identity": result.binding.source_manifest_identity,
+            "repair_generation": repair_generation,
+            "staged_transaction_id": staged_transaction_id,
+            "lifecycle": lifecycle,
+        },
+    }
+    return {**body, "cache_identity": stable_hash(body)}
+
+
+def validate_author_result_cache(
+    cache: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    *,
+    cas_root: Union[str, Path, None] = None,
+) -> AuthorResult:
+    """Revalidate a disposable cache through the production v3 result parser.
+
+    Parameters
+    ----------
+    cache:
+        Candidate cache entry from :func:`serialize_author_result_cache`.
+    envelope:
+        Exact request envelope for the cached result.
+    cas_root:
+        Optional source CAS root used for proposal evidence verification.
+
+    Returns
+    -------
+    ProposedAuthorResult | DeferRecommendation | SkipRecommendation | BlockedRecommendation
+        Revalidated exact union arm.
+    """
+
+    if cache.get("cache_version") != _CACHE_VERSION:
+        # AT-10: null/legacy generation FAILS CLOSED for authority-bearing
+        # reuse -- a v1 cache carries no generation binding, which is exactly
+        # how m12646's surviving repair_generation:null cache kept reloading
+        # across a re-drive's new work generation.
+        raise AuthorInfrastructureFaultError("unsupported author-result cache version")
+    expected = stable_hash({key: value for key, value in cache.items() if key != "cache_identity"})
+    if cache.get("cache_identity") != expected:
+        raise AuthorInfrastructureFaultError("author-result cache identity mismatch")
+    binding = _required_mapping(
+        cache.get("generation_binding"), "cache generation_binding", owner="infrastructure"
+    )
+    if binding.get("lifecycle") not in _CACHE_LIFECYCLES:
+        raise AuthorInfrastructureFaultError(
+            "author-result cache lifecycle is outside the closed vocabulary"
+        )
+    for cache_field, envelope_field in (
+        ("stable_id", "stable_id"),
+        ("work_id", "work_id"),
+        ("source_manifest_identity", "source_manifest_identity"),
+    ):
+        if binding.get(cache_field) != envelope.get(envelope_field):
+            raise AuthorInfrastructureFaultError(
+                f"author-result cache binds a foreign {cache_field}: "
+                f"cached={binding.get(cache_field)!r} "
+                f"envelope={envelope.get(envelope_field)!r} (AT-10: a cache "
+                "never serves outside its exact captured generation)"
+            )
+    source_manifest = _required_mapping(
+        cache.get("source_manifest"), "cache source_manifest", owner="infrastructure"
+    )
+    if _source_manifest_identity(source_manifest) != envelope.get("source_manifest_identity"):
+        raise AuthorEngineFaultError("cached source manifest is stale for the author envelope")
+    result = _required_mapping(cache.get("result"), "cache result", owner="infrastructure")
+    if binding.get("result_id") != result.get("result_id"):
+        raise AuthorInfrastructureFaultError(
+            "author-result cache generation binding contradicts its own result id"
+        )
+    return _validate_author_result_mapping(result, envelope, cas_root=cas_root)
+
+
+def validate_author_result_mapping(
+    result: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    *,
+    cas_root: Union[str, Path, None] = None,
+) -> AuthorResult:
+    """Validate canonical in-memory result bytes through the production v3 parser.
+
+    Parameters
+    ----------
+    result:
+        Exact mapping retained by canonical artifact reconstruction.
+    envelope:
+        Fresh envelope binding the active work, intake, source set, and staged model root.
+    cas_root:
+        Optional source CAS root. Canonical rehydration normally omits it because the
+        source manifest and claimed bytes were already verified by artifact projection.
+
+    Returns
+    -------
+    ProposedAuthorResult | DeferRecommendation | SkipRecommendation | BlockedRecommendation
+        Revalidated exact author-result union arm.
+    """
+
+    return _validate_author_result_mapping(result, envelope, cas_root=cas_root)
+
+
+def write_envelope_atomic(envelope: Mapping[str, Any], path: Union[str, Path]) -> Path:
+    """Atomically persist one deterministic work envelope.
+
+    Parameters
+    ----------
+    envelope:
+        Complete envelope object.
+    path:
+        Destination path.
+
+    Returns
+    -------
+    pathlib.Path
+        Published envelope path.
+    """
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    data = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(data)
+            handle.write(b"\n")
+            handle.flush()
+            durable_fsync(handle.fileno())
+        os.replace(temporary, destination)
+        fsync_directory(destination.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def _grounding_manifest(
+    envelope: Mapping[str, Any],
+    supplementary_sources: Optional[Sequence[Mapping[str, Any]]],
+) -> JsonObject:
+    """Return every source an excerpt in this result may legitimately cite.
+
+    Evidence grounding and manifest IDENTITY are two different questions and this
+    function is where they part company. ``source_manifest_identity`` binds the
+    manifest the author was handed at dispatch and echoed back; it must never
+    move. But the executor may grant ONE supplementary broker round mid-session,
+    and the sources it fetches are just as machine-owned and digest-pinned as the
+    frozen ones -- the author was handed them and told to write its result. Until
+    they were folded in here, every excerpt citing one was refused as
+    ``references unknown source``: an honest author indicted for quoting a
+    document we ourselves fetched for it.
+
+    The supplementary rows therefore widen GROUNDING only. They are appended, so
+    they can only ever add a citable source; a row reusing a frozen ``source_id``
+    is refused upstream at ingest and would in any case trip the duplicate-source
+    check in :func:`~menagerie.crawler.evidence.validate_evidence`. Nothing here
+    relaxes a digest, a locator, or a coverage requirement.
+
+    Parameters
+    ----------
+    envelope:
+        V3 author envelope carrying the frozen manifest.
+    supplementary_sources:
+        Rows the lane holds directly. ``None`` falls back to the rows the
+        envelope's own manifest carries, which is how a reloaded cache and a
+        canonical rehydration recover them without re-plumbing every call site.
+
+    Returns
+    -------
+    dict[str, Any]
+        A grounding-only manifest. It carries no ``manifest_sha256``: it is not
+        an identity and must never be mistaken for one.
+    """
+
+    manifest = _required_mapping(envelope.get("source_manifest"), "source_manifest", owner="engine")
+    if supplementary_sources is None:
+        return {"sources": manifest_source_rows(manifest)}
+    frozen = manifest.get("sources")
+    return {
+        "sources": [
+            *(list(frozen) if isinstance(frozen, list) else []),
+            *(row for row in supplementary_sources if isinstance(row, Mapping)),
+        ]
+    }
+
+
+def _validate_author_result_mapping(
+    result: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    *,
+    cas_root: Union[str, Path, None],
+    supplementary_sources: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> AuthorResult:
+    """Validate and parse one in-memory result through the closed v3 union."""
+
+    _validate_envelope_hash(envelope)
+    try:
+        validate_payload(result, AUTHOR_RESULT_SCHEMA_VERSION)
+    except PayloadValidationError as exc:
+        raise AuthorResultMalformedError(str(exc)) from exc
+    expected = _required_mapping(envelope.get("expected_result"), "expected_result", owner="engine")
+    for field, value in expected.items():
+        if result.get(field) != value:
+            raise AuthorResultMalformedError(f"author result {field} does not match its envelope")
+    expected_hash = stable_hash(
+        {key: value for key, value in result.items() if key != "result_sha256"}
+    )
+    if result.get("result_sha256") != expected_hash:
+        raise AuthorResultMalformedError("result_sha256 does not bind the complete author result")
+    payload = _required_mapping(result.get("payload"), "author result payload", owner="author")
+    kind = AuthorResultKind(str(result.get("kind")))
+    if payload.get("arm") != kind.value:
+        raise AuthorResultMalformedError("author result kind and payload arm disagree")
+    binding = _result_binding(result)
+    if kind is AuthorResultKind.PROPOSED:
+        proposal = _required_mapping(
+            payload.get("proposal"), "proposed payload proposal", owner="author"
+        )
+        _validate_proposal_binding(proposal, binding)
+        _validate_routed_distribution(proposal, envelope)
+        try:
+            report = validate_author_proposal(
+                proposal,
+                allowed_model_dir=str(envelope["allowed_model_dir"]),
+                source_manifest=_grounding_manifest(envelope, supplementary_sources),
+                cas_root=cas_root,
+                expected_schema_version=AUTHOR_PROPOSAL_SCHEMA_VERSION_V3,
+                # The era is the ENVELOPE's machine stamp: live envelopes carry
+                # the strict authority; recorded-result envelopes omit the key,
+                # so history keeps validating at its own recorded basis.
+                locator_authority=str(
+                    envelope.get("locator_authority") or LOCATOR_AUTHORITY_LEGACY_MEMBERSHIP
+                ),
+            )
+        except ValueError as exc:
+            raise AuthorResultMalformedError(str(exc)) from exc
+        return ProposedAuthorResult(binding, deepcopy(dict(proposal)), report)
+    _validate_recommendation_hash(payload)
+    if kind is AuthorResultKind.DEFER_RECOMMENDATION:
+        handoff_value = _required_mapping(
+            payload.get("handoff_execution"), "defer handoff_execution", owner="author"
+        )
+        handoff_proposal = _required_mapping(
+            handoff_value.get("proposal"), "defer handoff proposal", owner="author"
+        )
+        _validate_proposal_binding(handoff_proposal, binding)
+        proposal_sha256 = str(handoff_value["proposal_sha256"])
+        code_manifest_identity = str(handoff_value["code_manifest_identity"])
+        source_manifest_identity = str(handoff_value["source_manifest_identity"])
+        handoff_sha256 = str(handoff_value["handoff_sha256"])
+        implementation = handoff_proposal.get("proposed_facts", {}).get("implementation", {})
+        code_manifest = (
+            implementation.get("code_manifest") or [] if isinstance(implementation, Mapping) else []
+        )
+        expected_handoff = stable_hash(
+            {
+                "proposal": handoff_proposal,
+                "proposal_sha256": proposal_sha256,
+                "code_manifest_identity": code_manifest_identity,
+                "source_manifest_identity": source_manifest_identity,
+            }
+        )
+        if (
+            handoff_proposal.get("proposal_sha256") != proposal_sha256
+            or not isinstance(code_manifest, list)
+            or stable_hash(code_manifest) != code_manifest_identity
+            or source_manifest_identity != binding.source_manifest_identity
+            or handoff_proposal.get("source_manifest_identity") != source_manifest_identity
+            or handoff_sha256 != expected_handoff
+        ):
+            raise AuthorResultMalformedError("defer handoff execution identity is inconsistent")
+        return DeferRecommendation(
+            binding=binding,
+            platform=str(payload["platform"]),
+            source_ids=_nonempty_unique_strings(payload.get("source_ids"), "source_ids"),
+            evidence_ids=_unique_strings(payload.get("evidence_ids"), "evidence_ids"),
+            evidence_identity=str(payload["evidence_identity"]),
+            license_identity=str(payload["license_identity"]),
+            recommendation_sha256=str(payload["recommendation_sha256"]),
+            evidence_records=_declared_evidence_records(payload),
+            license_record=_declared_license_record(payload),
+            handoff_execution=HandoffExecution(
+                proposal=deepcopy(dict(handoff_proposal)),
+                proposal_sha256=proposal_sha256,
+                code_manifest_identity=code_manifest_identity,
+                source_manifest_identity=source_manifest_identity,
+                handoff_sha256=handoff_sha256,
+            ),
+        )
+    if kind is AuthorResultKind.SKIP_RECOMMENDATION:
+        return SkipRecommendation(
+            binding=binding,
+            status_code=str(payload["status_code"]),
+            source_ids=_nonempty_unique_strings(payload.get("source_ids"), "source_ids"),
+            evidence_ids=_unique_strings(payload.get("evidence_ids"), "evidence_ids"),
+            evidence_identity=str(payload["evidence_identity"]),
+            search_report_identity=str(payload["search_report_identity"]),
+            license_identity=str(payload["license_identity"]),
+            recommendation_sha256=str(payload["recommendation_sha256"]),
+            evidence_records=_declared_evidence_records(payload),
+            license_record=_declared_license_record(payload),
+        )
+    research_summary = payload.get("research_summary")
+    reason_code = payload.get("reason_code")
+    # Both deferrable BLOCKED arms hand their bounded search on to a later pass -- to a
+    # stronger tier, or to a run that has the access this one lacked -- so both are
+    # worthless without it.
+    if reason_code in {"needs-higher-tier", ACCESS_BLOCKED_REASON_CODE} and not isinstance(
+        research_summary, Mapping
+    ):
+        raise AuthorResultMalformedError(
+            f"BLOCKED({reason_code}) requires a typed stage-1 research_summary"
+        )
+    if reason_code == ACCESS_BLOCKED_REASON_CODE and not any(
+        isinstance(candidate, Mapping)
+        and candidate.get("rejection_class") == ACCESS_BARRIER_REJECTION_CLASS
+        for candidate in (research_summary or {}).get("candidate_links", [])
+    ):
+        raise AuthorResultMalformedError(
+            f"BLOCKED({ACCESS_BLOCKED_REASON_CODE}) requires at least one candidate link "
+            f"classified {ACCESS_BARRIER_REJECTION_CLASS!r}"
+        )
+    blocked_stage = str(payload["stage"])
+    blocked_reason_code = str(payload["reason_code"])
+    _validate_blocked_reason(blocked_stage, blocked_reason_code)
+    return BlockedRecommendation(
+        binding=binding,
+        stage=blocked_stage,
+        reason_code=blocked_reason_code,
+        prerequisite_ids=_nonempty_unique_strings(
+            payload.get("prerequisite_ids"), "prerequisite_ids"
+        ),
+        evidence_ids=_unique_strings(payload.get("evidence_ids"), "evidence_ids"),
+        evidence_identity=str(payload["evidence_identity"]),
+        license_identity=str(payload["license_identity"]),
+        recommendation_sha256=str(payload["recommendation_sha256"]),
+        evidence_records=_declared_evidence_records(payload),
+        license_record=_declared_license_record(payload),
+        research_summary=(
+            deepcopy(dict(research_summary)) if isinstance(research_summary, Mapping) else None
+        ),
+    )
+
+
+#: Budget-resource tokens an author uses when naming its own spent effort grant.
+#: Deliberately narrow: every member names the AUTHOR'S OWN budget (its wall clock,
+#: its effort grant, its deadline), never an external resource a genuine prerequisite
+#: could honestly name. Widening this set risks transmuting a genuine prerequisite
+#: claim, which is the one direction this matcher must never move.
+_EXHAUSTION_RESOURCE_TOKENS: frozenset[str] = frozenset({"wall", "budget", "deadline", "effort"})
+
+#: Outcome tokens that assert the named resource ran out.
+_EXHAUSTION_OUTCOME_TOKENS: frozenset[str] = frozenset(
+    {"exhausted", "exceeded", "expired", "depleted", "reached", "elapsed", "overrun"}
+)
+
+
+def _normalized_reason_code(reason_code: str) -> str:
+    """Fold spelling variance out of one author-supplied reason code.
+
+    Case, surrounding whitespace, underscores, and internal whitespace are all
+    spelling, not meaning: ``Wall_Exceeded`` and ``wall-exceeded`` state the same
+    outcome. Folding happens ONLY inside the exhaustion matcher -- the code the
+    author wrote travels unmodified everywhere else.
+
+    Parameters
+    ----------
+    reason_code:
+        Raw author-supplied reason code.
+
+    Returns
+    -------
+    str
+        Casefolded, hyphen-normalized spelling.
+    """
+
+    folded = re.sub(r"[\s_]+", "-", reason_code.strip().casefold())
+    return re.sub(r"-{2,}", "-", folded)
+
+
+def _names_effort_exhaustion(reason_code: str) -> bool:
+    """Return whether one BLOCKED reason states the author's own budget ran out.
+
+    The canonical spellings in ``EFFORT_EXHAUSTION_REASON_CODES`` were exact-match
+    only, and rung 7 measured the cost: 8 of 20 authors stated honest wall-clock
+    exhaustion in novel spellings (``authoring-budget-exhausted``,
+    ``author-wall-deadline-reached``, ``authoring-wall-exhausted``,
+    ``author-wall-deadline-before-citation-grounding``, ...) that the matcher let
+    through as ``blocked-prerequisite`` claims, so every one died at the terminal
+    checker as an ungroundable predicate instead of landing on the honest
+    ``failed:<stage>`` effort terminal. Authors run once; a matcher that only
+    recognizes spellings nobody produces is a wall.
+
+    This broadens MATCHING, never semantics: it recognizes (a) the canonical
+    spellings after normalization, (b) the ``effort-exhausted:`` prefix family,
+    and (c) a reason whose tokens name the author's own budget resource (wall /
+    budget / deadline / effort) together with an outcome stating it ran out --
+    including the ``<resource>-deadline-before-<milestone>`` shape. A genuine
+    external-prerequisite claim (``needs-source-access``, ``paywalled-paper``,
+    ``upstream-repo-deleted``) shares no token pair with that grammar and must
+    never transmute.
+
+    Parameters
+    ----------
+    reason_code:
+        Raw author-supplied BLOCKED reason code.
+
+    Returns
+    -------
+    bool
+        Whether the reason states effort/budget exhaustion.
+    """
+
+    canonical = _normalized_reason_code(reason_code)
+    if canonical in EFFORT_EXHAUSTION_REASON_CODES:
+        return True
+    if canonical.startswith("effort-exhausted:"):
+        return True
+    tokens = frozenset(canonical.replace(":", "-").split("-"))
+    if tokens & _EXHAUSTION_RESOURCE_TOKENS:
+        if tokens & _EXHAUSTION_OUTCOME_TOKENS:
+            return True
+        # "…-deadline-before-<milestone>": the deadline fired before the work
+        # completed. rung 7: author-wall-deadline-before-citation-grounding,
+        # author-wall-deadline-before-evidence-digests.
+        if "deadline" in tokens and "before" in tokens:
+            return True
+    return False
+
+
+def _validate_blocked_reason(stage: str, reason_code: str) -> None:
+    """Refuse a BLOCKED advisory reason that names an effort or budget outcome.
+
+    A BLOCKED arm terminalizes under the ``blocked-prerequisite`` predicate: an assertion
+    that this model cannot be resolved until a named prerequisite exists, carried into the
+    durable record as a source verdict. Cap exhaustion is a budget outcome, not a source
+    verdict (``PLAN.md`` LP-13.2) -- an exhausted model is *unfinished*, not
+    *unresolvable*. On a run-once campaign that difference is permanent, so the refusal
+    lives at the parse boundary every author result crosses: the false claim is
+    unrepresentable rather than merely detectable downstream.
+
+    The honest terminal is the one the doctrine already names: ``failed:<stage>`` with a
+    stage-valid effort reason, which ``tools/requeue --reason ... --grant ...`` reissues as
+    an explicit new work generation. ``_author_lane_failure`` routes this exception there.
+
+    This refuses ONLY the exhaustion class, never an unrecognized reason. The reason
+    vocabulary at large is closed downstream instead, by the total mapping in
+    ``driver._blocked_terminal``: a well-formed result whose reason the record cannot
+    express becomes ``failed:author`` with ``malformed-result``. Refusing unrecognized
+    reasons here as well would reintroduce the campaign-killing failure mode that mapping
+    was written to remove.
+
+    Parameters
+    ----------
+    stage:
+        Blocking stage claimed by the advisory arm.
+    reason_code:
+        Root reason code claimed by the advisory arm.
+
+    Raises
+    ------
+    AuthorEffortExhaustionClaim
+        If the reason names an effort or budget outcome. The author lane routes this to
+        ``failed:<stage>`` with a stage-valid effort reason rather than its blanket arm, so
+        refusing the claim cannot substitute one false statement for another.
+    """
+
+    if _names_effort_exhaustion(reason_code):
+        raise AuthorEffortExhaustionClaim(
+            f"blocked recommendation reason_code {reason_code!r} names an effort or budget "
+            "outcome, not a missing prerequisite: an exhausted model is unfinished, not "
+            "unresolvable. Exceed the grant instead, so the driver records failed:<stage> "
+            "with a stage-valid effort reason and tools/requeue can reissue a larger grant.",
+            # The stage the author named is the stage that was in flight when the budget
+            # ran out. An unknown one cannot travel to a terminal, so the constructor
+            # falls back rather than fabricating a status code.
+            stage=stage,
+        )
+
+
+def _validate_proposal_binding(proposal: Mapping[str, Any], binding: AuthorResultBinding) -> None:
+    """Require a proposed arm to repeat every common v3 authority binding exactly."""
+
+    expected = {
+        "stable_id": binding.stable_id,
+        "work_id": binding.work_id,
+        "campaign_id": binding.campaign_id,
+        "intake_snapshot_id": binding.intake_snapshot_id,
+        "intake_snapshot_sha256": binding.intake_snapshot_sha256,
+        "intake_item_sha256": binding.intake_item_sha256,
+        "source_manifest_identity": binding.source_manifest_identity,
+        "dispatcher_identity": binding.dispatcher_identity,
+    }
+    for field, value in expected.items():
+        if proposal.get(field) != value:
+            raise AuthorResultMalformedError(
+                f"proposed result {field} does not match its result binding"
+            )
+    author = _required_mapping(proposal.get("author"), "proposal author", owner="author")
+    if stable_hash(author) != binding.author_identity:
+        raise AuthorResultMalformedError(
+            "proposal author identity does not match its result binding"
+        )
+    if author.get("prompt_sha256") != binding.prompt_identity:
+        raise AuthorResultMalformedError(
+            "proposal prompt identity does not match its result binding"
+        )
+    proposal_hash = stable_hash(
+        {key: value for key, value in proposal.items() if key != "proposal_sha256"}
+    )
+    if proposal.get("proposal_sha256") != proposal_hash:
+        raise AuthorResultMalformedError("proposal_sha256 does not bind the complete v3 proposal")
+
+
+def _result_binding(result: Mapping[str, Any]) -> AuthorResultBinding:
+    """Build the common immutable binding from a validated result mapping."""
+
+    return AuthorResultBinding(
+        result_id=str(result["result_id"]),
+        result_sha256=str(result["result_sha256"]),
+        stable_id=str(result["stable_id"]),
+        work_id=str(result["work_id"]),
+        campaign_id=str(result["campaign_id"]),
+        author_identity=str(result["author_identity"]),
+        prompt_identity=str(result["prompt_identity"]),
+        dispatcher_identity=str(result["dispatcher_identity"]),
+        source_manifest_identity=str(result["source_manifest_identity"]),
+        intake_snapshot_id=str(result["intake_snapshot_id"]),
+        intake_snapshot_sha256=str(result["intake_snapshot_sha256"]),
+        intake_item_sha256=str(result["intake_item_sha256"]),
+        created_at=str(result["created_at"]),
+        raw_result=deepcopy(dict(result)),
+    )
+
+
+def _validate_recommendation_hash(payload: Mapping[str, Any]) -> None:
+    """Require an advisory payload digest to bind every arm-specific field."""
+
+    expected = stable_hash(
+        {key: value for key, value in payload.items() if key != "recommendation_sha256"}
+    )
+    if payload.get("recommendation_sha256") != expected:
+        raise AuthorResultMalformedError("recommendation_sha256 does not bind its complete payload")
+
+
+def _source_manifest_identity(source_manifest: Mapping[str, Any]) -> str:
+    """Return the exact frozen source-manifest identity."""
+
+    explicit = source_manifest.get("manifest_sha256") or source_manifest.get(
+        "source_manifest_identity"
+    )
+    if explicit is not None:
+        return str(explicit)
+    return stable_hash(source_manifest.get("sources", []))
+
+
+def _nonempty_unique_strings(value: object, field: str) -> tuple[str, ...]:
+    """Return a nonempty duplicate-free string tuple from an advisory payload."""
+
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, str) and item for item in value)
+        or len(value) != len(set(value))
+    ):
+        raise AuthorResultMalformedError(
+            f"author result {field} must be nonempty and duplicate-free"
+        )
+    return tuple(value)
+
+
+def _unique_strings(value: object, field: str) -> tuple[str, ...]:
+    """Return a duplicate-free string tuple that may be empty.
+
+    Parameters
+    ----------
+    value:
+        Candidate JSON array.
+    field:
+        Field name used in validation errors.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Exact duplicate-free strings in authored order.
+    """
+
+    if (
+        not isinstance(value, list)
+        or not all(isinstance(item, str) and item for item in value)
+        or len(value) != len(set(value))
+    ):
+        raise AuthorResultMalformedError(f"author result {field} must be duplicate-free strings")
+    return tuple(value)
+
+
+def _read_prompt() -> bytes:
+    """Read the exact frozen author prompt bytes."""
+
+    try:
+        return PROMPT_PATH.read_bytes()
+    except OSError as exc:
+        raise AuthorInfrastructureFaultError(f"cannot read frozen author prompt: {exc}") from exc
+
+
+def _validate_envelope_hash(envelope: Mapping[str, Any]) -> None:
+    """Validate a v3 author envelope's version and self-hash."""
+
+    if envelope.get("envelope_version") != _ENVELOPE_VERSION:
+        raise AuthorEngineFaultError("author envelope is not v3")
+    expected = stable_hash(
+        {key: value for key, value in envelope.items() if key != "envelope_sha256"}
+    )
+    if envelope.get("envelope_sha256") != expected:
+        raise AuthorEngineFaultError("author envelope hash mismatch")
+
+
+def _read_json_object(path: Path) -> JsonObject:
+    """Read one complete regular UTF-8 JSON object."""
+
+    try:
+        raw = path.read_bytes()
+        if not raw or path.is_symlink() or not path.is_file():
+            # DELIBERATELY on the ownership-ambiguous base. A missing, empty, or
+            # non-regular result at the envelope's atomic path is the ONE observation
+            # consistent with a session that genuinely died before its atomic rename --
+            # which is exactly what `session-crashed` asserts. Naming it
+            # `malformed-result` would state that a completed session published bad
+            # content, which is equally unprovable from here.
+            raise AuthorDispatchError("author result must be a non-empty regular file")
+        parsed = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # Also deliberately ambiguous: a truncated file is a crash mid-write, a
+        # syntactically invalid one is authored content, and the two are
+        # indistinguishable at this boundary. Guessing either way would trade a
+        # detectable catch-all for an undetectable false statement.
+        raise AuthorDispatchError(f"partial or invalid author result: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise AuthorResultMalformedError("author result must contain exactly one JSON object")
+    return parsed
+
+
+#: Ownership of the refusal raised by :func:`_required_mapping`, keyed by the caller's
+#: declared ``owner``. The helper itself cannot know who wrote the mapping it just
+#: refused -- it is called on driver-built envelope fields, on host-held cache fields,
+#: and on author-published result fields alike -- so the CALLER, which does know,
+#: declares it. Without this the one shared helper would have to raise the bare
+#: ownership-ambiguous base and launder nine known-ownership sites into the
+#: ``session-crashed`` catch-all.
+_REQUIRED_MAPPING_OWNERS: dict[str, type[AuthorDispatchError]] = {
+    "author": AuthorResultMalformedError,
+    "engine": AuthorEngineFaultError,
+    "infrastructure": AuthorInfrastructureFaultError,
+}
+
+
+def _required_mapping(value: object, field: str, *, owner: str) -> Mapping[str, Any]:
+    """Return a required mapping from a validated envelope, cache, or result.
+
+    Parameters
+    ----------
+    value:
+        Candidate JSON value.
+    field:
+        Field name used in the refusal message.
+    owner:
+        Who supplied ``value``: ``"author"`` for author-published result bytes,
+        ``"engine"`` for a driver-built envelope, ``"infrastructure"`` for host-held
+        cache state. Mandatory and keyword-only so a new call site cannot silently
+        inherit a wrong ownership.
+
+    Returns
+    -------
+    Mapping[str, Any]
+        The exact mapping, unchanged.
+    """
+
+    if not isinstance(value, Mapping):
+        raise _REQUIRED_MAPPING_OWNERS[owner](f"author {field} must be an object")
+    return value

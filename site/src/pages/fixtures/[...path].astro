@@ -1,0 +1,39 @@
+---
+/**
+ * Fixture index: links to every fixture page, plus the card in each record state. Built only
+ * when MENAGERIE_FIXTURE_PAGES=1 (a fixture build for QA); the deployed site has no /fixtures/.
+ */
+import ModelCard from "@/components/ModelCard.astro";
+import BaseLayout from "@/layouts/BaseLayout.astro";
+import { FIXTURE_CASES, emptyFamily, fixtureFamily, fixturePagesEnabled, fixtureRecord } from "@/fixtures/records";
+
+export function getStaticPaths() {
+  return fixturePagesEnabled() ? [{ params: { path: undefined } }] : [];
+}
+
+const records = FIXTURE_CASES.map(fixtureRecord);
+const families = [fixtureFamily(), emptyFamily()];
+---
+
+<BaseLayout title="Fixture pages" description="Fixture pages for QA." noindex>
+  <section class="shell py-8">
+    <h1>Fixture pages</h1>
+    <ul>
+      {records.map((record) => <li><a class="textlink" href={`/models/${record.slug}/`}>{record.display_name}</a></li>)}
+      {families.map((family) => <li><a class="textlink" href={`/families/${family.slug}/`}>{family.name} (family page)</a></li>)}
+    </ul>
+    <h2>Cards</h2>
+    <div class="fixture-cards">
+      {records.map((record) => <ModelCard model={record} headingLevel={3} />)}
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .fixture-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 15.5rem), 1fr));
+    align-items: start;
+    gap: 1rem;
+  }
+</style>

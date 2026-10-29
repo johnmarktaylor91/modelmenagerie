@@ -1,0 +1,498 @@
+{
+ "schema_version": "menagerie.crawler.cache-inventory.v1",
+ "comment": "IC-4 closed cache inventory (trilab union: opus B-6 C1-C22, sol B4 in-memory maps, fable 14-layer table). EVERY admission-steering cache names its invalidation authority here; the AST census in tests/test_cache_inventory.py enumerates lru_cache decorator sites plus cache/memo-named module-level and self-attribute bindings and refuses any site this file does not declare. A new cache without a registered invalidation authority fails CI. W9 (Wave-2 invalidation design) consumes these rows as its closed eviction scope. W44 SHADOW-EXCLUSION RIDER: every row additionally declares its shadow_exclusion mechanism (how shadow-rehearsal-marked records are kept from conferring reuse/authority through this cache); the census in tests/test_shadow_exclusion.py refuses a row without one.",
+ "caches": [
+  {
+   "id": "C1",
+   "name": "canonical-artifact-authority-solve-cache",
+   "kind": "on-disk-ledger",
+   "location": "records/artifacts/*.jsonl",
+   "key_axes": "has_final_event(stable_id, work_id) + recorded transaction_id",
+   "generation_binding": "work-generation via work_id",
+   "invalidation_authority": "append-only supersession; W9 durable retirement row (Wave 2) for identity-stale entries",
+   "sites": [],
+   "shadow_exclusion": "structural: authority conferral routes through the checkpoint fold, which quarantines shadow-marked chains as disclosed stale entries (W44; artifact_transactions._fold_transaction_chain)"
+  },
+  {
+   "id": "C2",
+   "name": "work-dir-author-result-scratch-cache",
+   "kind": "on-disk-file",
+   "location": ".crawl-local/work/<id>/driver-author-artifact.json",
+   "key_axes": "live-basis identities + work/snapshot anchor + supersession vs latest artifact event",
+   "generation_binding": "NONE (repair_generation:null observed; AT-10 binds it)",
+   "invalidation_authority": "W9 retire-by-rename .stale-<event_id> at the composed retirement authority AND the author-cache-discarded handler (evidence-preserving, never unlink); reaper protects renamed evidence; registry chokepoint author_result_cache_path",
+   "sites": [],
+   "shadow_exclusion": "structural: cached author results rehydrate only against checkpoint authority; authority conferral routes through the checkpoint fold, which quarantines shadow-marked chains as disclosed stale entries (W44; artifact_transactions._fold_transaction_chain)"
+  },
+  {
+   "id": "C3",
+   "name": "persistent-validation-memo",
+   "kind": "on-disk-memo",
+   "location": ".crawl-local/derived/checkpoint-cache/validation-memo-v1.jsonl",
+   "key_axes": "positive-only; schema bytes + validator import closure (IC-7) + jsonschema/referencing/python versions + CHECKPOINT_CACHE_EPOCH",
+   "generation_binding": "epoch",
+   "invalidation_authority": "environment-identity mismatch discards; CHECKPOINT_CACHE_EPOCH bump",
+   "sites": [
+    "menagerie/crawler/artifact_transactions.py::self._memo",
+    "menagerie/crawler/artifact_transactions.py::self._validation_memo",
+    "menagerie/crawler/driver_admission.py::self._checkpoint_memo_instance",
+    "menagerie/crawler/driver.py::self._checkpoint_memo_instance"
+   ],
+   "shadow_exclusion": "not-authority-bearing: positive-only pure-validation memo; hits re-verify content identity live and confer no verdict or award authority"
+  },
+  {
+   "id": "C4",
+   "name": "in-run-artifact-checkpoint-projection",
+   "kind": "in-memory-instance",
+   "location": "driver_admission.DriverAdmission",
+   "key_axes": "locked-ledger object identity + append generation + path tuple",
+   "generation_binding": "ledger append generation",
+   "invalidation_authority": "advance failure falls back to full validation",
+   "sites": [
+    "menagerie/crawler/driver_admission.py::self._artifact_checkpoint_cache",
+    "menagerie/crawler/driver.py::self._artifact_checkpoint_cache"
+   ],
+   "shadow_exclusion": "derived: projection of the artifact ledger through the same fold quarantine (W44); shadow chains project only as stale entries"
+  },
+  {
+   "id": "C5",
+   "name": "reducer-dependency-currency-projection",
+   "kind": "in-memory-instance",
+   "location": "reducer.CanonicalReducer",
+   "key_axes": "authority-bytes digest + models/attempts/gates/artifacts counts; IC-5 adds historical_generation_families + rotation registry as counted inputs",
+   "generation_binding": "authority bytes token",
+   "invalidation_authority": "token mismatch recompute (IC-5 closes the family-map/registry gap)",
+   "sites": [
+    "menagerie/crawler/reducer.py::self._projection_cache"
+   ],
+   "shadow_exclusion": "derived: reducer dependency-currency consumes post-exclusion gate/artifact authority (W44 gate accumulator + fold)"
+  },
+  {
+   "id": "C6",
+   "name": "authority-bytes-token-memo",
+   "kind": "in-memory-module",
+   "location": "reducer module global",
+   "key_axes": "canonical root; process lifetime by design (wave discipline)",
+   "generation_binding": "process lifetime",
+   "invalidation_authority": "explicit clear hook; documented mid-process-edit blindness at reducer.py:5810-5817",
+   "sites": [
+    "menagerie/crawler/reducer.py::_DEPENDENCY_BYTES_TOKEN_MEMO"
+   ],
+   "shadow_exclusion": "not-record-bearing: authority-bytes token memo; caches digests, never records"
+  },
+  {
+   "id": "C7",
+   "name": "reducer-attempt-index",
+   "kind": "in-memory-instance",
+   "location": "reducer.CanonicalReducer",
+   "key_axes": "attempts ledger content",
+   "generation_binding": "cleared on append",
+   "invalidation_authority": "cleared on _attempts.append",
+   "sites": [
+    "menagerie/crawler/reducer.py::self._attempt_index_cache"
+   ],
+   "shadow_exclusion": "derived: attempt index is a validation lookup; verdict authority accumulates only through the shadow-excluding gate accumulator (W44)"
+  },
+  {
+   "id": "C8",
+   "name": "reducer-gate-index",
+   "kind": "in-memory-instance",
+   "location": "reducer.CanonicalReducer",
+   "key_axes": "gates ledger content",
+   "generation_binding": "cleared on append",
+   "invalidation_authority": "cleared on _gates.append",
+   "sites": [
+    "menagerie/crawler/reducer.py::self._gate_index_cache"
+   ],
+   "shadow_exclusion": "derived: gate-ID index is a validation lookup; current proof authority excludes shadow-marked gates (W44; CanonicalReducer._current_gate_records)"
+  },
+  {
+   "id": "C9",
+   "name": "resolved-final-transactions-map",
+   "kind": "in-memory-instance",
+   "location": "driver.Driver._final_artifact_transactions (in-memory instance map)",
+   "key_axes": "(stable_id, work_id, transaction_id) -- exact triple, staleness-immune",
+   "generation_binding": "tx-keyed",
+   "invalidation_authority": "W9 composed retirement authority evicts all member keys (_report_identity_stale_artifact_authority); rebuilt from checkpoint authority per rehydration",
+   "sites": [],
+   "shadow_exclusion": "derived: resolved-final-transactions map is populated from fold-projected authority; shadow chains quarantine as stale before it (W44)"
+  },
+  {
+   "id": "C10",
+   "name": "family-representative-artifacts-map",
+   "kind": "in-memory-instance",
+   "location": "driver.Driver._family_artifacts (in-memory instance map)",
+   "key_axes": "stable_id per leg",
+   "generation_binding": "leg lifetime",
+   "invalidation_authority": "W9 composed retirement authority evicts the member entry (_report_identity_stale_artifact_authority)",
+   "sites": [],
+   "shadow_exclusion": "derived: family-representative artifacts come from post-exclusion rehydration (W44 fold quarantine)"
+  },
+  {
+   "id": "C11",
+   "name": "gate-verdict-reuse",
+   "kind": "retired",
+   "location": "gate_reuse.py",
+   "key_axes": "RETIRED (GATE_VERDICT_REUSE_RETIRED, BL-10 h); key not semantically closed",
+   "generation_binding": "n/a",
+   "invalidation_authority": "retired fail-closed; re-arm bar documented (complete request digest + immutable checker build identity + shadow census)",
+   "sites": [],
+   "shadow_exclusion": "seam: the reuse predicate refuses shadow-marked deciding rows (W44; gate_reuse._latest_reuse_match), independent of retirement and of any DX-59 re-arm"
+  },
+  {
+   "id": "C12",
+   "name": "ledger-incremental-scan",
+   "kind": "on-disk-open-state",
+   "location": "<ledger>.open-state",
+   "key_axes": "(st_dev, st_ino, st_size, st_mtime_ns)",
+   "generation_binding": "file identity signature",
+   "invalidation_authority": "signature mismatch discards; next full scan re-verifies payload_sha256",
+   "sites": [
+    "menagerie/crawler/recordio.py::self._cached_index",
+    "menagerie/crawler/recordio.py::self._cached_record"
+   ],
+   "shadow_exclusion": "not-record-bearing: advisory scan-position state only"
+  },
+  {
+   "id": "C13",
+   "name": "operational-evidence-scan-cache",
+   "kind": "in-memory-module",
+   "location": "reducer module global",
+   "key_axes": "resolved path; delegates to C12",
+   "generation_binding": "delegated",
+   "invalidation_authority": "C12 signature discipline + explicit clear hook",
+   "sites": [
+    "menagerie/crawler/reducer.py::_OPERATIONAL_EVIDENCE_SCAN_CACHE"
+   ],
+   "shadow_exclusion": "not-authority-bearing: operational-evidence disclosures only; no verdict or award authority derives"
+  },
+  {
+   "id": "C14",
+   "name": "close-read-substrate",
+   "kind": "in-memory-instance",
+   "location": "close_reads.py",
+   "key_axes": "generation-bound, byte-bounded (T4 32dc5ad8)",
+   "generation_binding": "generation",
+   "invalidation_authority": "generation binding",
+   "sites": [],
+   "shadow_exclusion": "seam: close reads mirror raw ledgers; shadow handling at the close is W3's release-eligibility refusal at the verdict-render seam, marker-keyed"
+  },
+  {
+   "id": "C15",
+   "name": "incremental-chain-state",
+   "kind": "in-memory-instance",
+   "location": "ledger_chain.extend_chain_state",
+   "key_axes": "chain suffix verification (additive)",
+   "generation_binding": "chain head",
+   "invalidation_authority": "suffix re-verification",
+   "sites": [],
+   "shadow_exclusion": "not-record-bearing: incremental chain-hash state only"
+  },
+  {
+   "id": "C16",
+   "name": "artifact-mirror-cas",
+   "kind": "on-disk-cas",
+   "location": ".crawl-local/mirrors/{public,private,local}",
+   "key_axes": "content address; append-only",
+   "generation_binding": "content-addressed (staleness-immune)",
+   "invalidation_authority": "content addressing; retention/GC deliberately deferred (F18/F19 doctrine)",
+   "sites": [],
+   "shadow_exclusion": "structural: physical custody only; shadow bytes stay attested store contents while authority exclusion happens at the checkpoint fold (W44)"
+  },
+  {
+   "id": "C17",
+   "name": "text-corpus-cas",
+   "kind": "on-disk-cas",
+   "location": "records/text-corpus/{sha256,corpus-index.jsonl}",
+   "key_axes": "content address; corpus_row_id includes work_id",
+   "generation_binding": "work_id in row id",
+   "invalidation_authority": "never-reapable by contract (text_corpus.py)",
+   "sites": [],
+   "shadow_exclusion": "not-authority-bearing: corpus retention rows and payloads; no verdict or award authority derives"
+  },
+  {
+   "id": "C18",
+   "name": "per-work-dir-source-cas",
+   "kind": "on-disk-cas",
+   "location": ".crawl-local/work/<id>/author/source-cas",
+   "key_axes": "content address",
+   "generation_binding": "work dir",
+   "invalidation_authority": "work_dir_reap_clearance gate",
+   "sites": [],
+   "shadow_exclusion": "not-authority-bearing: work-dir evidence bytes only"
+  },
+  {
+   "id": "C19",
+   "name": "broker-evidence",
+   "kind": "on-disk-files",
+   "location": ".crawl-local/work/<id>/author/**/broker/evidence",
+   "key_axes": "per work dir",
+   "generation_binding": "work dir",
+   "invalidation_authority": "work-dir reap tier (report-only today)",
+   "sites": [],
+   "shadow_exclusion": "not-authority-bearing: broker evidence bytes only"
+  },
+  {
+   "id": "C20",
+   "name": "conda-package-caches",
+   "kind": "on-disk-cas",
+   "location": "$MENAGERIE_ENVIRONMENT_STATE_ROOT/package-caches/<prefix>-<lockdigest>",
+   "key_axes": "lock digest in path",
+   "generation_binding": "lock digest",
+   "invalidation_authority": "env-orphans reap tier",
+   "sites": [],
+   "shadow_exclusion": "not-record-bearing: conda package payloads only"
+  },
+  {
+   "id": "C21",
+   "name": "environment-authority-cache",
+   "kind": "in-memory-instance",
+   "location": "env_lifecycle.EnvironmentAuthorityCache",
+   "key_axes": "active-prefix identity",
+   "generation_binding": "prefix generation",
+   "invalidation_authority": "refuses inactive prefixes (fail-closed)",
+   "sites": [
+    "menagerie/crawler/env_lifecycle.py::self._authority_cache"
+   ],
+   "shadow_exclusion": "not-record-bearing: environment identities only; carries no gate/artifact records"
+  },
+  {
+   "id": "C23",
+   "name": "author-leg-runaway-budget-cache",
+   "kind": "in-memory-instance",
+   "location": "driver_admission.py",
+   "key_axes": "per-leg author runaway budget",
+   "generation_binding": "leg lifetime",
+   "invalidation_authority": "leg lifetime (instance dies with the leg)",
+   "sites": [
+    "menagerie/crawler/driver_admission.py::self._author_leg_runaway_cache"
+   ],
+   "shadow_exclusion": "not-record-bearing: budget counters only"
+  },
+  {
+   "id": "C24",
+   "name": "scheduler-wave-artifact-map",
+   "kind": "in-memory-wave-state",
+   "location": "scheduler.py wave state (artifacts by stable_id)",
+   "key_axes": "stable_id within one wave",
+   "generation_binding": "wave lifetime",
+   "invalidation_authority": "W9: the scheduler award site evicts the member from the wave artifact map on identity-stale retirement (no bare-continue); wave state rebuilds per leg",
+   "sites": [],
+   "shadow_exclusion": "derived: wave artifact map holds post-exclusion rehydrated artifacts (W44 fold quarantine)"
+  },
+  {
+   "id": "C25",
+   "name": "scheduler-wave-membership-sets",
+   "kind": "in-memory-wave-state",
+   "location": "scheduler.py authored_ids/admitted_ids and gated sets",
+   "key_axes": "stable_id membership within one wave",
+   "generation_binding": "wave lifetime",
+   "invalidation_authority": "wave lifetime; W9 eviction scope member",
+   "sites": [],
+   "shadow_exclusion": "derived: wave membership sets derive from post-exclusion admission state"
+  },
+  {
+   "id": "C26",
+   "name": "runner-identity-cache",
+   "kind": "in-memory-module",
+   "location": "driver_admission module global",
+   "key_axes": "content key over runner inputs incl. selected asset ids/sha256; bounded at 16 entries",
+   "generation_binding": "content-keyed",
+   "invalidation_authority": "content key + size bound",
+   "sites": [
+    "menagerie/crawler/driver_admission.py::_RUNNER_IDENTITY_CACHE"
+   ],
+   "shadow_exclusion": "not-record-bearing: runner identity digests only"
+  },
+  {
+   "id": "C27",
+   "name": "intake-snapshot-verification-memo",
+   "kind": "in-memory-module",
+   "location": "checkpoint module global",
+   "key_axes": "resolved snapshot root + full stat inventory signature",
+   "generation_binding": "stat signature",
+   "invalidation_authority": "any added/removed/resized/rewritten file voids the memo (fail toward verification); explicit clear hook",
+   "sites": [
+    "menagerie/crawler/checkpoint.py::_INTAKE_SNAPSHOT_VERIFICATION_MEMO"
+   ],
+   "shadow_exclusion": "not-record-bearing: intake snapshot verification digests only"
+  },
+  {
+   "id": "C28",
+   "name": "manifest-module-import-cache",
+   "kind": "in-memory-instance",
+   "location": "recipe.py manifest member finder",
+   "key_axes": "module name within one manifest-scoped import session",
+   "generation_binding": "manifest root lifetime",
+   "invalidation_authority": "importer instance lifetime",
+   "sites": [
+    "menagerie/crawler/recipe.py::self._cache"
+   ],
+   "shadow_exclusion": "not-record-bearing: module import handles only"
+  },
+  {
+   "id": "C22-award-closure",
+   "name": "lru: award closure from bytes",
+   "kind": "lru",
+   "location": "driver_admission.py",
+   "key_axes": "frozen input bytes",
+   "generation_binding": "input-keyed",
+   "invalidation_authority": "frozen inputs",
+   "sites": [
+    "menagerie/crawler/driver_admission.py::_award_closure_from_bytes"
+   ],
+   "shadow_exclusion": "not-record-bearing: code-closure digests only"
+  },
+  {
+   "id": "C22-native-schema",
+   "name": "lru: derived native output schema",
+   "kind": "lru",
+   "location": "native_output_schema.py",
+   "key_axes": "frozen inputs",
+   "generation_binding": "input-keyed",
+   "invalidation_authority": "frozen inputs",
+   "sites": [
+    "menagerie/crawler/native_output_schema.py::_derived"
+   ],
+   "shadow_exclusion": "not-record-bearing: derived schema documents only"
+  },
+  {
+   "id": "C22-policy",
+   "name": "lru: policy site roots / package digests / sandbox detection",
+   "kind": "lru",
+   "location": "policy.py",
+   "key_axes": "path-keyed; _installed_package_digest_for_path sound ONLY because env prefixes are generation-addressed and never reused in place (named invariant, no tripwire -- opus C22 note)",
+   "generation_binding": "prefix-generation addressing invariant",
+   "invalidation_authority": "process lifetime + generation-addressed prefixes",
+   "sites": [
+    "menagerie/crawler/policy.py::_cached_runtime_site_roots",
+    "menagerie/crawler/policy.py::_installed_package_digest_for_path",
+    "menagerie/crawler/policy.py::_installed_package_record_entries",
+    "menagerie/crawler/policy.py::detect_os_sandbox"
+   ],
+   "shadow_exclusion": "not-record-bearing: policy site roots and digests only"
+  },
+  {
+   "id": "C22-recipe",
+   "name": "lru: distribution package snapshots",
+   "kind": "lru",
+   "location": "recipe.py",
+   "key_axes": "process-frozen importlib metadata",
+   "generation_binding": "process lifetime",
+   "invalidation_authority": "process lifetime",
+   "sites": [
+    "menagerie/crawler/recipe.py::_distribution_top_level_packages",
+    "menagerie/crawler/recipe.py::_packages_distributions_snapshot"
+   ],
+   "shadow_exclusion": "not-record-bearing: distribution snapshots only"
+  },
+  {
+   "id": "C22-routing",
+   "name": "lru: compiled routing patterns",
+   "kind": "lru",
+   "location": "routing.py",
+   "key_axes": "frozen pattern text",
+   "generation_binding": "input-keyed",
+   "invalidation_authority": "frozen inputs",
+   "sites": [
+    "menagerie/crawler/routing.py::_compiled"
+   ],
+   "shadow_exclusion": "not-record-bearing: compiled patterns only"
+  },
+  {
+   "id": "C22-schema",
+   "name": "lru: schema resources and validators",
+   "kind": "lru",
+   "location": "schema.py",
+   "key_axes": "packaged schema bytes (frozen per process)",
+   "generation_binding": "process lifetime",
+   "invalidation_authority": "process lifetime; C3's environment identity hashes the same schema bytes",
+   "sites": [
+    "menagerie/crawler/schema.py::_load_schema_resource",
+    "menagerie/crawler/schema.py::get_validator",
+    "menagerie/crawler/schema.py::load_schema"
+   ],
+   "shadow_exclusion": "not-record-bearing: schema resources and validators only"
+  },
+  {
+   "id": "C23-records-root-fstype",
+   "name": "records-root-fstype-cache",
+   "kind": "in-memory-process",
+   "location": "menagerie/crawler/records_root_guard.py::_FSTYPE_CACHE",
+   "key_axes": "st_dev of the resolved records root",
+   "generation_binding": "process-lifetime",
+   "invalidation_authority": "process-scoped memo; a remount assigns a fresh st_dev so a stale row cannot alias a new mount under the same key on macOS/Linux; consumer is the leg-open substrate refusal which re-resolves per leg. HARDENING FOLLOW-UP (routed to WS7 Wave-2 design notes): clear the memo at leg open so a device-id recycle within one long-lived driver process cannot serve a stale fstype.",
+   "sites": [
+    "menagerie/crawler/records_root_guard.py::_FSTYPE_CACHE"
+   ],
+   "shadow_exclusion": "not-record-bearing: filesystem-type probe result only"
+  },
+  {
+   "id": "C24-toolchain-pin-verification",
+   "name": "toolchain-pin-verification-memo",
+   "kind": "in-memory-module",
+   "location": "toolchain_pins._VERIFICATION_CACHE",
+   "key_axes": "(leg cache key: campaign_id + paid generation_id) + resolved pinned command + expected version",
+   "generation_binding": "leg generation via the cache key: a new leg re-probes every declared pin",
+   "invalidation_authority": "key-scoped: a new (campaign, generation) key re-verifies; clear_toolchain_verification_cache() for tests and explicit re-probes; process-scoped (a driver restart clears it)",
+   "sites": [
+    "menagerie/crawler/toolchain_pins.py::_VERIFICATION_CACHE"
+   ],
+   "shadow_exclusion": "derived: the memo caches a subprocess --version probe of the pinned binary; the binary itself is the authority and the pin bump discipline (toolchain attestation) governs version moves"
+  }
+ ],
+ "non_cache_matches": [
+  {
+   "site": "menagerie/crawler/author_dispatch.py::_CACHE_VERSION",
+   "reason": "schema-version constant for C2's on-disk format, not a cache"
+  },
+  {
+   "site": "menagerie/crawler/author_dispatch.py::_CACHE_LIFECYCLES",
+   "reason": "closed lifecycle vocabulary for C2's v2 generation binding (AT-10), not a cache"
+  },
+  {
+   "site": "menagerie/crawler/checkpoint_cache.py::CHECKPOINT_CACHE_EPOCH",
+   "reason": "C3 epoch constant"
+  },
+  {
+   "site": "menagerie/crawler/checkpoint_cache.py::MEMO_FILENAME",
+   "reason": "C3 filename constant"
+  },
+  {
+   "site": "menagerie/crawler/checkpoint_cache.py::_MEMO_KINDS",
+   "reason": "C3 closed kind vocabulary constant"
+  },
+  {
+   "site": "menagerie/crawler/driver_receipts.py::_FORBIDDEN_CACHE_ROOT_NAMES",
+   "reason": "guard constant refusing cache-root spellings, not a cache"
+  },
+  {
+   "site": "menagerie/crawler/reaper.py::TIER_DERIVED_CACHES",
+   "reason": "reaper tier-name constant"
+  },
+  {
+   "site": "menagerie/crawler/authority.py::self._cache",
+   "reason": "verification token's back-reference to C21, not an independent cache"
+  },
+  {
+   "site": "menagerie/crawler/cache_registry.py::AUTHOR_RESULT_SCRATCH_CACHE",
+   "reason": "registry NAME constant for C2 (the W9 registry chokepoint), not a cache"
+  },
+  {
+   "site": "menagerie/crawler/release_vocabulary.py::MACHINE_RELEASE_CLASS_ENGINE_CACHE",
+   "reason": "W14 release-class NAME constant (engine-invalidated-artifact-cache), not a cache"
+  },
+  {
+   "site": "menagerie/crawler/release_vocabulary.py::CACHE_INVALIDATION_FAULT_EVENT_KIND",
+   "reason": "closed event-kind constant for the AT-14 fault-evidence contract, not a cache"
+  },
+  {
+   "site": "menagerie/crawler/release_vocabulary.py::CACHE_INVALIDATION_FAULT_REASONS",
+   "reason": "closed reason vocabulary for AT-14 fault events, not a cache"
+  },
+  {
+   "site": "menagerie/crawler/release_vocabulary.py::CACHE_INVALIDATION_FAULT_EXCEPTION_TYPES",
+   "reason": "closed fault exception-identity set for AT-14 fault events, not a cache"
+  }
+ ]
+}
