@@ -18,6 +18,12 @@ Config (``describes`` in the tick's config.json), each passed to the run's envir
   unattended 70, so 2a and the Claude 2b lanes keep the band above it.
 - ``earlier_pins``: families validated only at an earlier TorchLens pin follow the current pin's
   (default true).
+- ``abstracts``: families without a full text may ground on the cited paper's saved S2 or
+  OpenAlex abstract: false (default), true for all, or a list of family ids (a trial, described
+  first).
+- ``workers``: seats may run on the 2b worker runtimes, 2b first, with no hub-slot gate; the hub
+  is the fallback (``describe_workers``; default false: hub only). ``worker_seats``: the most
+  seats on workers at once (default and ceiling ``lanes``).
 """
 
 from __future__ import annotations
@@ -31,12 +37,13 @@ from pathlib import Path
 from typing import Any
 
 from menagerie.paths import work_dir
-from menagerie.pipeline import DataLayout, StoreLayout, admission, describe_write, now
+from menagerie.pipeline import DataLayout, StoreLayout, admission, describe_workers, describe_write, now
 
 UNIT = "menagerie-describe-stage"
 RUNTIME_S = 3600  # a run stops after this; the next tick starts another
 REPO = Path(__file__).resolve().parents[2]
-DEFAULTS = {"hub_reserve": 6, "max_week_pct": 60, "earlier_pins": True}
+DEFAULTS = {"hub_reserve": 6, "max_week_pct": 60, "earlier_pins": True, "abstracts": False,
+            "workers": False}
 PASS_ENV = ("PATH", "PYTHONPATH")  # with every MENAGERIE_ variable
 
 Run = Callable[..., subprocess.CompletedProcess[str]]
@@ -55,14 +62,27 @@ def knobs(given: Mapping[str, Any]) -> dict[str, str]:
     """The run's environment words from the config's ``describes`` (``DEFAULTS`` fill gaps)."""
 
     cap = admission.LANE_CAP_MAX[describe_write.KIND]
-    lanes = int(given.get("lanes", admission.lane_cap(describe_write.KIND)))
+    lanes = max(0, min(int(given.get("lanes", admission.lane_cap(describe_write.KIND))), cap))
     cfg = {**DEFAULTS, **given}
-    if not isinstance(cfg["earlier_pins"], bool):
-        raise TypeError("describes.earlier_pins must be true or false")
-    return {"MENAGERIE_LANES_DESCRIBE": str(max(0, min(lanes, cap))),
-            describe_write.HUB_RESERVE: str(int(cfg["hub_reserve"])),
-            "MENAGERIE_DESCRIBE_MAX_PCT": str(int(cfg["max_week_pct"])),
-            describe_write.EARLIER_PINS: "1" if cfg["earlier_pins"] else "0"}
+    for name in ("earlier_pins", "workers"):
+        if not isinstance(cfg[name], bool):
+            raise TypeError(f"describes.{name} must be true or false")
+    words = {"MENAGERIE_LANES_DESCRIBE": str(lanes),
+             describe_write.HUB_RESERVE: str(int(cfg["hub_reserve"])),
+             "MENAGERIE_DESCRIBE_MAX_PCT": str(int(cfg["max_week_pct"])),
+             describe_write.EARLIER_PINS: "1" if cfg["earlier_pins"] else "0",
+             describe_write.ABSTRACTS: _abstracts(cfg["abstracts"])}
+    if cfg["workers"]:
+        words[describe_workers.WORKERS] = str(max(0, min(int(cfg.get("worker_seats", lanes)), lanes)))
+    return words
+
+
+def _abstracts(value: Any) -> str:
+    if isinstance(value, bool):
+        return "all" if value else ""
+    if isinstance(value, list) and all(isinstance(f, str) and f and "," not in f for f in value):
+        return ",".join(value)
+    raise TypeError("describes.abstracts must be true, false or a list of family ids")
 
 
 def _active(run: Run) -> bool:
@@ -73,12 +93,15 @@ def _active(run: Run) -> bool:
 
 def _idle(words: Mapping[str, str], slots: Callable[[], int]) -> bool:
     """Whether a run could do nothing: every seat is reserved and staged, none has a lane to
-    start or collect, and the hub has no slot past the reserve."""
+    start or collect, the hub has no slot past the reserve and, with workers on, no worker has
+    describe room (``describe_workers.hosts``)."""
 
     folders = describe_write._folders()
     if len(folders) < int(words["MENAGERIE_LANES_DESCRIBE"]):
         return False
     if any((f / "lane.json").is_file() or not (f / "ready.json").is_file() for f in folders):
+        return False
+    if describe_workers.WORKERS in words and describe_workers.hosts(int(words[describe_workers.WORKERS])):
         return False
     return slots() <= int(words[describe_write.HUB_RESERVE])
 

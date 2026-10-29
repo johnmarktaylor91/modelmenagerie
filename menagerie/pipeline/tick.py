@@ -116,6 +116,12 @@ DEFAULTS: dict[str, Any] = {
     "queue_spool": "scratch/menagerie/spool-B",
     "queue_depth": 40,
     "trickle_limit": 20,
+    # library packets a pass gives their library's documentation (0 = off), and the seconds
+    # after which that part of the trickle starts no new family
+    "library_docs": 0,
+    "library_docs_seconds": 90,
+    "paper_texts": 0,  # packets a pass gives an open-access paper text (paper_texts.texts); 0 off
+    "paper_texts_seconds": 90,
     "disk": {},
     "reclaim": {},  # disk_reclaim.DEFAULTS: below 75 GiB free, once an hour, failed trees after 2 h
     "commit_lanes": True,  # false leaves lane results uncommitted (the ``lanes`` step skips)

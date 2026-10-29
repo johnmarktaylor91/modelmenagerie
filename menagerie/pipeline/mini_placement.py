@@ -20,6 +20,10 @@ finish), and only in the share the runners leave with runner A sized for the 2b 
 workers can reach (``runner_job.lane_room``, ``_reachable_2b``), so in declared terms they never
 take room a runner needs. A lane already running when the guard
 pauses finishes, like a running row.
+
+A describe seat (``describe_workers``, ``start_describe``) takes a worker slot through the same
+admission, runtime, identity and lease, as a ``describe`` lease the relay stages without verbs;
+every placed lease counts against its worker's slots, whatever its kind.
 """
 
 from __future__ import annotations
@@ -39,14 +43,17 @@ from typing import Any
 
 from menagerie.paths import work_dir
 from menagerie.pipeline import DataLayout, admission, drive, mini_relay, now, read_json, runner
-from menagerie.pipeline.mini_lane import LANE_TIMEOUT_S, expand
+from menagerie.pipeline.mini_lane import expand
 
 SSH = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
 MEMORY_MARGIN = 1.25  # Match the remote runner's physical-footprint allowance.
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RUNTIME_KEYS = ("runtime", "identity", "prepare", "deliver")  # what a runtime profile may supply
 PHONE_NICE = 10  # a lane on a phone-build mini runs below phone builds' priority
-LEASE_MINUTES = 210  # the 180-minute hard timeout plus time to pull and ingest
+# Each lane kind's hard timeout. The run's deadline and the lane's own timeout come 15 minutes
+# before it, and the lease lasts 30 minutes past it to pull and ingest (2b: 165, 180, 210 minutes).
+HARD_MINUTES = {"2b": 180, "describe": admission.LANE_MINUTES["describe"]}
+LEASE_MINUTES = HARD_MINUTES["2b"] + 30
 POOL = "pool"  # an ``account`` value: serve whichever pool account admission picks
 # The lane runs on the system Python by absolute path. run-on puts Homebrew's bin first on a Mac's
 # PATH, and a Homebrew Python becomes macOS's responsible process for everything under it, so the
@@ -209,8 +216,7 @@ def slots(cfg: Mapping[str, Any]) -> list[str]:
         return []  # ``status`` names the malformed configuration
     if not enabled or not serving():
         return []
-    busy = Counter(x.get("placement") for x in admission.lanes(data=DataLayout.from_env())
-                   if x["kind"] == "2b")
+    busy = Counter(x.get("placement") for x in admission.lanes(data=DataLayout.from_env()))
     return [host for host, spec in enabled.items()
             for _ in range(max(0, host_cap(host, spec, cfg)[0] - busy[host]))]
 
@@ -352,16 +358,16 @@ def _big_night(host: str, spec: Mapping[str, Any]) -> bool:
 
 
 def _host_lanes(host: str) -> int:
-    """The 2b lane leases placed on ``host``, read without the lease lock: the slot checks run
-    inside it (``launch`` under ``_reserve``'s callers), so ``admission.lanes`` would deadlock. An
-    ended lane's lease not yet released counts until the next pass releases it."""
+    """The 2b and describe lane leases placed on ``host``, read without the lease lock: the slot
+    checks run inside it (``launch`` under ``_reserve``'s callers), so ``admission.lanes`` would
+    deadlock. An ended lane's lease not yet released counts until the next pass releases it."""
     count = 0
     for path in work_dir("leases").glob("*.json"):
         try:
             lease = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        count += lease.get("kind") == "2b" and lease.get("placement") == host
+        count += lease.get("kind") in ("2b", "describe") and lease.get("placement") == host
     return count
 
 
@@ -488,7 +494,8 @@ def _free(lock: Any) -> bool:
         and not lock.get("queue")
 
 
-def _runtime(role: str, spec: Mapping[str, Any], repair: bool, host: str) -> tuple[dict[str, Any], str, str]:
+def _runtime(role: str, spec: Mapping[str, Any], repair: bool, host: str,
+             kind: str = "2b") -> tuple[dict[str, Any], str, str]:
     """Use only a role and account the installed mini runtime can actually serve.
 
     A worker whose ``account`` is ``pool`` serves whichever pool account admission picks; its
@@ -496,7 +503,8 @@ def _runtime(role: str, spec: Mapping[str, Any], repair: bool, host: str) -> tup
     The runtime serves Claude alone, so each role is resolved for that harness: background
     routing's other-lab seat cannot run here, and the role's own Claude seat is used instead
     (``admission._resolve``'s ``harness``), still behind the pool's admission gate.
-    Returns the seat plan, the selected role and the account the lane runs on.
+    Returns the seat plan, the selected role and the account the lane runs on. ``kind`` is the
+    lane kind admission gates (``describe`` at its own week-use ceiling).
     """
     cwd = runner.CODE_ROOT
     pooled = spec["account"] == POOL
@@ -507,7 +515,7 @@ def _runtime(role: str, spec: Mapping[str, Any], repair: bool, host: str) -> tup
         plan = admission._resolve(candidate, spec["account"], harness="claude")
         if plan["harness"] != "claude":
             continue
-        _, account = admission._admit("claude", candidate, cwd, "2b")
+        _, account = admission._admit("claude", candidate, cwd, kind)
         if pooled:
             _identity(spec, account)
         elif account != spec["account"]:
@@ -583,6 +591,27 @@ def start(families: Sequence[str], *, role: str, data: DataLayout, host: str,
     return Started(host, path, lease, tuple(families), tier)
 
 
+def start_describe(families: Sequence[str], brief: Path, *, role: str, host: str,
+                   config: Mapping[str, Any], cfg: Mapping[str, Any]) -> Started:
+    """A describe seat's lane on ``host`` up to its proven job start (``finish`` reads its
+    admission): the worker checks of ``start``, the runtime resolved for Claude alone and gated
+    as a describe lane, a ``describe`` lease on the batch's families. ``brief`` is the batch
+    folder's brief; the relay stages that folder and ingests ``out/`` and the result beside it."""
+    from menagerie.pipeline import implement
+
+    spec = _admissible(host, config, cfg)
+    if not families or any(not implement.LABEL_FAMILY.fullmatch(f) for f in families):
+        raise ValueError("describe lane families must be safe family keys")
+    plan, selected_role, account = _runtime(role, spec, True, host, kind="describe")
+    spec = {**spec, "account": account}
+    label = "describe-mini-" + os.urandom(6).hex()
+    path, lease = _reserve(families, host, spec, label, plan, selected_role, cfg, kind="describe")
+    run = _submit(host, spec, families, label, brief, plan, kind="describe")  # unproven: lease held
+    lease = {**lease, "run": run, "brief": str(brief),
+             "result": str(brief.with_name(f"{brief.stem}.result.md"))}
+    return Started(host, path, lease, tuple(families), None)
+
+
 def finish(started: Started) -> str:
     """Read a started lane's run-on admission: a proven refusal releases its lease and raises
     ``Refused`` (the caller may fall back); otherwise the lease takes the run and the launch
@@ -593,12 +622,15 @@ def finish(started: Started) -> str:
     except admission.Refused:
         started.path.unlink()
         raise
-    lease = {**started.lease, "expires": admission._stamp(datetime.now(timezone.utc)
-                                                          + timedelta(minutes=LEASE_MINUTES))}
+    kind = started.lease.get("kind", "2b")
+    lease = {**started.lease, "expires": admission._stamp(
+        datetime.now(timezone.utc) + timedelta(minutes=HARD_MINUTES[kind] + 30))}
     admission._write_atomic(started.path, json.dumps(lease) + "\n")
     run = lease["run"]
     drive.event(run, "", "launch", **{k: v for k, v in lease.items() if k != "run"},
                 gauges=admission.gauges(lease["account"]))
+    if kind != "2b":
+        return run  # a describe lane's one event is its launch, as on the hub
     for family in started.families:
         if len(started.families) > 1:
             drive.event(run, family, "batch:assigned")
@@ -642,7 +674,7 @@ def _families(families: Sequence[str], data: DataLayout) -> None:
 
 def _reserve(families: Sequence[str], host: str, spec: Mapping[str, Any], label: str,
              plan: Mapping[str, Any], role: str,
-             cfg: Mapping[str, Any]) -> tuple[Path, dict[str, Any]]:
+             cfg: Mapping[str, Any], kind: str = "2b") -> tuple[Path, dict[str, Any]]:
     """Reserve before any network preparation; ambiguous starts retain the family and slot."""
     with admission._lease_lock() as leases:
         admission._held(leases, families, label)
@@ -653,20 +685,20 @@ def _reserve(families: Sequence[str], host: str, spec: Mapping[str, Any], label:
             raise admission.Refused("no_admission", "mini worker slot taken")
         if not serving():
             raise admission.Refused("no_admission", "bridge or mini relay not serving")
-        lease = {"label": label, "run": "pending:" + label, "kind": "2b", "keys": list(families),
+        lease = {"label": label, "run": "pending:" + label, "kind": kind, "keys": list(families),
                  "role": role, "harness": "claude", "model": plan["model"],
                  "effort": plan.get("effort"), "routing": plan.get("routing"), "ids": [],
                  "account": spec["account"], "placement": host, "web": False,
                  "mini": {"ssh_alias": spec["ssh_alias"], "deliver": spec.get("deliver")},
                  "parent": os.environ.get("FLEET_RUN_ID"), "started": now(),
                  "expires": admission._stamp(datetime.now(timezone.utc)
-                                             + timedelta(minutes=LEASE_MINUTES))}
+                                             + timedelta(minutes=HARD_MINUTES[kind] + 30))}
         path = leases / f"{label}.json"
         admission._write_atomic(path, json.dumps(lease) + "\n")
     return path, lease
 
 def _submit(host: str, spec: Mapping[str, Any], families: Sequence[str], label: str,
-            brief: Path, plan: Mapping[str, Any]) -> str:
+            brief: Path, plan: Mapping[str, Any], kind: str = "2b") -> str:
     """The remote runner pins source, checks host clearance and records the job's peak.
 
     The job gets only what it runs with: the runtime, identity probe, model and the paths of
@@ -677,16 +709,18 @@ def _submit(host: str, spec: Mapping[str, Any], families: Sequence[str], label: 
     if ref.returncode:
         raise OSError("cannot pin mini lane source")
     brief_rel, result_rel = mini_relay.layout(families, brief)
+    hard = HARD_MINUTES[kind]
     manifest = {"runtime": spec["runtime"], "identity": spec["identity"], "model": plan["model"],
                 "effort": plan.get("effort") or "high", "account": spec["account"],
                 "label": label, "families": list(families), "brief": brief_rel,
-                "result": result_rel, "lane_timeout_s": LANE_TIMEOUT_S,
+                "result": result_rel, "lane_timeout_s": (hard - 15) * 60,
                 "prepare": spec.get("prepare"),
-                "nice": PHONE_NICE if _phone_first(host, spec) else None}
+                "nice": PHONE_NICE if _phone_first(host, spec) else None,
+                **({"kind": kind} if kind != "2b" else {})}
     parent = os.environ.get("FLEET_RUN_ID")
     argv = [admission._fleet_run(), "start", "--kind", "remote", "--label", label,
             "--cwd", str(cwd), "--project", "menagerie", "--require-result",
-            "--adapter", "run-on", "--deadline", "165m", "--hard-timeout", "180m",
+            "--adapter", "run-on", "--deadline", f"{hard - 15}m", "--hard-timeout", f"{hard}m",
             "--client-key", "run-on:" + label,
             *(["--parent", parent] if parent else []), "--", admission._adapter(), "run-on",
             admission._tool("run-on"), label,

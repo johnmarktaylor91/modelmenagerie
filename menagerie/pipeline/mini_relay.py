@@ -10,7 +10,9 @@ whose hashes the copy must match, and the canonical hub wrapper runs from a trus
 folder. Answers are kept on the hub until delivered. When fleet-run reports the run ended the
 relay pulls ``outputs/lane/`` with ``pull-outputs`` into the project's ``outputs/<job>/`` and,
 while the lease is still this lane's, ingests the drafts and result; the lease is kept until
-then (``admission._live``).
+then (``admission._live``). A describe lease (``kind`` ``describe``, ``describe_workers``) has no
+verbs: the relay stages its batch folder's ``families/`` and ``out/`` with the translated brief,
+and ingest keeps only ``out/<family>.json`` for the lease's families and the result file.
 
 Started as a thread of the bridge service (``bridge.serve``); ``python -m
 menagerie.pipeline.mini_relay`` runs it alone. One relay serves at a time. Imports neither
@@ -40,6 +42,7 @@ from typing import Any
 from menagerie.paths import work_dir
 from menagerie.pipeline import DataLayout, admission, now
 from menagerie.pipeline.mini_lane import (
+    DRAFT_MAX_BYTES,
     NOT_DRAFTS,
     OUT,
     ROOT,
@@ -100,6 +103,8 @@ def _reply(rc: int, stderr: str = "", stdout: str = "") -> dict[str, Any]:
 def layout(families: Sequence[str], brief: Path) -> tuple[str, str]:
     """The brief's and result's paths under the worker's ``.mini-lane/``."""
     folder = Path(brief).parent
+    if folder.parent == work_dir("describe"):  # a describe batch folder and its own result name
+        return f"work/{folder.name}/{Path(brief).name}", f"work/{folder.name}/{Path(brief).stem}.result.md"
     name = folder.name if folder.parent == work_dir("2b") and folder.name in families else "_batch"
     return f"work/{name}/{Path(brief).name}", f"work/{name}/BRIEF.result.md"
 
@@ -234,6 +239,7 @@ class Lane:
     def __init__(self, lease: Mapping[str, Any], remote: Remote) -> None:
         self.lease, self.remote = dict(lease), remote
         self.label, self.run, self.host = lease["label"], lease["run"], lease["placement"]
+        self.kind = lease.get("kind", "2b")
         self.families = list(lease["keys"])
         self.brief = Path(lease["brief"])
         self.expires = admission._parse(lease["expires"])
@@ -272,7 +278,8 @@ class Lane:
                 if not self.inflight:
                     self.ingest()
             elif (self.staged or {}).get("phase") == "ready":
-                self.poll()
+                if self.kind != "describe":  # a describe lane has no verbs; its spool is never read
+                    self.poll()
             elif (self.staged or {}).get("phase") != "aborted":
                 self.stage()
         except Exception as exc:  # noqa: BLE001 - retried on the next pass; the log keeps why.
@@ -308,6 +315,8 @@ class Lane:
             return False  # The job has not created its checkout yet.
         worktree = home.decode().strip()
         root = worktree + "/" + ROOT
+        if self.kind == "describe":
+            return self._stage_describe(worktree, root)
         mapping = paths(root, self.families, self.brief, self.run)
         spool = " ".join(_q(f"{root}/spool/{box}") for box in ("new", "claimed", "done"))
         self.remote.run(f"mkdir -p {spool}")
@@ -325,6 +334,25 @@ class Lane:
                        "at": now()}
         self._save("staged.json", self.staged)
         _log(self.label, f"staged {len(self.families)} families at {root}")
+        return True
+
+    def _stage_describe(self, worktree: str, root: str) -> bool:
+        """A describe batch: its ``families/`` and ``out/`` (a return lane's earlier drafts) beside
+        the translated brief; regular files only, so no link reaches past the folder."""
+        folder = self.brief.parent
+        brief_rel, _ = layout(self.families, self.brief)
+        work = f"{root}/{Path(brief_rel).parent}"
+        mapping = {str(folder): work}
+        for name in ("families", "out"):
+            self.remote.run(f"mkdir -p {_q(f'{work}/{name}')}")
+            if (folder / name).is_dir():
+                self.remote.rsync(["-rt"], f"{folder / name}/", self.remote.target(f"{work}/{name}/"))
+        self._put(f"{root}/{brief_rel}", translate(self.brief.read_text(encoding="utf-8"),
+                                                   mapping).encode())
+        self.staged = {"root": root, "worktree": worktree, "paths": mapping, "phase": "staged",
+                       "at": now()}
+        self._save("staged.json", self.staged)
+        _log(self.label, f"staged describe batch {folder.name} ({len(self.families)} families) at {work}")
         return True
 
     def _deliver(self, argv: Sequence[str]) -> bool:
@@ -607,17 +635,34 @@ class Lane:
             current = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
             if current.get("run") != self.run:
                 return "late: the lease was released; results stay in the pulled folder"
-            for family in self.families:
-                source = lane / "families" / family
-                if source.is_dir():
-                    _copy_drafts(source, work_dir("2b") / family)
-                    keep_adapter_paths(work_dir("2b") / family, mapping)
+            if self.kind == "describe":
+                self._keep_describe(lane)
+            else:
+                for family in self.families:
+                    source = lane / "families" / family
+                    if source.is_dir():
+                        _copy_drafts(source, work_dir("2b") / family)
+                        keep_adapter_paths(work_dir("2b") / family, mapping)
             result = lane / "result.md"
             if not result.is_file() or not result.stat().st_size:
                 return "no-result"
             text = translate(result.read_text(encoding="utf-8"), inverse(mapping))
             admission._write_atomic(Path(self.lease["result"]), text)
         return "ingested"
+
+
+    def _keep_describe(self, lane: Path) -> None:
+        """Only ``<family>.json`` for this lease's families, regular files within the draft size,
+        into the hub batch folder's ``out/``; ``describe_write._collect`` checks them."""
+        folder = self.brief.parent
+        if folder.parent != work_dir("describe"):
+            raise ValueError(f"describe lease brief outside the describe work root: {self.brief}")
+        for family in self.families:
+            draft = lane / "describe" / f"{family}.json"
+            if draft.is_symlink() or not draft.is_file() or draft.stat().st_size > DRAFT_MAX_BYTES:
+                continue
+            (folder / "out").mkdir(exist_ok=True)
+            _write_bytes(folder / "out" / draft.name, draft.read_bytes())
 
 
 def _pulled_lane(dest: Path) -> Path | None:

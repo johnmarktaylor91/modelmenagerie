@@ -2,7 +2,9 @@
 
 Lane r3-describe. Runs on the hub (no torch). ``gather`` lays one family's folder out for a
 prose lane and the jev classifier: the packet, each member's roster row and model record, every
-saved text (paper, page, Hub card) and each code snapshot's top-level README, plus ``facts.json``
+saved text (paper, page, Hub card), a library's own documentation saved as a code source's text,
+each code snapshot's top-level README and, where switched on and no full text exists, the abstract
+of the saved S2 or OpenAlex record of the cited paper, plus ``facts.json``
 with the deterministic fields: ``era`` from the citation's first public date, ``institutions``
 from the saved OpenAlex record's authorships, and the stage 3 output fields of each member's
 deciding trace. Nothing here touches the web.
@@ -20,9 +22,17 @@ from typing import Any
 
 from menagerie.pipeline import DataLayout, StoreLayout, ledger, roster
 from menagerie.pipeline import store as store_mod
+from menagerie.pipeline.describe import _bib_abstract
 from menagerie.pipeline.records import LedgerRow, to_dict
 
 TEXT_ROLES = ("paper", "page")
+ABSTRACT_APIS = ("s2", "openalex")
+# What describe can read, by kind, and what each kind of saved text file is (``<sid>-<x>.txt``).
+# A record's ``basis`` is the strongest kind it read; a stronger kind it did not read re-opens it.
+RANK = {"none": 0, "readme": 1, "docs": 2, "abstract": 2, "full": 3}
+FILE_KIND = {"paper": "full", "page": "full", "docs": "docs", "abstract": "abstract",
+             "readme": "readme"}
+MODES = (("full", "full"), ("abstract", "abstract"), ("docs", "docs"), ("readme", "readme-only"))
 README = re.compile(r"readme(\.(md|rst|txt|markdown))?", re.I)
 SAFE_SID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")  # a sid names a file: no separators
 
@@ -47,20 +57,24 @@ class Inputs:
     folder: Path
     packet: dict[str, Any]
     members: list[dict[str, Any]]
-    texts: dict[str, Path]  # sid -> saved text file (papers, pages, READMEs)
+    texts: dict[str, Path]  # sid -> saved text file (papers, pages, docs, abstracts, READMEs)
     facts: dict[str, Any] = field(default_factory=dict)
 
     @property
     def mode(self) -> str:
-        """``full`` with a paper or page text, ``readme-only`` with READMEs alone, else ``none``."""
+        """``full`` with a paper or page text, else ``abstract`` with a saved abstract, else
+        ``docs`` with a library's documentation, ``readme-only`` with READMEs alone, else
+        ``none``."""
 
-        roles = {sid: src.get("role") for sid, src in self._sources().items()}
-        if any(roles.get(sid) in TEXT_ROLES for sid in self.texts):
-            return "full"
-        return "readme-only" if self.texts else "none"
+        kinds = set(self.kinds.values())
+        return next((mode for kind, mode in MODES if kind in kinds), "none")
 
-    def _sources(self) -> dict[str, dict[str, Any]]:
-        return {s["sid"]: s for s in self.packet.get("sources", [])}
+    @property
+    def kinds(self) -> dict[str, str]:
+        """sid -> the kind of each saved text, from its file name (``<sid>-<x>.txt``)."""
+
+        return {sid: FILE_KIND.get(path.stem.rsplit("-", 1)[-1], "full")
+                for sid, path in self.texts.items()}
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -164,18 +178,61 @@ def _readme(sha: str, dest: Path, store: StoreLayout) -> Path | None:
     return dest
 
 
-def _texts(packet: Mapping[str, Any], folder: Path, store: StoreLayout) -> dict[str, Path]:
-    texts: dict[str, Path] = {}
+def _abstract(sha: str, title: str, dest: Path, store: StoreLayout) -> Path | None:
+    """The abstract a saved S2 or OpenAlex record holds for the cited title, saved as ``dest``;
+    ``None`` when it holds none."""
+
+    try:
+        text = _bib_abstract(sha, title, store, dest.parent.parent) if title else None
+    except Exception:  # noqa: BLE001  (a record the store no longer holds or that does not parse)
+        return None
+    if not text:
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text[:MAX_TEXT_CHARS], encoding="utf-8")
+    return dest
+
+
+def candidates(packet: Mapping[str, Any], *, abstracts: bool = False) -> dict[str, str]:
+    """Each source describe could read, sid -> kind, from the packet alone (nothing fetched):
+    ``full`` (a paper or page text), ``docs`` (a code source's text: a library's documentation at
+    the validated version), ``readme`` (a code snapshot, which may hold a README) and, with
+    ``abstracts`` and no full text, ``abstract`` (a saved S2 or OpenAlex record). A sid that is
+    not a plain file name is left unread, never a path."""
+
+    found: dict[str, str] = {}
     for src in packet.get("sources", []):
-        sid, role = src["sid"], src.get("role")
+        sid, role = src.get("sid", ""), src.get("role")
         if not readable_sid(sid):
-            continue  # a sid that is not a plain file name is left unread, never a path
+            continue
         if role in TEXT_ROLES and src.get("text"):
-            texts[sid] = _save_text(src["text"], folder / "source" / f"{sid}-{role}.txt", store)
-        elif role == "code" and src.get("blob"):
-            got = _readme(src["blob"], folder / "source" / f"{sid}-readme.txt", store)
-            if got is not None:
-                texts[sid] = got
+            found[sid] = "full"
+        elif role == "code" and (src.get("text") or src.get("blob")):
+            found[sid] = "docs" if src.get("text") else "readme"
+        elif role == "bib" and abstracts and src.get("api") in ABSTRACT_APIS and src.get("blob"):
+            found[sid] = "abstract"
+    if "full" in found.values():
+        found = {sid: kind for sid, kind in found.items() if kind != "abstract"}
+    return found
+
+
+def _texts(packet: Mapping[str, Any], folder: Path, store: StoreLayout, *,
+           abstracts: bool = False) -> dict[str, Path]:
+    sources = {s.get("sid"): s for s in packet.get("sources", [])}
+    title = (packet.get("citation") or {}).get("title") or ""
+    texts: dict[str, Path] = {}
+    for sid, kind in candidates(packet, abstracts=abstracts).items():
+        src, dest = sources[sid], folder / "source"
+        if kind == "full":
+            got = _save_text(src["text"], dest / f"{sid}-{src['role']}.txt", store)
+        elif kind == "docs":
+            got = _save_text(src["text"], dest / f"{sid}-docs.txt", store)
+        elif kind == "readme":
+            got = _readme(src["blob"], dest / f"{sid}-readme.txt", store)
+        else:
+            got = _abstract(src["blob"], title, dest / f"{sid}-abstract.txt", store)
+        if got is not None:
+            texts[sid] = got
     return texts
 
 
@@ -235,13 +292,14 @@ def stage3_outputs(members: Sequence[Mapping[str, Any]], rows: Sequence[Any], *,
 
 def gather(family: str, *, data: DataLayout, store: StoreLayout, folder: Path, tl: str,
            rows: Sequence[Any] | None = None, vocab: Mapping[str, Sequence[str]] | None = None,
-           jev: Mapping[str, Any] | None = None) -> Inputs:
+           jev: Mapping[str, Any] | None = None, abstracts: bool = False) -> Inputs:
     """Lay out ``folder`` for one family and return its inputs.
 
-    Writes ``packet.json``, ``members.json``, ``source/<sid>-<role>.txt`` per saved text and
-    README, ``stage3/<id>.json`` per summary read, and ``facts.json`` (``mode``, ``sids``,
-    ``era``, ``institutions``, ``output`` per member, ``vocab``, ``jev``). ``rows`` are the
-    ledger's lines when the caller already read them.
+    Writes ``packet.json``, ``members.json``, ``source/<sid>-<kind>.txt`` per saved text, docs,
+    README and (with ``abstracts``) abstract, ``stage3/<id>.json`` per summary read, and
+    ``facts.json`` (``mode``, ``sids``, ``considered``: every candidate sid looked at, ``era``,
+    ``institutions``, ``output`` per member, ``vocab``, ``jev``). ``rows`` are the ledger's lines
+    when the caller already read them.
     """
 
     packet = _read_json(data.packet(family))
@@ -249,11 +307,12 @@ def gather(family: str, *, data: DataLayout, store: StoreLayout, folder: Path, t
     roster_rows = {r.stable_id: to_dict(r) for r in roster.read(data=data) if r.stable_id}
     members = _members(packet, roster_rows, data)
     folder.mkdir(parents=True, exist_ok=True)
-    texts = _texts(packet, folder, store)
+    texts = _texts(packet, folder, store, abstracts=abstracts)
     names, bib_sid = institutions(packet, folder, store)
     inputs = Inputs(family, folder, packet, members, texts)
     facts = {
         "family": family, "mode": inputs.mode, "sids": sorted(texts),
+        "considered": sorted(candidates(packet, abstracts=abstracts)),
         "era": _era(packet, members), "institutions": names, "institutions_sid": bib_sid,
         "output": stage3_outputs(members, rows, tl=tl, folder=folder, store=store),
         "vocab": dict(vocab or {}), "jev": dict(jev or {}),

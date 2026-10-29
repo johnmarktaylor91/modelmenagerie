@@ -12,7 +12,13 @@ to one return lane with its findings; still failing, it is written ``describe:un
 ``write`` is idempotent like the review verbs: call it until every family is settled. The tick
 calls it through ``describe_stage`` with the stage's knobs in the environment: the seat cap
 (``MENAGERIE_LANES_DESCRIBE``), hub slots a seat leaves free (``HUB_RESERVE``) and whether
-families validated only at an earlier TorchLens pin follow (``EARLIER_PINS``).
+families validated only at an earlier TorchLens pin follow (``EARLIER_PINS``) and which families
+may ground on the cited paper's saved abstract when they have no full text (``ABSTRACTS``). A
+record names the strongest kind of text it read (``basis``); a stronger kind it did not read, landing
+later in the packet, makes the family due again. With the stage's worker switch
+(``describe_workers.WORKERS``) a seat runs on a worker runtime when one has room after 2b, with no
+hub-slot gate; the hub, behind its gate, is the fallback. ``lane.json`` then names the worker and
+lease, and the lane has ended once its outputs are ingested (``describe_workers.landed``).
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from menagerie.pipeline import (
     StoreLayout,
     describe_jev,
     describe_text,
+    describe_workers,
     ledger,
     read_json,
     review,
@@ -53,6 +60,10 @@ BATCH = 10
 DEFAULT_SEATS = 4  # trial D passed (decisions.md 2026-10-16); MENAGERIE_LANES_DESCRIBE=1 reverts
 HUB_RESERVE = "MENAGERIE_DESCRIBE_HUB_RESERVE"  # hub slots a new seat leaves free (default none)
 EARLIER_PINS = "MENAGERIE_DESCRIBE_EARLIER_PINS"  # "1": earlier-pin families follow (``due``)
+# "all", or comma-separated family ids (a trial, described first): ground on a saved abstract.
+ABSTRACTS = "MENAGERIE_DESCRIBE_ABSTRACTS"
+BASIS = {"full": "full", "abstract": "abstract", "docs": "docs", "readme-only": "readme",
+         "none": "none"}
 SUMMARY_CHARS = (250, 4000)
 QUOTE_WORDS = (3, 80)  # a grounding quote: at least three words, at most eighty
 COVER = 0.7  # a grounding sentence may stand for a longer split sentence only past this share
@@ -220,12 +231,14 @@ def _record(draft: Mapping[str, Any] | None, facts: Mapping[str, Any], *, family
     sids = list(facts.get("sids") or [])
     if facts.get("institutions_sid"):
         sids.append(facts["institutions_sid"])
+    if facts.get("mode") == "none":  # a textless record lists what it looked at (``_undescribed``)
+        sids = list(facts.get("considered") or [])
     by = "readme-only" if facts.get("mode") == "readme-only" else f"{ROLE}@describe"
     return from_dict(DescribeRecord, {
         "schema": DescribeRecord.SCHEMA, "family": family, "by": by if draft else "describe",
         "era": facts.get("era"), "institutions": list(facts.get("institutions") or []),
         **body, "inputs": sorted(set(sids)), "prompt": prompt, "class": cls,
-        "grounding_state": "unchecked"})
+        "grounding_state": "unchecked", "basis": BASIS.get(facts.get("mode"))})
 
 
 def _settle(family: str, folder: Path, lane: Mapping[str, Any], *, data: DataLayout,
@@ -280,9 +293,11 @@ def _write_record(record: DescribeRecord, state: str, *, data: DataLayout, cls: 
 def _launch(folder: Path, families: Sequence[str], role: str, *, data: DataLayout,
             returned: bool = False) -> str:
     # The return lane gets its own brief, so its result file is new: the launcher accepts a lane
-    # only when the result file beside its brief was written by that run.
-    if tick_full.hub_slots() <= int(os.environ.get(HUB_RESERVE) or 0):
-        raise drive_mod.Refused("hub_full", "no free describe slot")
+    # only when the result file beside its brief was written by that run. A worker seat takes no
+    # hub slot, so with workers on the hub gate is read only for the hub fallback.
+    workers = describe_workers.seats() > 0
+    if not workers:
+        _hub_gate()
     if sum(lane["kind"] == KIND for lane in drive_mod.lanes(data=data)) >= _cap():
         raise drive_mod.Refused("describe_full", "no free describe seat")
     brief = folder / ("BRIEF-r2.md" if returned else "BRIEF.md")
@@ -295,11 +310,25 @@ def _launch(folder: Path, families: Sequence[str], role: str, *, data: DataLayou
                  "the classifier journal or trial-values.json. Those values are compared later.", ""]
     brief.write_text("\n".join(head) + PROMPT.read_text(encoding="utf-8"), encoding="utf-8")
     (folder / "out").mkdir(exist_ok=True)
-    run = drive_mod.launch(KIND, role, brief, keys=tuple(families), parent=os.environ.get("FLEET_RUN_ID"),
-                           label=f"describe-{folder.name}{'-r2' if returned else ''}", lab="claude")
+    placed = describe_workers.launch(brief, families, role=role) if workers else None
+    where: dict[str, str] = {}
+    if placed is None:
+        if workers:
+            _hub_gate()
+        run = drive_mod.launch(KIND, role, brief, keys=tuple(families), parent=os.environ.get("FLEET_RUN_ID"),
+                               label=f"describe-{folder.name}{'-r2' if returned else ''}", lab="claude")
+    else:
+        run, where["placement"], where["label"] = placed
     _dump(folder / "lane.json", {"run": run, "role": role, "families": list(families),
-                                 "prompt": prompt_version(), "returned": returned})
+                                 "prompt": prompt_version(), "returned": returned, **where})
     return run
+
+
+def _hub_gate() -> None:
+    """A hub seat leaves ``HUB_RESERVE`` hub slots free for 2a and review lanes."""
+
+    if tick_full.hub_slots() <= int(os.environ.get(HUB_RESERVE) or 0):
+        raise drive_mod.Refused("hub_full", "no free describe slot")
 
 
 def _return(folder: Path, failing: Mapping[str, Sequence[str]], role: str, *, data: DataLayout) -> str:
@@ -350,30 +379,59 @@ def _pins(data: DataLayout, tl: str, rows: Sequence[Any] | None = None) -> dict[
                                         earlier=os.environ.get(EARLIER_PINS) == "1")
 
 
+def abstracts_for(family: str) -> bool:
+    """Whether ``family`` may ground on its cited paper's saved abstract (``ABSTRACTS``)."""
+
+    given = os.environ.get(ABSTRACTS, "").strip()
+    return given == "all" or family in given.split(",")
+
+
+def _trial() -> set[str]:
+    given = os.environ.get(ABSTRACTS, "").strip()
+    return set() if given in ("", "all") else set(given.split(","))
+
+
 def due(families: Sequence[str] | None, *, data: DataLayout, tl: str) -> list[str]:
     """The families to describe: the given ones, else every validated family with a packet and no
-    describe record, those validated at ``tl`` before those validated only at an earlier pin, each
-    oldest packet first."""
+    describe record (or one a stronger text has reached since, ``_undescribed``): an abstract
+    trial's families first, then those validated at ``tl`` before those validated only at an
+    earlier pin, each oldest packet first."""
 
     valid = _pins(data, tl)
     if families:
         return list(dict.fromkeys(f for f in families if f in valid))
     todo = [f for f in valid if data.packet(f).is_file() and _undescribed(f, data)]
-    return sorted(todo, key=lambda f: (valid[f] != tl, _json(data.packet(f)).get("written") or "", f))
+    trial = _trial()
+    return sorted(todo, key=lambda f: (f not in trial, valid[f] != tl,
+                                       _json(data.packet(f)).get("written") or "", f))
+
+
+def _basis(record: Mapping[str, Any]) -> str | None:
+    """The kind of text a record rests on; a record from before ``basis`` is told by its class
+    and ``by``. ``None`` for an old textless record, which never listed what it looked at."""
+
+    if record.get("basis"):
+        return record["basis"]
+    if record.get("class") == "describe:no_text":
+        return None
+    return "readme" if record.get("by") == "readme-only" else "full"
 
 
 def _undescribed(family: str, data: DataLayout) -> bool:
-    """No record yet, or a ``describe:no_text`` record while the packet has since gained a text
-    source or a code snapshot (the paper pass lands texts after the first describe pass)."""
+    """No record yet, or the packet now offers a kind of text stronger than the record's basis
+    that the record did not read (the paper pass lands full texts after an abstract-grounded or
+    textless record; ``describe_text.RANK``). An old textless record re-opens on any candidate."""
 
     path = data.describe(family)
     if not path.exists():
         return True
-    if _json(path).get("class") != "describe:no_text":
-        return False
-    return any((s.get("text") or (s.get("role") == "code" and s.get("blob")))
-               and describe_text.readable_sid(s.get("sid", ""))
-               for s in _json(data.packet(family)).get("sources", []))
+    record = _json(path)
+    found = describe_text.candidates(_json(data.packet(family)), abstracts=abstracts_for(family))
+    basis = _basis(record)
+    if basis is None:
+        return bool(found)
+    read, rank = set(record.get("inputs") or ()), describe_text.RANK[basis]
+    return any(describe_text.RANK[kind] > rank and sid not in read for sid, kind in found.items())
 
 
 def _extend(folder: Path, todo: Sequence[str], count: int, *, data: DataLayout) -> list[str]:
@@ -405,7 +463,8 @@ def _gather_batch(folder: Path, todo: Sequence[str], *, data: DataLayout,
                 results.append({"family": family, "verdict": "not_validated"})
                 continue
             inputs = describe_text.gather(family, data=data, store=store, tl=valid[family], rows=rows,
-                                          folder=folder / "families" / family, vocab=vocabularies)
+                                          folder=folder / "families" / family, vocab=vocabularies,
+                                          abstracts=abstracts_for(family))
             if inputs.mode == "none":
                 record = _record(None, inputs.facts, family=family, prompt=prompt_version(), resolver=resolver)
                 results.append(_write_record(record, "unchecked", data=data, cls="describe:no_text", write=True))
@@ -567,8 +626,15 @@ def _batch_rows(folder: Path, batch: Sequence[str], *, role: str, data: DataLayo
         run = _launch(folder, batch, role, data=data) if write else "dry-run"
         return [{"family": f, "verdict": "launched", "run": run} for f in batch]
     lane = _json(folder / "lane.json")
-    if review._fleet_run(lane["run"]).get("state") != "TERMINAL":
+    status = review._fleet_run(lane["run"])
+    if status.get("state") != "TERMINAL" or not describe_workers.landed(lane):
         return [{"family": f, "verdict": "running", "run": lane["run"]} for f in lane["families"]]
+    if status.get("admission_state") not in (None, "admitted") and write:
+        # The hub's queue ended the lane before it ever ran: it did no work, so it starts again
+        # rather than spending the families' one return.
+        run = _launch(folder, lane["families"], lane["role"], data=data,
+                      returned=bool(lane.get("returned")))
+        return [{"family": f, "verdict": "relaunched", "run": run} for f in lane["families"]]
     return _collect(folder, lane, data=data, resolver=resolver, write=write)
 
 
@@ -576,8 +642,8 @@ def write(families: Sequence[str] | None, *, data: DataLayout, store: StoreLayou
           role: str | None = None, write: bool = True) -> list[dict[str, Any]]:
     """Describe the due families; return one ``{"family", "verdict", ...}`` per family touched.
 
-    Verdicts: ``grounded`` and ``describe:no_text`` (records written), ``launched``, ``running``
-    and ``returned`` (a lane holds the family), ``describe:ungrounded`` (typed after the return),
+    Verdicts: ``grounded`` and ``describe:no_text`` (records written), ``launched``, ``running``,
+    ``relaunched`` (its lane was never admitted) and ``returned`` (a lane holds the family), ``describe:ungrounded`` (typed after the return),
     ``waiting`` (a lane is active, so no new one starts), ``no_packet``, ``due`` (a dry run). Each
     seat holds at most ``BATCH`` families; discovery reserves disjoint batches under a short lock.
     """
@@ -668,9 +734,11 @@ def _check_one(family: str, *, data: DataLayout, store: StoreLayout, resolver: _
     folder = work_dir(KIND) / "check" / family
     shutil.rmtree(folder, ignore_errors=True)
     packet = _json(data.packet(family))
+    basis = _basis(to_dict(record))
     texts = {sid: p.read_text("utf-8", errors="replace")
-             for sid, p in describe_text._texts(packet, folder, store).items() if sid in record.inputs}
-    findings = verify(record, texts, mode="readme-only" if record.by == "readme-only" else "full",
+             for sid, p in describe_text._texts(packet, folder, store, abstracts=basis == "abstract").items()
+             if sid in record.inputs}
+    findings = verify(record, texts, mode="readme-only" if basis == "readme" else "full",
                       member_ids=[m["id"] for m in packet.get("members", [])],
                       resolves=resolver.resolves)
     state = "grounded" if not findings else "ungrounded"

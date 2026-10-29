@@ -131,6 +131,28 @@ def test_rows_changed_since_the_commit_are_recomputed(data: DataLayout, tmp_path
         data, ["m3631", "m9999"])  # an id the file never listed
 
 
+def test_a_repair_a_lane_ended_is_done_although_the_file_says_2b(data: DataLayout,
+                                                               tmp_path: Path) -> None:
+    from menagerie.paths import work_dir
+    from menagerie.pipeline.records import Amendment
+
+    trace, _ = read_jsonl(parse_ledger_line, FIXTURES / "m8839.e2e.ledger.jsonl")
+    append_jsonl([dataclasses.replace(trace, outcome="fail", cls="torchlens_gap:replay")],
+                 data.ledger("2026-10"))
+    packet = read_json(Packet, data.packet("f-resnet"))
+    note = Amendment(at="2026-10-28T01:00:00Z", why="repair: m8839; warm the BatchNorms",
+                     evidence=(), changed=("repair",), by="Crawler")
+    write_json(dataclasses.replace(packet, amendments=(note,)), data.packet("f-resnet"))
+    _commit(data.root.parents[1])
+    path = _built(data, tmp_path)
+    assert counts.steps_for(IDS, data=data, path=path)["m8839"] == "2b"
+    result = work_dir("2b") / "f-resnet" / "BRIEF.result.md"
+    result.parent.mkdir(parents=True)
+    result.write_text("the repair does not apply\n", encoding="utf-8")  # no committed file moves
+    assert counts.steps_for(IDS, data=data, path=path) == _direct(data)
+    assert _direct(data)["m8839"] == "done"
+
+
 def test_a_stale_missing_or_foreign_file_falls_back(data: DataLayout, tmp_path: Path) -> None:
     path = _built(data, tmp_path)
     payload = json.loads(path.read_text())

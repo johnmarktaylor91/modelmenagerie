@@ -463,6 +463,18 @@ def _share_room(cohort: str, cfg: Mapping[str, Any], caps: Mapping[str, int], oc
     return max(0, math.floor(caps["2b"] * share) - occupied)
 
 
+def _cap_room(cohort: str, cfg: Mapping[str, Any], room: int, busy: int) -> int:
+    """``room`` within the cohort's absolute 2b lane cap (``cohort_cap``), which holds whether or
+    not an earlier cohort waits; ``room`` when it has none."""
+
+    cap = (cfg.get("cohort_cap") or {}).get(cohort)
+    if cap is None:
+        return room
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
+        raise ValueError("cohort caps must be whole numbers of 2b lanes, 0 or more")
+    return max(0, min(room, cap - busy))
+
+
 def _lane_busy(cfg: Mapping[str, Any], family: Mapping[str, Any], kind: str) -> Counter[str]:
     """Count lane slots by cohort, including unknown leases conservatively in every target."""
     from menagerie.pipeline import admission
@@ -511,12 +523,14 @@ def _cohort_batches(ids: Sequence[str], steps: Mapping[str, str], family: Mappin
     research_busy = _lane_busy(cfg, family, "2a") if count["2a"] else Counter()
     slots_busy = _lane_busy(cfg, family, "2b") if count["2b"] else Counter()
     first_busy = research_busy[first] + research_busy["unknown"]
-    batches = implement.batch_groups(primary["2b"], batch_size, data=data)[:available]
+    batches = implement.batch_groups(primary["2b"], batch_size, data=data)[
+        :_cap_room(first, cfg, available, slots_busy[first] + slots_busy["unknown"])]
     ready = len(primary["2b"]) - sum(map(len, batches))
     chunks = _plan_2a(primary["2a"], ready, first_busy, _buffer_target(cfg, caps),
                       caps["2a"], per)[:max(0, min(slots - max(0, len(batches) - mini_slots), caps["2a"] - count["2a"]))]
     for cohort in later:
-        room = _share_room(cohort, cfg, caps, slots_busy[cohort] + slots_busy["unknown"])
+        busy = slots_busy[cohort] + slots_busy["unknown"]
+        room = _cap_room(cohort, cfg, _share_room(cohort, cfg, caps, busy), busy)
         limit = min(available - len(batches), slots + mini_slots - len(batches) - len(chunks), room)
         extra = implement.batch_groups(pending[cohort]["2b"], batch_size, data=data)[:max(0, limit)]
         batches.extend(extra)
@@ -559,6 +573,8 @@ def top_up(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> dict[s
     it (``_spent_2b``, listed as ``2b_spent``); launches never exceed the hub's free slots
     (``agent-capacity``), and admission is read before each one. Review lanes start in ``reviews``,
     describe lanes in ``describes``.
+    With ``describes.workers`` on, the worker slots the plan leaves free are recorded as the
+    describe stage's room on the workers (``describe_workers.record_room``).
     2b launches wait for a fresh bridge heartbeat and, in the tick, runner A's live declaration
     (``cfg["runner_declaration"]``); the 2a plan is unchanged by either hold. 2b lanes run model
     code, so they take only worker slots (``mini_workers``) and every hub slot is left for 2a,
@@ -606,6 +622,11 @@ def top_up(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> dict[s
         plan["2b_minis"] = mini_placement.status(cfg)
     if held_2b:
         plan["2b_held"] = held_2b
+    if not dry_run and cfg.get("mini_workers") and (cfg.get("describes") or {}).get("workers"):
+        from menagerie.pipeline import describe_workers
+
+        # 2b first: describe seats get only the worker slots this plan leaves free.
+        plan["describe_room"] = describe_workers.record_room(mini_slots, placements, held=bool(held_2b))
     plan["cohorts"] = _cohort_plan(ids, steps, family, cfg, batches, chunks)
     if batch_size > 1:
         plan["2b_batches"] = batches
@@ -705,15 +726,32 @@ def _declared(env: Mapping[str, str] | None) -> Iterator[None]:
 
 
 def trickle(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> Any:
-    """``paper harvest --limit``: bibliographic records for new paper ids, a few a pass.
+    """``paper harvest --limit``: bibliographic records for new paper ids, a few a pass; then,
+    when ``library_docs`` is positive, that many library packets get their library's own
+    documentation as a describe text source (``library_docs.docs``), starting no family after
+    ``library_docs_seconds``; then, when ``paper_texts`` is positive, that many packets get the
+    open-access text of a paper never fetched (``paper_texts.texts``), starting none after
+    ``paper_texts_seconds``.
 
     The tick commits what it writes (``tick._step_trickle``); a dry run lists the packets due and
     fetches and writes nothing."""
 
-    from menagerie.pipeline import StoreLayout, find_paper
+    from menagerie.pipeline import StoreLayout, find_paper, library_docs, paper_texts
 
-    return find_paper.harvest(None, data=data, store=StoreLayout.from_env(),
-                              limit=int(cfg["trickle_limit"]), write=not dry_run)
+    store = StoreLayout.from_env()
+    rows = find_paper.harvest(None, data=data, store=store, limit=int(cfg["trickle_limit"]),
+                              write=not dry_run)
+    limit = int(cfg.get("library_docs") or 0)
+    if limit > 0:
+        rows = [*rows, *library_docs.docs(
+            None, data=data, store=store, limit=limit, write=not dry_run,
+            seconds=float(cfg.get("library_docs_seconds") or 90))]
+    limit = int(cfg.get("paper_texts") or 0)
+    if limit > 0:
+        rows = [*rows, *paper_texts.texts(
+            None, data=data, store=store, limit=limit, write=not dry_run,
+            seconds=float(cfg.get("paper_texts_seconds") or 90))]
+    return rows
 
 
 # Reference yields by tier; thresholds are strict. GitHub is rung 3's measured rate (52 percent of

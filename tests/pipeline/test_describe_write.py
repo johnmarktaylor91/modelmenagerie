@@ -15,7 +15,9 @@ from menagerie.pipeline import (
     StoreLayout,
     describe_jev,
     describe_text,
+    describe_workers,
     describe_write,
+    mini_relay,
     publish,
     review,
     tick_full,
@@ -227,6 +229,21 @@ def test_write_lays_out_launches_returns_once_then_writes(tmp_path, world):
         {"family": "f-resnet", "verdict": "grounded", "findings": []}]
 
 
+def test_a_lane_the_hub_never_admitted_starts_again_without_spending_the_return(tmp_path, world):
+    data = _data(tmp_path)
+    describe_write.write(None, data=data, store=world["store"])
+    world["runs"]["run-1"] = {"state": "TERMINAL", "admission_state": "expired"}
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    assert (row["verdict"], row["run"]) == ("relaunched", "run-2")
+    assert world["launches"][1]["keys"] == ("f-resnet",)
+    folder = world["launches"][1]["brief"].parent
+    assert world["launches"][1]["brief"].name == "BRIEF.md" and not (folder / "BRIEF-r2.md").exists()
+    world["runs"]["run-2"] = {"state": "TERMINAL", "admission_state": "admitted"}
+    (folder / "out" / "f-resnet.json").write_text(json.dumps(_draft()))
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    assert row["verdict"] == "grounded" and len(world["launches"]) == 2
+
+
 def test_a_second_failure_types_the_record_ungrounded(tmp_path, world):
     data = _data(tmp_path)
     describe_write.write(["f-resnet"], data=data, store=world["store"])
@@ -273,6 +290,103 @@ def test_readme_only_families_get_taxonomy_and_a_tagline(tmp_path, world):
     [row] = describe_write.write(None, data=data, store=world["store"])
     assert row["verdict"] == "grounded"
     assert from_dict(DescribeRecord, json.loads(data.describe("f-resnet").read_text())).by == "readme-only"
+
+
+S2_SHA, DOCS_SHA = "e" * 64, "f" * 64
+DOCS = ("ResNet. We present a residual learning framework to ease the training of networks that are "
+        "substantially deeper than those used previously. This model was trained by timm.")
+
+
+def _short_texts(world, monkeypatch):
+    """Stand-ins for an S2 record holding the cited paper's abstract and a library's docs."""
+
+    def materialize(sha, dest, *, store):
+        if sha not in (S2_SHA, DOCS_SHA):
+            return _materialize(sha, dest, store=store)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(DOCS if sha == DOCS_SHA else json.dumps(
+            {"title": "Deep residual learning for image recognition", "abstract": PAPER}))
+        return dest
+
+    monkeypatch.setattr(store_mod, "materialize", materialize)
+
+
+def _cited(draft, sid):
+    return {**draft, "lineage": [], "grounding": [{**g, "sid": sid} for g in draft["grounding"]]}
+
+
+def test_an_abstract_grounds_a_textless_family_once_switched_on(tmp_path, world, monkeypatch):
+    _short_texts(world, monkeypatch)
+    data = _data(tmp_path, text=False)
+    packet = json.loads(data.packet("f-resnet").read_text())
+    packet["sources"] = [s for s in packet["sources"] if s["sid"] != "s4"]
+    packet["sources"].append({"sid": "bib-s2-1", "role": "bib", "api": "s2", "blob": S2_SHA})
+    data.packet("f-resnet").write_text(json.dumps(packet))
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    record = json.loads(data.describe("f-resnet").read_text())
+    assert (row["verdict"], record["basis"], record["inputs"]) == ("describe:no_text", "none", [])
+    assert describe_write.due(None, data=data, tl=TL) == []  # settled while abstracts are off
+    monkeypatch.setenv(describe_write.ABSTRACTS, "f-other,f-resnet")  # a trial naming the family
+    assert describe_write.due(None, data=data, tl=TL) == ["f-resnet"]
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    folder = world["launches"][0]["brief"].parent
+    facts = json.loads((folder / "families" / "f-resnet" / "facts.json").read_text())
+    assert (row["verdict"], facts["mode"], facts["sids"]) == ("launched", "abstract", ["bib-s2-1"])
+    assert (folder / "families" / "f-resnet" / "source" / "bib-s2-1-abstract.txt").read_text() == PAPER
+    world["runs"]["run-1"]["state"] = "TERMINAL"
+    (folder / "out" / "f-resnet.json").write_text(json.dumps(_cited(_draft(), "bib-s2-1")))
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    record = json.loads(data.describe("f-resnet").read_text())
+    assert (row["verdict"], record["basis"], record["summary_markdown"] is not None) == ("grounded", "abstract", True)
+    monkeypatch.delenv(describe_write.ABSTRACTS)
+    assert describe_write.check(None, data=data, store=world["store"])[0]["verdict"] == "grounded"
+    assert describe_write.due(None, data=data, tl=TL) == []
+    packet["sources"][0]["text"] = TEXT_SHA  # the paper pass saves the full text: due again
+    data.packet("f-resnet").write_text(json.dumps(packet))
+    assert describe_write.due(None, data=data, tl=TL) == ["f-resnet"]
+
+
+def test_library_docs_ground_a_summary_and_reopen_a_readme_record(tmp_path, world, monkeypatch):
+    _short_texts(world, monkeypatch)
+    data = _data(tmp_path, text=False)
+    describe_write._write_record(describe_write._record(
+        _draft(summary_markdown=None, key_contribution=None, grounding=[], lineage=[], labs=[]),
+        {"sids": ["s4"], "mode": "readme-only"}, family="f-resnet", prompt="0" * 8,
+        resolver=describe_write._Resolver(data)), "grounded", data=data, write=True)
+    assert json.loads(data.describe("f-resnet").read_text())["basis"] == "readme"
+    assert describe_write.due(None, data=data, tl=TL) == []
+    packet = json.loads(data.packet("f-resnet").read_text())
+    packet["sources"].append({"sid": "s5", "role": "code", "url": "https://github.com/x/y/blob/v1/docs.md",
+                              "rev": "v1.0.30", "text": DOCS_SHA})
+    data.packet("f-resnet").write_text(json.dumps(packet))
+    assert describe_write.due(None, data=data, tl=TL) == ["f-resnet"]
+    describe_write.write(None, data=data, store=world["store"])
+    folder = world["launches"][0]["brief"].parent
+    facts = json.loads((folder / "families" / "f-resnet" / "facts.json").read_text())
+    assert (facts["mode"], facts["sids"]) == ("docs", ["s4", "s5"])
+    world["runs"]["run-1"]["state"] = "TERMINAL"
+    s1 = "ResNet is a residual learning framework that eases the training of substantially deeper networks."
+    quote = "We present a residual learning framework to ease the training of networks that are substantially deeper than those used previously."
+    draft = _draft(lineage=[], labs=[], summary_markdown=(s1 + " ") * 4, key_contribution=s1,
+                   grounding=[{"sentence": s1, "sid": "s5", "quote": quote}])
+    (folder / "out" / "f-resnet.json").write_text(json.dumps(draft))
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    assert row["verdict"] == "grounded" and json.loads(data.describe("f-resnet").read_text())["basis"] == "docs"
+
+
+def test_an_old_textless_record_is_looked_at_once_more_then_settles(tmp_path, world, monkeypatch):
+    data = _data(tmp_path, text=False)
+    record = describe_write._record(None, {"mode": "none", "sids": [], "institutions_sid": "bib-openalex-1"},
+                                    family="f-resnet", prompt="0" * 8, resolver=describe_write._Resolver(data))
+    body = {k: v for k, v in describe_write.to_dict(record).items() if k != "basis"}
+    data.describe("f-resnet").parent.mkdir(parents=True, exist_ok=True)
+    data.describe("f-resnet").write_text(json.dumps({**body, "class": "describe:no_text", "inputs": ["bib-openalex-1"]}))
+    monkeypatch.setattr(describe_text, "_readme", lambda *a: None)  # the snapshot holds no README
+    assert describe_write.due(None, data=data, tl=TL) == ["f-resnet"]
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    record = json.loads(data.describe("f-resnet").read_text())
+    assert (row["verdict"], record["basis"], record["inputs"]) == ("describe:no_text", "none", ["s4"])
+    assert describe_write.due(None, data=data, tl=TL) == []  # no more looks every pass
 
 
 def test_verify_names_each_failure(tmp_path, world):
@@ -553,3 +667,81 @@ def test_one_seat_targeted_call_leaves_an_unrelated_batch_alone(tmp_path, world,
     rows = describe_write.write(names[10:], data=data, store=world["store"])
     assert len(world["launches"]) == 1
     assert all(r["family"] in names[10:] and r["verdict"] == "waiting" for r in rows)
+
+
+# --- worker seats (``describe_workers``) ---------------------------------------------------------
+
+
+def _on_workers(world, monkeypatch, *, placed=True):
+    """Workers switched on; a worker start is stood in for (``None``: no worker had room)."""
+
+    monkeypatch.setenv(describe_workers.WORKERS, "1")
+    started = []
+
+    def launch(brief, families, *, role):
+        if not placed:
+            return None
+        run = f"wrun-{len(started) + 1}"
+        started.append({"brief": Path(brief), "families": list(families), "role": role, "run": run})
+        world["runs"][run] = {"state": "RUNNING", "admission_state": None}
+        return run, "zm", f"describe-mini-{len(started)}"
+
+    monkeypatch.setattr(describe_workers, "launch", launch)
+    return started
+
+
+def test_switched_off_never_asks_a_worker(tmp_path, world, monkeypatch):
+    data = _data(tmp_path)
+    monkeypatch.setattr(describe_workers, "launch", lambda *a, **kw: pytest.fail("asked a worker"))
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 0)
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    assert row["verdict"] == "waiting" and row["why"]["result"] == "hub_full"
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 4)
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    lane = json.loads((world["launches"][0]["brief"].parent / "lane.json").read_text())
+    assert row["verdict"] == "launched" and "placement" not in lane
+
+
+def test_a_worker_seat_skips_the_hub_gate_and_settles_after_ingest(tmp_path, world, monkeypatch):
+    data = _data(tmp_path)
+    started = _on_workers(world, monkeypatch)
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: pytest.fail("a worker seat read the hub gate"))
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    assert (row["verdict"], row["run"]) == ("launched", "wrun-1") and not world["launches"]
+    assert started[0]["families"] == ["f-resnet"] and started[0]["role"] == "model-judgment"
+    folder = started[0]["brief"].parent
+    lane = json.loads((folder / "lane.json").read_text())
+    assert (lane["placement"], lane["label"]) == ("zm", "describe-mini-1")
+    # Ended on the worker but not ingested: the lease still holds it, so it is still running.
+    world["runs"]["wrun-1"]["state"] = "TERMINAL"
+    leases = describe_write.work_dir("leases")
+    leases.mkdir(parents=True)
+    (leases / "describe-mini-1.json").write_text("{}")
+    assert describe_write.write(None, data=data, store=world["store"])[0]["verdict"] == "running"
+    (folder / "out" / "f-resnet.json").write_text(json.dumps(_draft()))  # what the ingest keeps
+    mini_relay.state_dir("describe-mini-1").mkdir(parents=True)
+    (mini_relay.state_dir("describe-mini-1") / "ingested.json").write_text('{"status": "ingested"}')
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    assert row == {"family": "f-resnet", "verdict": "grounded", "written": True}
+
+
+def test_no_worker_room_falls_back_to_the_hub_behind_its_gate(tmp_path, world, monkeypatch):
+    data = _data(tmp_path)
+    _on_workers(world, monkeypatch, placed=False)
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 0)
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    assert row["verdict"] == "waiting" and row["why"]["result"] == "hub_full" and not world["launches"]
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 4)
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    assert (row["verdict"], row["run"]) == ("launched", "run-1")
+
+
+def test_a_lost_worker_lane_is_returned_like_a_failed_hub_lane(tmp_path, world, monkeypatch):
+    data = _data(tmp_path)
+    started = _on_workers(world, monkeypatch)
+    describe_write.write(None, data=data, store=world["store"])
+    world["runs"]["wrun-1"]["state"] = "TERMINAL"  # no ingest, and its lease expired and is gone
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    assert (row["verdict"], row["run"]) == ("returned", "wrun-2")
+    assert row["findings"] == ["the lane wrote no draft"]
+    assert started[1]["brief"].name == "BRIEF-r2.md"

@@ -76,6 +76,9 @@ POLL_S = 0.5
 GIVEUP_CLASSES = frozenset({
     "research_gap", "missing_dependency", "compiled_ext", "needs_gpu", "oversized",
     "needs_weights", "budget", "not_traceable_framework", "env_unresolved", "standin",
+    # a random-weight forward that is degenerate and that no allowed init change repairs (only
+    # pretrained weights make it fire; decisions.md 2026-10-29)
+    "degenerate_forward",
 })
 GAP_FIELDS = ("command", "missing", "searched")
 PROMPT = Path(__file__).with_name("prompts") / "2b.md"
@@ -901,7 +904,8 @@ def brief(family: str, *, data: DataLayout) -> Path:
         PROMPT.read_text(encoding="utf-8").split("\n## Batch\n", 1)[0],
     ])
     path = work / "BRIEF.md"
-    path.write_text(text + repair_section(fabrications(packet, data), layout), encoding="utf-8")
+    path.write_text(text + repair_section(fabrications(packet, data), layout)
+                    + repair_request_section(packet, data), encoding="utf-8")
     return path
 
 
@@ -983,6 +987,33 @@ def repair_section(reviews: Sequence[LedgerRow], store: StoreLayout) -> str:
                   f"ours: {c.get('ours', '')}; {c.get('note', '')}\n"
                   for c in review.get("components", []) if c.get("finding") in REPAIR_FINDINGS]
     return "".join(parts)
+
+
+def repair_request_section(packet: Packet, data: DataLayout) -> str:
+    """The brief's section for the packet's repair amendments (``drive.REPAIR``) still owed: the
+    members each sends back to 2b and its note; ``""`` when none is owed."""
+
+    from menagerie.pipeline import drive
+
+    named = sorted({m for a in packet.amendments for m in drive.repair_ids(a)})
+    if not named:
+        return ""
+    files = drive._load(data, ids=named)  # same package
+    owed = {m for m in named if drive._step(m, files)[1].startswith("packet amended for a repair")}
+    parts = []
+    for amendment in packet.amendments:
+        members = sorted(drive.repair_ids(amendment) & owed)
+        if members:
+            parts.append(f"\n### Amendment {amendment.at} ({amendment.by}): {', '.join(members)}\n\n"
+                         f"{amendment.why.partition(';')[2].strip()}\n")
+    if not parts:
+        return ""
+    return ("\n\n## Repair request\n\nThese members ran and failed, and the packet was amended to "
+            "send them back for a repair. Work only on them: leave every other member, and any "
+            "adapter a validated member runs, as it is (put a changed adapter in its own file, "
+            f'`"adapter": "adapters/{packet.family}--repair.py"`, when theirs is shared). If the '
+            "repair does not apply to a member, change nothing for it and say why in the result "
+            "file.\n" + "".join(parts))
 
 
 # The runner's declaration: request caps are sized from it, so a lane must not inherit the hub's.

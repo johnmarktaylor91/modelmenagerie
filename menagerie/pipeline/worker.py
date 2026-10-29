@@ -30,7 +30,10 @@ rows traced before. A verdict TorchLens reports as
 
 A forward whose output holds NaN or inf is typed ``degenerate_forward:nonfinite`` before any
 capture (JMT via Lead, 2026-10-28): it can never be validated, so the forward and trace modes stop
-there. In forward mode a non-finite train-mode output fails the row's ``train`` mode only.
+there. In forward mode a non-finite train-mode output fails the row's ``train`` mode only. An
+eval-mode output that is exactly zero everywhere, or that is the same for a second, distinct input
+while some module reads the input, is typed ``degenerate_forward:constant`` the same way (Lead,
+2026-10-29: a silent spiking net is no exception).
 
 A recipe's vendor tree (``MENAGERIE_VENDOR``) goes on ``sys.path`` when ``main`` starts, not on
 ``PYTHONPATH``: a tree with a top-level folder named like a stdlib module the interpreter loads
@@ -71,6 +74,7 @@ _MEMORY = re.compile(r"(?i)out of memory|can't allocate memory|DefaultCPUAllocat
 # A compiled extension built in the sandbox (torch.utils.cpp_extension, setuptools, ninja) failed.
 # A forward whose output holds NaN or inf: never validated, so typed before any capture.
 NONFINITE = "degenerate_forward:nonfinite"
+CONSTANT = "degenerate_forward:constant"
 _COMPILE = re.compile(r"(?i)error building extension|ninja: build stopped|CompileError|"
                       r"command '[^']*(gcc|g\+\+|cc|c\+\+|nvcc)' failed|"
                       r"CUDA_HOME environment variable is not set|Ninja is required")
@@ -246,6 +250,53 @@ def _finite(out: Any, mode: str) -> None:
     why = nonfinite(out)
     if why is not None:
         raise Failure(NONFINITE, f"{mode}-mode forward is not finite: {why}")
+
+
+def _valued(value: Any) -> list[Any]:
+    """The floating and complex output tensors that hold values (integer labels, masks, empty,
+    sparse and meta tensors say nothing about whether a forward is degenerate)."""
+
+    return [t.detach() for t in tensors(value) if (t.is_floating_point() or t.is_complex())
+            and not t.is_sparse and not t.is_meta and t.numel()]
+
+
+def constant(value: Any, other: Any | None = None) -> str | None:
+    """Why an eval output is degenerate: every value of every output tensor exactly zero, or
+    (given ``other``, the output for a second, distinct input) every output tensor the same.
+    ``None`` otherwise, and when no output tensor holds floating or complex values."""
+
+    import torch
+
+    first = _valued(value)
+    if not first:
+        return None
+    if all(not bool(t.any()) for t in first):
+        return f"all {sum(t.numel() for t in first)} output values are exactly zero"
+    if other is None:
+        return None
+    second = _valued(other)
+    same = len(first) == len(second) and all(
+        a.shape == b.shape and bool(torch.equal(a, b)) for a, b in zip(first, second))
+    return "the output is the same for two distinct inputs" if same else None
+
+
+def _not_constant(subject: Subject, out: Any, boundary: str) -> None:
+    """Raise ``CONSTANT`` when an eval output is all zero, or, when some module reads the input
+    (``input_boundary`` ``real``), the same for the changed inputs ``input_boundary`` uses."""
+
+    import torch
+
+    other = None
+    if constant(out) is None and boundary == "real":
+        args, kwargs = _perturbed((subject.args, subject.kwargs))
+        try:
+            with torch.no_grad():
+                other = _forward(Subject(subject.model, args, kwargs))
+        except Exception:  # noqa: BLE001 -- a model that breaks on other values reads them
+            return
+    why = constant(out, other)
+    if why is not None:
+        raise Failure(CONSTANT, f"eval-mode forward is degenerate: {why}")
 
 
 def _shapes(value: Any) -> tuple[tuple[int, ...], ...]:
@@ -462,6 +513,7 @@ def _forward_mode(request: RunRequest, attempt_dir: Path) -> RunResult:
     _finite(eval_out, "eval")
     peak = _rss_mb()
     boundary = input_boundary(subject, eval_out)
+    _not_constant(subject, eval_out, boundary)
     params = sum(int(p.numel()) for p in subject.model.parameters())
     del subject
     train, div = "pass", None
@@ -715,6 +767,8 @@ def _trace_mode(request: RunRequest, attempt_dir: Path, device: str = "cpu") -> 
     _finite(truth, request.model_mode)
     forward_peak = _rss_mb()
     boundary = input_boundary(subject, truth)
+    if not train:
+        _not_constant(subject, truth, boundary)
     del subject
     gc.collect()
     # The verdict is taken on a fresh build warmed by exactly one forward (``_warm``), never on

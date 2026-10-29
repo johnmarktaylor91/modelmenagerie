@@ -48,6 +48,7 @@ from menagerie.pipeline.admission import (  # noqa: F401  (re-exported: drive's 
 )
 from menagerie.pipeline.records import (
     OFF_WORKER,
+    Amendment,
     LedgerRow,
     ModelRecord,
     Packet,
@@ -472,11 +473,11 @@ def _run_step(model_id: str, record: ModelRecord, files: _Files) -> tuple[str, s
                                                                              "gpu-window"):
         return "forward", f"no forward row at recipe {rev}"
     if forward and forward.outcome != "pass" and _head(forward.cls) not in STRUCTURE_ONLY_FAILS:
-        return "done", f"forward failed: {forward.cls}"
+        return _repair_or(model_id, record, files, forward, f"forward failed: {forward.cls}")
     if trace is None:
         return "trace", f"no trace at recipe {rev} and TorchLens {files.tl}"
     if trace.outcome != "pass":
-        return "done", f"trace failed: {trace.cls}"
+        return _repair_or(model_id, record, files, trace, f"trace failed: {trace.cls}")
     saved = trace.trace or trace.summary  # a structure-only capture may save only its summary
     rendered = _latest(rows, lambda r: isinstance(r, RenderRow) and r.trace == saved
                        and r.outcome in ("pass", "partial"))
@@ -486,6 +487,50 @@ def _run_step(model_id: str, record: ModelRecord, files: _Files) -> tuple[str, s
             return "done", f"render failed: {why}"
         return "render", f"no render of trace {saved}"
     return _review_step(model_id, record, files, rows)
+
+
+# An amendment whose ``why`` starts with this sends the members it names (before its first ``;``)
+# back to 2b after a failed run: the repair of a recipe the run showed wrong (decisions.md
+# 2026-10-28, sending degenerate forwards back through 2b).
+REPAIR = "repair:"
+
+
+def repair_ids(amendment: Amendment) -> set[str]:
+    """The members a repair amendment names; none for any other amendment."""
+
+    if not amendment.why.startswith(REPAIR):
+        return set()
+    return set(re.findall(r"\bm\d+\b", amendment.why.partition(";")[0]))
+
+
+def repair_request(model_id: str, packet: Packet | None, after: str) -> Amendment | None:
+    """The packet's latest repair amendment naming ``model_id`` dated after ``after``."""
+
+    found = [a for a in (packet.amendments if packet else ()) if a.at > after
+             and model_id in repair_ids(a)]
+    return max(found, key=lambda a: a.at) if found else None
+
+
+def _repair_lane_ended(family: str, at: str) -> bool:
+    """Whether a 2b lane for ``family`` wrote its result after ``at`` (the repair was tried)."""
+
+    result = work_dir("2b") / family / "BRIEF.result.md"
+    when = datetime.strptime(at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return result.is_file() and result.stat().st_mtime > when.timestamp()
+
+
+def _repair_or(model_id: str, record: ModelRecord, files: _Files, failed: LedgerRow,
+               why: str) -> tuple[str, str]:
+    """``done`` for a failed run, or ``2b`` while a repair amendment after it is untried.
+
+    A repair is tried once: the lane's new recipe gives the row new runs, its give-up settles
+    it, and a lane that changed nothing leaves its result file, after which the row is done
+    with its failed run again."""
+
+    request = repair_request(model_id, files.packet(record.family), failed.at)
+    if request is None or _repair_lane_ended(record.family, request.at):
+        return "done", why
+    return "2b", f"packet amended for a repair at {request.at} ({why}): the 2b repair"
 
 
 def render_failed(rows: Sequence[Any], rev: str | None, *, tl: str) -> str | None:

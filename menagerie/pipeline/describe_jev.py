@@ -52,8 +52,8 @@ def state_of(inputs: describe_text.Inputs) -> dict[str, Any]:
     """One family's jev state: names, text openings and the traced output fields."""
 
     excerpts = describe_text.excerpts(inputs)
-    sources = {s["sid"]: s.get("role") for s in inputs.packet.get("sources", [])}
-    text = {sid: t for sid, t in excerpts.items() if sources.get(sid) in describe_text.TEXT_ROLES}
+    kinds = inputs.kinds
+    text = {sid: t for sid, t in excerpts.items() if kinds.get(sid) in ("full", "abstract")}
     readme = {sid: t for sid, t in excerpts.items() if sid not in text}
     identity = inputs.packet.get("identity") or {}
     return {"name": identity.get("canonical") or inputs.family,

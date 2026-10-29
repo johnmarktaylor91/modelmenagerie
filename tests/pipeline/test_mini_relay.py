@@ -482,3 +482,96 @@ def test_a_late_ingest_never_overwrites_a_newer_lease(lane: dict[str, Any]) -> N
     assert one.keep(pulled).startswith("late")
     assert not (lane["family"] / "recipe.json").exists()
     assert not (lane["family"] / "BRIEF.result.md").exists()
+
+
+# --- a describe lane: no verbs, the batch folder in, out/ and the result back ---------------------
+
+
+DESCRIBE_LABEL = "describe-mini-test"
+DESCRIBE_AGENT = r'''
+import json, os, re, sys
+prompt = sys.stdin.read()
+folder = re.search(r"Family folders: `(\S+)/families/<family>/`", prompt)[1]
+result = re.search(r"result file is `(\S+)`", prompt)[1]
+paper = open(folder + "/families/f-one/source/s1-paper.txt").read()
+earlier = open(folder + "/out/f-one.json").read() if os.path.exists(folder + "/out/f-one.json") else ""
+json.dump({"family": "f-one", "paper": paper, "earlier": earlier}, open(folder + "/out/f-one.json", "w"))
+json.dump({"family": "f-other"}, open(folder + "/out/f-other.json", "w"))
+os.makedirs(os.path.dirname(folder) + "/../spool/new", exist_ok=True)
+open(os.path.dirname(folder) + "/../spool/new/1-0123abcd.json", "w").write(json.dumps(
+    {"id": "1-0123abcd", "family": "f-one", "args": ["bridge", "serve"], "cwd": "/"}))
+open(result, "w").write("done; drafts in " + folder + "/out\n")
+'''
+
+
+@pytest.fixture
+def describe_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """A hub describe batch folder, a worker home with the job's checkout and one describe lease."""
+    monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path / "work"))
+    monkeypatch.setattr(mini_relay, "STATUS_EVERY_S", 0.0)
+    folder = tmp_path / "work/describe/abcd1234"
+    (folder / "families/f-one/source").mkdir(parents=True)
+    (folder / "families/f-one/source/s1-paper.txt").write_text("We present a residual framework.")
+    (folder / "families/f-one/facts.json").write_text("{}")
+    (folder / "out").mkdir()
+    (folder / "out/f-one.json").write_text('{"earlier": true}')  # a return lane's earlier draft
+    (folder / "trial-values.json").write_text("{}")  # never staged
+    (folder / "BRIEF.md").write_text(
+        f"# Describe lane\n\nFamily folders: `{folder}/families/<family>/`. Write `{folder}/out/<family>.json` "
+        f"for each family below; the result file is `{folder}/BRIEF.result.md`.\n")
+    home = tmp_path / "worker"
+    worktree = home / mini_relay.WORKTREE.format(label=DESCRIBE_LABEL)
+    (worktree / "menagerie/pipeline").mkdir(parents=True)
+    shutil.copy(LANE_FILE, worktree / "menagerie/pipeline/mini_lane.py")
+    outputs = tmp_path / "outputs"
+    fake_pull = _script(tmp_path / "pull-outputs", FAKE_PULL.format(
+        python=sys.executable, home=str(home), outputs=str(outputs)))
+    fake_run_on = _script(tmp_path / "run-on", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setattr(admission, "_tool", lambda name: str(
+        {"pull-outputs": fake_pull, "run-on": fake_run_on}[name]))
+    lease = {"label": DESCRIBE_LABEL, "run": "run-d", "kind": "describe", "keys": ["f-one"],
+             "placement": "worker-a", "account": ACCOUNT, "mini": {"ssh_alias": "worker-a-ssh", "deliver": None},
+             "brief": str(folder / "BRIEF.md"), "result": str(folder / "BRIEF.result.md"),
+             "started": "2026-10-29T00:00:00Z", "expires": "2099-01-01T00:00:00Z"}
+    leases = tmp_path / "work/leases"
+    leases.mkdir(parents=True)
+    (leases / f"{DESCRIBE_LABEL}.json").write_text(json.dumps(lease))
+    return {"tmp": tmp_path, "folder": folder, "home": home, "worktree": worktree, "lease": lease,
+            "lease_path": leases / f"{DESCRIBE_LABEL}.json"}
+
+
+@needs_rsync
+def test_describe_lane_stages_its_batch_and_ingests_only_its_drafts(describe_lane: dict[str, Any],
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    folder, worktree = describe_lane["folder"], describe_lane["worktree"]
+    assert mini_relay.layout(["f-one"], folder / "BRIEF-r2.md") == (
+        "work/abcd1234/BRIEF-r2.md", "work/abcd1234/BRIEF-r2.result.md")
+    state = {"run": "RUNNING"}
+    monkeypatch.setattr(admission, "_status", lambda run: {"run": {"state": state["run"]}})
+    agent = describe_lane["tmp"] / "agent.py"
+    agent.write_text(DESCRIBE_AGENT)
+    spec = {"label": DESCRIBE_LABEL, "account": ACCOUNT, "model": "m", "effort": "high", "kind": "describe",
+            "runtime": [sys.executable, str(agent)],
+            "identity": [sys.executable, "-c", f"print('{{\"harness\":\"claude\",\"account\":\"{ACCOUNT}\"}}')"],
+            "families": ["f-one"], "brief": "work/abcd1234/BRIEF.md", "result": "work/abcd1234/BRIEF.result.md",
+            "stage_timeout_s": 60, "lane_timeout_s": 120}
+    job: dict[str, Any] = {}
+    worker = threading.Thread(target=lambda: job.update(rc=mini_lane.run(spec, cwd=worktree)))
+    worker.start()
+    relay = mini_relay.Relay(connect=lambda alias, control: LocalRemote(describe_lane["home"]))
+    _drive(relay, lambda: not worker.is_alive())
+    worker.join(timeout=1)
+    assert job.get("rc") == 0, (worktree / "outputs/lane/agent.log").read_text()
+    root = worktree.resolve() / ".mini-lane"
+    assert not (root / "work/abcd1234/trial-values.json").exists()
+    assert not (root / "work/f-one").exists()  # no verb wrappers
+    assert (root / "spool/new/1-0123abcd.json").is_file()  # a describe lane's spool is never read
+    state["run"] = "TERMINAL"
+    assert admission._live(describe_lane["lease_path"], describe_lane["lease"]) == "INGESTING"
+    _drive(relay, lambda: mini_relay.ingested(DESCRIBE_LABEL))
+    assert json.loads((mini_relay.state_dir(DESCRIBE_LABEL) / "ingested.json").read_text())["status"] == "ingested"
+    draft = json.loads((folder / "out/f-one.json").read_text())
+    assert draft["paper"] == "We present a residual framework." and draft["earlier"] == '{"earlier": true}'
+    assert not (folder / "out/f-other.json").exists()  # only the lease's families come back
+    assert (folder / "BRIEF.result.md").read_text() == f"done; drafts in {folder}/out\n"
+    assert admission._live(describe_lane["lease_path"], describe_lane["lease"]) is None

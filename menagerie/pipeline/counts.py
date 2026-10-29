@@ -220,7 +220,9 @@ def steps_for(ids: Sequence[str], *, data: DataLayout, path: Path | None = None,
     changed = touched(data, payload["commit"], steps)
     if changed is None:
         return None
-    redo = {i for i in ids if i in changed or i not in steps}
+    # A cached 2b is recomputed too: a repair ends when its lane writes a result file in scratch
+    # (``drive._repair_or``), which no commit shows.
+    redo = {i for i in ids if i in changed or i not in steps or steps[i][0] == "2b"}
     files = drive._load(data, ids=redo)
     fresh = {i: drive._step(i, files)[0] for i in redo}
     return {i: fresh[i] if i in fresh else steps[i][0] for i in ids}

@@ -49,7 +49,9 @@ FAILURE_CLASSES = frozenset(
         # named published config; a row waiting on an environment (`needs_env:<name>`).
         "describe", "no_paper", "june_code", "needs_env",
         # A forward whose output holds NaN or inf (`degenerate_forward:nonfinite`; JMT via Lead,
-        # 2026-10-28): never validated, so the worker types it before any capture.
+        # 2026-10-28), or whose eval output is all zero or the same for two distinct inputs
+        # (`degenerate_forward:constant`; Lead, 2026-10-29): never validated, so the worker types
+        # it before any capture.
         "degenerate_forward",
     }
 )
@@ -61,13 +63,13 @@ CLASS_PATTERN = r"(" + "|".join(sorted(FAILURE_CLASSES)) + r")(:\S+)?"
 # name); `oversized:beyond_allocation` (refused by the largest allocation); `unpublishable:fidelity`
 # (fabrication after the repair round); `standin:no_published_config` (a `standin:kwargs` row with
 # neither library defaults nor a named published config to rebuild at); `describe:ungrounded`,
-# `describe:no_text`; `june_code:flagged`; `degenerate_forward:nonfinite`.
+# `describe:no_text`; `june_code:flagged`; `degenerate_forward:nonfinite`, `degenerate_forward:constant`.
 CLASS_DETAILS = {
     "standin": frozenset({"exec", "compact", "kwargs", "dense", "no_published_config"}),
     "unpublishable": frozenset({"fidelity"}),
     "describe": frozenset({"ungrounded", "no_text"}),
     "june_code": frozenset({"flagged"}),
-    "degenerate_forward": frozenset({"nonfinite"}),
+    "degenerate_forward": frozenset({"nonfinite", "constant"}),
 }
 # Heads whose detail is open but required: `no_paper:<why>`, `needs_env:<environment>`.
 NEEDS_DETAIL = frozenset({"no_paper", "needs_env"})
@@ -867,6 +869,11 @@ class DescribeRecord(Record):
     inputs: tuple[str, ...] = ()
     prompt: str | None = spec(None, pattern=r"[0-9a-f]{8}([0-9a-f]{56})?")
     grounding_state: Literal["unchecked", "grounded", "returned", "ungrounded"] = "unchecked"
+    # The strongest kind of text the writer read: `full` (a paper or page text), `abstract` (only
+    # the cited paper's abstract from a saved S2 or OpenAlex record), `docs` (a library's own
+    # documentation at the validated version), `readme` or `none`; None on records written before
+    # 2026-10-29 (`by` `readme-only` then means `readme`, any other prose record `full`).
+    basis: Literal["full", "abstract", "docs", "readme", "none"] | None = None
     # A typed outcome (`describe:no_text`, `describe:ungrounded`) when the writer could not ground
     # a record; None on a grounded one (lane r3-describe).
     cls: str | None = spec(None, key="class", pattern=CLASS_PATTERN)

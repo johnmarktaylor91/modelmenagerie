@@ -26,9 +26,10 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -39,10 +40,9 @@ from menagerie.pipeline import (
     append_jsonl,
     month_of,
     now,
-    read_jsonl,
     tree_sha256,
 )
-from menagerie.pipeline.records import SHA256, StoreIndexLine
+from menagerie.pipeline.records import SHA256, StoreIndexLine, from_dict
 
 T = TypeVar("T")
 
@@ -53,16 +53,100 @@ def _bytes(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 
-def _index_lines(data: DataLayout) -> list[StoreIndexLine]:
-    folder = data.root / "store-index"
-    return [line for shard in sorted(folder.glob("*.jsonl"))
-            for line in read_jsonl(StoreIndexLine, shard)]
+# --- Store index lookups ---------------------------------------------------------------------
+# Each process keeps every index shard's lines by sha and, on each lookup, stats the shards and
+# reads only the bytes appended since its last read (its own appends and other processes'). A
+# shard that was replaced (new inode), shrank, changed without growing, or no longer holds the
+# last line read is read again from the start. A writer's unfinished last line is left unread
+# until its newline lands. Lines are kept as text and parsed into records only when looked up.
+
+
+@dataclass
+class _Shard:
+    """One shard's cached lines; mutated in place as the shard grows (copying a dict of a
+    quarter-million lines per append would cost what the cache saves)."""
+
+    ident: tuple[int, int]  # (st_dev, st_ino)
+    size: int = 0  # st_size and st_mtime_ns at the last read
+    mtime_ns: int = 0
+    offset: int = 0  # just past the last newline read
+    tail: bytes = b""  # the last whole line read, newline included
+    by_sha: dict[str, list[str]] = field(default_factory=dict)
+
+
+_SHARDS: dict[str, _Shard] = {}
+_SHARDS_LOCK = threading.Lock()
+
+
+def _scan_line(text: str) -> str:
+    """The sha of one index line's text (the only parse a shard read does)."""
+
+    return str(json.loads(text)["sha256"])
+
+
+def _parse_line(text: str) -> StoreIndexLine:
+    return from_dict(StoreIndexLine, json.loads(text))
+
+
+def _tail_matches(handle: Any, shard: _Shard) -> bool:
+    handle.seek(shard.offset - len(shard.tail))
+    return bool(handle.read(len(shard.tail)) == shard.tail)
+
+
+def _read_shard(path: Path, cached: _Shard | None) -> _Shard | None:
+    """``cached`` brought up to date with ``path``, or a fresh read; ``None`` when it is gone."""
+
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    ident = (stat.st_dev, stat.st_ino)
+    if cached is not None and cached.ident != ident:
+        cached = None
+    if cached is not None and (stat.st_size, stat.st_mtime_ns) == (cached.size, cached.mtime_ns):
+        return cached
+    with path.open("rb") as handle:
+        grew = cached is not None and stat.st_size > cached.size and _tail_matches(handle, cached)
+        shard = cached if grew and cached is not None else _Shard(ident)
+        handle.seek(shard.offset)
+        chunk = handle.read()
+    end = chunk.rfind(b"\n") + 1  # 0 when no whole line was appended
+    texts = [text for text in chunk[:end].decode("utf-8").split("\n") if text.strip()]
+    found = [(_scan_line(text), text) for text in texts]  # a bad line raises before any change
+    for sha, text in found:
+        shard.by_sha.setdefault(sha, []).append(text)
+    if end:
+        shard.offset += end
+        shard.tail = chunk[chunk.rfind(b"\n", 0, end - 1) + 1:end]
+    shard.size, shard.mtime_ns = stat.st_size, stat.st_mtime_ns
+    return shard
+
+
+def _index_texts(sha256: str, data: DataLayout) -> list[str]:
+    """Every index line's text for a blob, in shard order (sorted names), then file order."""
+
+    found: list[str] = []
+    with _SHARDS_LOCK:
+        for path in sorted((data.root / "store-index").glob("*.jsonl")):
+            key = os.path.abspath(path)
+            shard = _read_shard(path, _SHARDS.get(key))
+            if shard is None:
+                _SHARDS.pop(key, None)
+                continue
+            _SHARDS[key] = shard
+            found.extend(shard.by_sha.get(sha256, ()))
+    return found
+
+
+def _index_lines(sha256: str, data: DataLayout) -> list[StoreIndexLine]:
+    return [_parse_line(text) for text in _index_texts(sha256, data)]
 
 
 def index_line(sha256: str, *, data: DataLayout) -> StoreIndexLine | None:
     """Return the first index line recorded for a blob, or ``None``."""
 
-    return next((line for line in _index_lines(data) if line.sha256 == sha256), None)
+    texts = _index_texts(sha256, data)
+    return _parse_line(texts[0]) if texts else None
 
 
 def _known(sha: str, url: str | None, derived_from: str | None,
@@ -73,7 +157,7 @@ def _known(sha: str, url: str | None, derived_from: str | None,
     holding one stock LICENSE) get their own line with that ``url`` and ``derived_from``,
     restating the blob's latest placement, so a lookup by address or by tree finds every source."""
 
-    lines = [line for line in _index_lines(data) if line.sha256 == sha]
+    lines = _index_lines(sha, data)
 
     def same(line: StoreIndexLine) -> bool:
         return line.derived_from == derived_from and url in (None, line.url)
@@ -262,8 +346,8 @@ def gzipped_path(sha256: str, *, store: StoreLayout) -> Path:
 def placement(sha256: str, *, data: DataLayout) -> StoreIndexLine | None:
     """The latest index line for a blob that states an ``encoding`` or ``location``."""
 
-    found = [line for line in _index_lines(data) if line.sha256 == sha256
-             and (line.encoding is not None or line.location is not None)]
+    found = [line for line in _index_lines(sha256, data)
+             if line.encoding is not None or line.location is not None]
     return found[-1] if found else None
 
 

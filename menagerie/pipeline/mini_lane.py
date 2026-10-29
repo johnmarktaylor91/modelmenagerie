@@ -5,6 +5,8 @@ minis, so stdlib only and no package imports). The hub relay (``mini_relay``) st
 and family folders into ``.mini-lane/`` in the job's checkout, answers the verb requests the
 lane's wrappers queue in ``.mini-lane/spool/``, and after the job ends pulls ``outputs/lane/``
 with ``pull-outputs``. No runtime installation, credentials or SSH configuration happens here.
+A describe lane (manifest ``kind`` ``describe``) has no verbs: its agent reads the staged batch
+folder beside its brief and writes ``out/<family>.json`` there, which ``finish`` returns.
 """
 
 from __future__ import annotations
@@ -170,9 +172,14 @@ def snapshot(root: Path, name: str, family: str) -> dict[str, Any]:
 
 
 def finish(root: Path, out: Path, spec: Mapping[str, Any], rc: int | None) -> bool:
-    """Copy drafts and the result into the pulled folder; return whether the result exists."""
-    skipped = {family: _copy_drafts(root / "work" / family, out / "families" / family)
-               for family in spec["families"] if (root / "work" / family).is_dir()}
+    """Copy drafts and the result into the pulled folder; return whether the result exists.
+    A describe lane's drafts are the ``out/`` folder beside its brief, returned as ``describe/``."""
+    if spec.get("kind") == "describe":
+        drafts = root / Path(spec["brief"]).parent / "out"
+        skipped = {"out": _copy_drafts(drafts, out / "describe")} if drafts.is_dir() else {}
+    else:
+        skipped = {family: _copy_drafts(root / "work" / family, out / "families" / family)
+                   for family in spec["families"] if (root / "work" / family).is_dir()}
     result = root / spec["result"]
     present = result.is_file() and result.stat().st_size > 0
     if present:
@@ -210,7 +217,8 @@ def run(spec: Mapping[str, Any], cwd: Path | None = None) -> int:
     try:
         wait_ready(root, float(spec.get("stage_timeout_s", STAGE_TIMEOUT_S)))
         env = runtime_env(spec)
-        write_wrappers(root, spec["families"])
+        if spec.get("kind") != "describe":  # a describe lane has no verbs
+            write_wrappers(root, spec["families"])
         brief = root / spec["brief"]
         with (out / "agent.log").open("w", encoding="utf-8") as log:
             done = subprocess.run(agent_argv(spec), input=brief.read_text(encoding="utf-8"),

@@ -129,6 +129,42 @@ def test_a_row_traced_without_a_forward_row_moves_past_the_forward(data: DataLay
     assert drive.next_steps(["m8839"], data=data)[0]["why"] == "trace failed: torchlens_gap:replay"
 
 
+def _amend(data: DataLayout, at: str, why: str) -> None:
+    packet = read_json(Packet, data.packet("f-resnet"))
+    note = Amendment(at=at, why=why, evidence=(), changed=("repair",), by="Crawler")
+    write_json(dataclasses.replace(packet, amendments=(*packet.amendments, note)),
+               data.packet("f-resnet"))
+
+
+def test_a_repair_amendment_sends_a_failed_row_back_to_2b_until_a_lane_tries_it(
+        data: DataLayout) -> None:
+    from menagerie.paths import work_dir
+    from menagerie.pipeline import implement
+
+    trace, render = _rows()
+    failed = dataclasses.replace(trace, outcome="fail", cls="torchlens_gap:replay")
+    _ledger(data, _forward(trace), failed)
+    _amend(data, "2026-10-01T00:00:00Z", "repair: m8839; before the failure: no repair")
+    _amend(data, "2026-10-28T00:00:00Z", "repair: m1; another member's repair")
+    assert _step(data) == "done"
+    packet = read_json(Packet, data.packet("f-resnet"))
+    assert implement.repair_request_section(packet, data) == ""
+    _amend(data, "2026-10-28T01:00:00Z", "repair: m8839; warm the BatchNorms (m14958)")
+    (row,) = drive.next_steps(["m8839"], data=data)
+    assert row["step"] == "2b" and row["why"].startswith(
+        "packet amended for a repair at 2026-10-28T01:00:00Z (trace failed: torchlens_gap:replay)")
+    section = implement.repair_request_section(read_json(Packet, data.packet("f-resnet")), data)
+    assert "## Repair request" in section and "m8839" in section
+    assert "warm the BatchNorms (m14958)" in section and "another member" not in section
+    _ledger(data, _forward(trace), trace, render)  # a passing trace is never sent back
+    assert _step(data) == "done"
+    _ledger(data, _forward(trace), failed)
+    result = work_dir("2b") / "f-resnet" / "BRIEF.result.md"
+    result.parent.mkdir(parents=True)
+    result.write_text("nothing to repair\n", encoding="utf-8")  # a lane tried it after the amendment
+    assert drive.next_steps(["m8839"], data=data)[0]["why"] == "trace failed: torchlens_gap:replay"
+
+
 def test_a_cluster_recipe_skips_the_worker_forward(data: DataLayout) -> None:
     record = read_json(ModelRecord, data.model("m8839"))
     _record(data, recipe=dataclasses.replace(record.recipe, placement="axon-cpu"))

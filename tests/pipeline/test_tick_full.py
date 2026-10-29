@@ -189,6 +189,17 @@ def test_share_caps_later_slots_and_lifts_without_earlier_waits(work: Path,
     assert len(tick_full.top_up(DataLayout(work / "data"), cfg, dry_run=True)["2b"]) == 5
 
 
+def test_a_cohort_cap_holds_first_or_later_and_a_bad_one_is_refused(work: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    data = DataLayout(work / "data")
+    cfg = {**_scheduler(work, monkeypatch), "cohort_cap": {"r4-github": 1}}
+    assert tick_full.top_up(data, cfg, dry_run=True)["2b"] == ["f-m0", "f-m1", "f-m10"]
+    cfg = {**_scheduler(work, monkeypatch, early=0), "cohort_cap": {"r4-github": 1}}
+    assert tick_full.top_up(data, cfg, dry_run=True)["2b"] == ["f-m10"]  # first, still capped
+    with pytest.raises(ValueError, match="cohort caps"):
+        tick_full.top_up(data, {**cfg, "cohort_cap": {"r4-github": 1.5}}, dry_run=True)
+
+
 def test_a_refill_top_up_starts_2b_only_and_returns_at_once_when_no_slot_is_free(
         work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from menagerie.pipeline import implement

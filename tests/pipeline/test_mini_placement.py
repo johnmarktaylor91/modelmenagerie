@@ -1014,3 +1014,89 @@ def test_the_trace_host_holds_new_lanes_while_b_is_refused_by_day(
     off = mini_placement.host_cap("linux-a", linux(), {"disk_state": "ok", "b_before_lanes": False})
     assert "runner B" not in off[1]
     assert mini_placement.host_cap("linux-a", linux(trace_host=False), {}) == (2, "")  # Mac lanes untouched
+
+
+# --- describe seats on the workers ----------------------------------------------------------
+
+
+def test_describe_leases_take_worker_slots_like_2b(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    from menagerie.pipeline import mini_placement
+
+    monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path))
+    monkeypatch.setattr(mini_placement, "serving", lambda: True)
+    cfg = {"mini_workers": {"worker-a": worker(), "worker-b": worker()}}
+    monkeypatch.setattr(admission, "lanes", lambda **kw: [
+        {"kind": "describe", "placement": "worker-a"}, {"kind": "describe"}])
+    assert mini_placement.slots(cfg) == ["worker-b"]
+    (tmp_path / "leases").mkdir()
+    for label, kind in (("a", "2b"), ("b", "describe"), ("c", "review")):
+        (tmp_path / "leases" / f"{label}.json").write_text(json.dumps({"kind": kind, "placement": "zm"}))
+    assert mini_placement._host_lanes("zm") == 2  # the trace host's lanes G waits on
+
+
+def test_start_describe_leases_a_describe_lane_and_submits_its_batch_layout(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import contextlib
+    import json
+    import subprocess
+
+    from menagerie.pipeline import mini_placement
+
+    monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path / "work"))
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    seen, admitted, events = [], [], []
+    monkeypatch.setattr(mini_placement, "serving", lambda: True)
+    monkeypatch.setattr(admission, "_resolve", lambda role, account, **kw: {"harness": "claude", "model": "m"})
+    monkeypatch.setattr(admission, "_admit", lambda *a: admitted.append(a) or ([], "models"))
+    monkeypatch.setattr(mini_placement, "_identity", lambda spec, account: None)
+    monkeypatch.setattr(admission, "_lease_lock", lambda: contextlib.nullcontext(leases))
+    monkeypatch.setattr(admission, "gauges", lambda account: {})
+    monkeypatch.setattr(drive, "event", lambda *a, **kw: events.append(a))
+    monkeypatch.setattr(admission, "_sh", lambda argv, **kw: seen.append(argv) or subprocess.CompletedProcess(
+        argv, 0, "abc123\n" if argv[0] == "git" else "run_id=child-1\n", ""))
+    monkeypatch.setattr(mini_placement, "_admitted", lambda label: None)
+    brief = tmp_path / "work/describe/abcd1234/BRIEF-r2.md"
+    started = mini_placement.start_describe(["f-a", "f-b"], brief, role="model-judgment", host="worker-a",
+                                            config=worker(account="pool"), cfg={})
+    assert admitted[0][1:] == ("model-judgment", runner.CODE_ROOT, "describe")  # the describe ceiling
+    lease = json.loads(started.path.read_text())
+    assert lease["kind"] == "describe" and lease["keys"] == ["f-a", "f-b"] and lease["placement"] == "worker-a"
+    assert lease["label"].startswith("describe-mini-") and lease["run"].startswith("pending:")
+    assert mini_placement.finish(started) == "child-1"
+    lease = json.loads(started.path.read_text())
+    assert lease["result"] == str(brief.with_name("BRIEF-r2.result.md")) and lease["account"] == "models"
+    assert [e[2] for e in events] == ["launch"]  # no per-family batch events, as on the hub
+    argv = seen[-1]
+    assert argv[argv.index("--hard-timeout") + 1] == "120m" and argv[argv.index("--deadline") + 1] == "105m"
+    manifest = json.loads(argv[-1])
+    assert manifest["kind"] == "describe" and manifest["lane_timeout_s"] == 105 * 60
+    assert (manifest["brief"], manifest["result"]) == ("work/abcd1234/BRIEF-r2.md",
+                                                       "work/abcd1234/BRIEF-r2.result.md")
+    assert str(tmp_path) not in argv[-1]
+    with pytest.raises(ValueError, match="safe family keys"):
+        mini_placement.start_describe(["../f-a"], brief, role="model-judgment", host="worker-a",
+                                      config=worker(), cfg={})
+
+
+def test_top_up_records_describe_room_only_when_switched_on(scheduler: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    from menagerie.paths import work_dir
+    from menagerie.pipeline import describe_workers
+
+    data, cfg = scheduler
+    monkeypatch.setattr(drive, "next_steps", lambda ids, **kw: [
+        {"id": i, "step": "2b" if i == "m1" else "done"} for i in ids])
+    monkeypatch.setattr(tick_full, "_launch_2b", lambda *a, **kw: [])
+    monkeypatch.setattr(tick_full, "_launch_2a", lambda chunks, data: [])
+    cfg = {**cfg, "2b_on_hub": False}
+    result = tick_full.top_up(data, cfg, dry_run=False)
+    assert "describe_room" not in result and not (work_dir("tick") / describe_workers.ROOM).exists()
+    on = {**cfg, "describes": {"enabled": True, "workers": True}}
+    assert tick_full.top_up(data, on, dry_run=True).get("describe_room") is None
+    result = tick_full.top_up(data, on, dry_run=False)
+    assert result["2b_placements"] == ["worker-a"] and result["describe_room"] == {"worker-b": 1}
+    assert json.loads((work_dir("tick") / describe_workers.ROOM).read_text())["room"] == {"worker-b": 1}

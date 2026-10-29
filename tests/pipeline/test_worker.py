@@ -94,6 +94,32 @@ class Overflows(nn.Module):
         return y * float("nan")
 
 
+class ZeroHead(nn.Module):
+    """A body that reads its input under a zero-initialised head: the output is all zero."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.body, self.head = nn.Linear(27, 4), nn.Linear(4, 4)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x: Any) -> Any:
+        return self.head(self.body(x.flatten(1)))
+
+
+class Silent(nn.Module):
+    """A body that reads its input, then a gate no input opens (a silent spiking layer): the
+    output is a nonzero constant."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.body, self.out = nn.Linear(27, 4), nn.Linear(4, 4)
+
+    def forward(self, x: Any) -> Any:
+        spikes = (self.body(x.flatten(1)) > 1e6).float()
+        return self.out(spikes)
+
+
 class NeedsMissing(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -171,7 +197,8 @@ class ValueBranch(nn.Module):
 
 
 TOYS = {f"toys.{c.__name__}": c
-        for c in (ModeGated, Dropped, Plain, IgnoresInput, Explodes, Overflows, NeedsMissing,
+        for c in (ModeGated, Dropped, Plain, IgnoresInput, Explodes, Overflows, ZeroHead,
+                  Silent, NeedsMissing,
                   LazyCache, BiasCache, EvalRaises, ValueBranch)}
 
 
@@ -295,6 +322,33 @@ def test_nonfinite_reads_floating_and_complex_outputs_only() -> None:
     assert worker.nonfinite(torch.tensor([complex(float("inf"), 0.0)])) is not None
 
 
+@pytest.mark.parametrize("call,why", [("toys.ZeroHead", "exactly zero"),
+                                      ("toys.Silent", "the same for two distinct inputs")])
+def test_a_constant_eval_forward_is_typed_before_any_capture(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, call: str, why: str) -> None:
+    forward = run(tmp_path, recipe(call, (2, 3, 3, 3)), mode="forward")
+    assert (forward.outcome, forward.cls) == ("fail", worker.CONSTANT)
+    assert why in (only_row(forward).msg or "")
+
+    def no_capture(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("a constant forward is never captured")
+
+    monkeypatch.setattr(worker, "_validate", no_capture)
+    trace = run(tmp_path, recipe(call, (2, 3, 3, 3)), mode="trace")
+    assert (trace.outcome, trace.cls, only_row(trace).stage) == ("fail", worker.CONSTANT, "trace")
+
+
+def test_constant_reads_valued_outputs_and_compares_a_second_input() -> None:
+    assert worker.constant(torch.empty(0)) is None
+    assert worker.constant({"labels": torch.zeros(3, dtype=torch.long)}) is None
+    assert worker.constant((torch.zeros(2, 3), torch.zeros(4))) == (
+        "all 10 output values are exactly zero")
+    assert worker.constant(torch.ones(2), torch.ones(2)) == (
+        "the output is the same for two distinct inputs")
+    assert worker.constant([torch.ones(2), torch.ones(1)], [torch.ones(2), torch.zeros(1)]) is None
+    assert worker.constant(torch.ones(2)) is None
+
+
 def test_yolov8n_from_yaml_is_structural(tmp_path: Path) -> None:
     pytest.importorskip("ultralytics")
     rec = recipe("ultralytics.nn.tasks.DetectionModel", (1, 3, 640, 640), "yolov8n.yaml",
@@ -310,9 +364,15 @@ def test_input_boundary_wrapper_real_and_none(tmp_path: Path) -> None:
     resnet = run(tmp_path, timm_recipe("resnet18"), mode="forward")
     assert resnet.input_boundary == "real"
     assert worker.input_boundary(worker.Subject(Plain(), (), {}), None) == "none"
-    # torchvision's ViT has a zero-initialised head: a constant output, a body that reads the input.
+    # torchvision's ViT has a zero-initialised head: a body that reads the input, an all-zero
+    # output, so its forward is degenerate (decisions.md 2026-10-29) until an adapter replaces
+    # that init.
     vit = recipe("torchvision.models.get_model", (1, 3, 224, 224), "vit_b_16", weights=None)
-    assert run(tmp_path, vit, mode="forward").input_boundary == "real"
+    forward = run(tmp_path, vit, mode="forward")
+    assert forward.cls == worker.CONSTANT and "exactly zero" in (forward.msg or "")
+    model = pytest.importorskip("torchvision").models.get_model("vit_b_16", weights=None).eval()
+    assert worker.input_boundary(worker.Subject(model, (torch.randn(1, 3, 224, 224),), {}),
+                                 None) == "real"
 
 
 @pytest.mark.parametrize("model_mode", ["eval", "train"])

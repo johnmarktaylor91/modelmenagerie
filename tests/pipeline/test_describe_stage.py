@@ -37,12 +37,17 @@ def work(tmp_path, monkeypatch):
 def test_knobs_default_and_never_exceed_the_describe_maximum():
     assert describe_stage.knobs({}) == {
         "MENAGERIE_LANES_DESCRIBE": "4", describe_write.HUB_RESERVE: "6",
-        "MENAGERIE_DESCRIBE_MAX_PCT": "60", describe_write.EARLIER_PINS: "1"}
+        "MENAGERIE_DESCRIBE_MAX_PCT": "60", describe_write.EARLIER_PINS: "1",
+        describe_write.ABSTRACTS: ""}
     words = describe_stage.knobs({"lanes": 9, "hub_reserve": 2, "earlier_pins": False})
     assert words["MENAGERIE_LANES_DESCRIBE"] == "4" and words[describe_write.HUB_RESERVE] == "2"
     assert words[describe_write.EARLIER_PINS] == "0"
     with pytest.raises(TypeError, match="earlier_pins"):
         describe_stage.knobs({"earlier_pins": "yes"})
+    assert describe_stage.knobs({"abstracts": True})[describe_write.ABSTRACTS] == "all"
+    assert describe_stage.knobs({"abstracts": ["f-a", "f-b"]})[describe_write.ABSTRACTS] == "f-a,f-b"
+    with pytest.raises(TypeError, match="abstracts"):
+        describe_stage.knobs({"abstracts": "f-a,f-b"})
 
 
 def test_a_pass_starts_one_unit_with_its_knobs_and_the_tick_environment(monkeypatch):
@@ -116,3 +121,35 @@ def test_no_run_starts_while_every_seat_is_staged_and_the_hub_is_full():
     assert "started" in describe_stage.stage({"lanes": 3}, dry_run=False, run=_Systemd(), slots=lambda: 0)
     (root / "seat0" / "lane.json").write_text("{}")
     assert "started" in describe_stage.stage({"lanes": 2}, dry_run=False, run=_Systemd(), slots=lambda: 0)
+
+
+def test_the_worker_switch_adds_its_seat_cap_and_off_changes_nothing():
+    from menagerie.pipeline import describe_workers
+
+    off = describe_stage.knobs({})
+    assert describe_stage.knobs({"workers": False, "worker_seats": 2}) == off
+    assert describe_workers.WORKERS not in off
+    assert describe_stage.knobs({"workers": True})[describe_workers.WORKERS] == "4"
+    assert describe_stage.knobs({"workers": True, "worker_seats": 2})[describe_workers.WORKERS] == "2"
+    assert describe_stage.knobs({"workers": True, "lanes": 3, "worker_seats": 9})[describe_workers.WORKERS] == "3"
+    with pytest.raises(TypeError, match="workers"):
+        describe_stage.knobs({"workers": "yes"})
+
+
+def test_worker_room_starts_a_run_while_the_hub_is_full():
+    from menagerie.pipeline import describe_workers
+
+    root = describe_write.work_dir(describe_write.KIND)
+    for n in range(2):
+        (root / f"seat{n}").mkdir(parents=True)
+        (root / f"seat{n}" / "families.json").write_text("[]")
+        (root / f"seat{n}" / "ready.json").write_text("{}")
+    describe_write.work_dir("leases").mkdir(parents=True)
+    describe_workers.record_room(["zm"], [], held=False)
+    held = describe_stage.stage({"lanes": 2}, dry_run=False, run=_Systemd(), slots=lambda: 0)
+    assert held["held"].startswith("every seat is staged")  # off: the hub alone decides
+    out = describe_stage.stage({"lanes": 2, "workers": True}, dry_run=False, run=_Systemd(), slots=lambda: 0)
+    assert "started" in out
+    describe_workers.record_room(["zm"], ["zm"], held=False)  # 2b took the slot
+    out = describe_stage.stage({"lanes": 2, "workers": True}, dry_run=False, run=_Systemd(), slots=lambda: 0)
+    assert out["held"].startswith("every seat is staged")

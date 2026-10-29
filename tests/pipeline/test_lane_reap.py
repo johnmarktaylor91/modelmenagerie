@@ -96,3 +96,14 @@ def test_only_jobs_run_on_holds_for_their_grace_are_candidates(tmp_path: Path,
                          reap=lambda label: pytest.fail("no held record"), held=None,
                          deadline=time.monotonic() + 600)
     assert "skipped" in out
+
+
+def test_a_describe_worker_lane_is_reaped_once_ingested_and_released(tmp_path: Path) -> None:
+    root, briefs = tmp_path / "minis", tmp_path / "2b"
+    (root / "describe-mini-a").mkdir(parents=True)
+    (root / "describe-mini-a" / "ingested.json").write_text(json.dumps({"status": "ingested"}))
+    (root / "describe-mini-a" / "staged.json").write_text(json.dumps({"paths": {
+        str(tmp_path / "describe" / "abcd1234"): "/worker/.mini-lane/work/abcd1234"}}))
+    os.utime(root / "describe-mini-a" / "ingested.json", (NOW.timestamp() - 60,) * 2)
+    ready, waiting = lane_reap.candidates(root, tmp_path / "leases", briefs, {"f-a"}, {"describe-mini-a"}, NOW)
+    assert ready == ["describe-mini-a"] and waiting == {"lease": 0, "uncommitted": 0}

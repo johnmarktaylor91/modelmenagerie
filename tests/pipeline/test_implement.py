@@ -234,6 +234,16 @@ def test_giveup_research_gap_needs_its_fields(data: DataLayout, tmp_path: Path,
     assert str(tmp_path) not in "".join(p.read_text() for p in (data.root / "ledger").glob("*"))
 
 
+def test_giveup_types_a_degenerate_forward_no_init_change_repairs(data: DataLayout,
+                                                                  events: list) -> None:
+    with pytest.raises(RecordError, match="degenerate_forward:constant"):
+        implement.giveup("m9001", "degenerate_forward:silent", "x", data=data)
+    record = implement.giveup("m9001", "degenerate_forward:constant",
+                              "LIF layers silent at random weights; only pretrained weights fire",
+                              data=data)
+    assert record.give_up.cls == "degenerate_forward:constant" and record.give_up.by == "agent"
+
+
 def test_done_writes_records_adapter_ledger_and_runs_variants(data: DataLayout, tmp_path: Path,
                                                               served: list, events: list) -> None:
     recipe = _draft_files(tmp_path / "lane")
