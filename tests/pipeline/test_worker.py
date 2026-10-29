@@ -79,6 +79,21 @@ class Explodes(nn.Module):
         raise ValueError("shape mismatch in block 3")
 
 
+class Overflows(nn.Module):
+    """A random-weight net that overflows in eval mode (NaN out) and, with ``train_only``, in
+    train mode only (inf out)."""
+
+    def __init__(self, train_only: bool = False) -> None:
+        super().__init__()
+        self.lin, self.train_only = nn.Linear(27, 4), train_only
+
+    def forward(self, x: Any) -> Any:
+        y = self.lin(x.flatten(1))
+        if self.train_only:
+            return y / 0.0 if self.training else y
+        return y * float("nan")
+
+
 class NeedsMissing(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -156,8 +171,8 @@ class ValueBranch(nn.Module):
 
 
 TOYS = {f"toys.{c.__name__}": c
-        for c in (ModeGated, Dropped, Plain, IgnoresInput, Explodes, NeedsMissing, LazyCache,
-                  BiasCache, EvalRaises, ValueBranch)}
+        for c in (ModeGated, Dropped, Plain, IgnoresInput, Explodes, Overflows, NeedsMissing,
+                  LazyCache, BiasCache, EvalRaises, ValueBranch)}
 
 
 def _import(call: str) -> Any:
@@ -247,6 +262,37 @@ def test_forward_classifies_train_eval_divergence(tmp_path: Path, seam: dict[str
     assert seam["construct"] == 2, "eval and train each run on a freshly built model"
     row = only_row(result)
     assert row.stage == "forward" and row.forward_secs is not None and row.forward_peak_rss_mb
+
+
+def test_nonfinite_eval_forward_is_typed_before_any_capture(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    forward = run(tmp_path, recipe("toys.Overflows", (2, 3, 3, 3)), mode="forward")
+    assert (forward.outcome, forward.cls) == ("fail", worker.NONFINITE)
+    assert forward.modes is not None and forward.modes.eval == f"fail:{worker.NONFINITE}"
+    row = only_row(forward)
+    assert row.stage == "forward" and row.cls == worker.NONFINITE and "8 NaN" in (row.msg or "")
+
+    def no_capture(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("a non-finite forward is never captured")
+
+    monkeypatch.setattr(worker, "_validate", no_capture)
+    trace = run(tmp_path, recipe("toys.Overflows", (2, 3, 3, 3)), mode="trace")
+    assert (trace.outcome, trace.cls, only_row(trace).stage) == ("fail", worker.NONFINITE, "trace")
+
+
+def test_nonfinite_train_forward_fails_only_the_train_mode(tmp_path: Path) -> None:
+    result = run(tmp_path, recipe("toys.Overflows", (2, 3, 3, 3), train_only=True), mode="forward")
+    assert result.outcome == "pass" and result.modes is not None
+    assert (result.modes.eval, result.modes.train) == ("pass", f"fail:{worker.NONFINITE}")
+
+
+def test_nonfinite_reads_floating_and_complex_outputs_only() -> None:
+    finite = (torch.ones(2), {"ids": torch.arange(3), "mask": torch.ones(2, dtype=torch.bool)})
+    assert worker.nonfinite(finite) is None
+    assert worker.nonfinite(torch.empty(0)) is None
+    where = worker.nonfinite([torch.ones(2), torch.tensor([1.0, float("inf"), float("nan")])])
+    assert where == "output 1 of shape (3,) holds 1 NaN and 1 inf of 3 values"
+    assert worker.nonfinite(torch.tensor([complex(float("inf"), 0.0)])) is not None
 
 
 def test_yolov8n_from_yaml_is_structural(tmp_path: Path) -> None:

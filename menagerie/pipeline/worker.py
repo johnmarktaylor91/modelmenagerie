@@ -28,6 +28,10 @@ rows traced before. A verdict TorchLens reports as
 ``unverified`` is typed ``torchlens_unverified``, apart from a replay failure
 (``torchlens_gap:replay``), from the trace's own replay status, never its message.
 
+A forward whose output holds NaN or inf is typed ``degenerate_forward:nonfinite`` before any
+capture (JMT via Lead, 2026-10-28): it can never be validated, so the forward and trace modes stop
+there. In forward mode a non-finite train-mode output fails the row's ``train`` mode only.
+
 A recipe's vendor tree (``MENAGERIE_VENDOR``) goes on ``sys.path`` when ``main`` starts, not on
 ``PYTHONPATH``: a tree with a top-level folder named like a stdlib module the interpreter loads
 while starting (``importlib``) would otherwise replace it before any code runs.
@@ -65,6 +69,8 @@ SUMMARY_FILE = "summary.json"
 TAIL_LINES = 40
 _MEMORY = re.compile(r"(?i)out of memory|can't allocate memory|DefaultCPUAllocator|std::bad_alloc")
 # A compiled extension built in the sandbox (torch.utils.cpp_extension, setuptools, ninja) failed.
+# A forward whose output holds NaN or inf: never validated, so typed before any capture.
+NONFINITE = "degenerate_forward:nonfinite"
 _COMPILE = re.compile(r"(?i)error building extension|ninja: build stopped|CompileError|"
                       r"command '[^']*(gcc|g\+\+|cc|c\+\+|nvcc)' failed|"
                       r"CUDA_HOME environment variable is not set|Ninja is required")
@@ -213,6 +219,33 @@ def tensors(value: Any) -> list[Any]:
     if isinstance(value, (list, tuple)):
         return [t for v in value for t in tensors(v)]
     return []
+
+
+def nonfinite(value: Any) -> str | None:
+    """Where a forward's output is not finite: the first floating or complex output tensor that
+    holds NaN or inf, with its counts, or ``None`` when every one is finite. Integer and boolean
+    outputs are finite by type; sparse and meta tensors hold no values to read here."""
+
+    import torch
+
+    for i, t in enumerate(tensors(value)):
+        if not (t.is_floating_point() or t.is_complex()) or t.is_sparse or t.is_meta:
+            continue
+        data = t.detach()
+        if bool(torch.isfinite(data).all()):
+            continue
+        nan, inf = int(torch.isnan(data).sum()), int(torch.isinf(data).sum())
+        return (f"output {i} of shape {tuple(data.shape)} holds {nan} NaN and {inf} inf of "
+                f"{data.numel()} values")
+    return None
+
+
+def _finite(out: Any, mode: str) -> None:
+    """Raise ``NONFINITE`` when a plain forward's output holds NaN or inf."""
+
+    why = nonfinite(out)
+    if why is not None:
+        raise Failure(NONFINITE, f"{mode}-mode forward is not finite: {why}")
 
 
 def _shapes(value: Any) -> tuple[tuple[int, ...], ...]:
@@ -426,6 +459,7 @@ def _forward_mode(request: RunRequest, attempt_dir: Path) -> RunResult:
         return worker_preview.forward_mode(request, attempt_dir)
     subject = _build(request.recipe)
     eval_out, secs, eval_ops = _timed_forward(subject, record=True)
+    _finite(eval_out, "eval")
     peak = _rss_mb()
     boundary = input_boundary(subject, eval_out)
     params = sum(int(p.numel()) for p in subject.model.parameters())
@@ -433,6 +467,7 @@ def _forward_mode(request: RunRequest, attempt_dir: Path) -> RunResult:
     train, div = "pass", None
     try:
         train_out, _, train_ops = _timed_forward(_build(request.recipe, train=True), record=True)
+        _finite(train_out, "train")
         div = divergence(eval_out, train_out, eval_ops, train_ops)
     except Failure as failure:
         train = f"fail:{failure.cls}"
@@ -677,6 +712,7 @@ def _trace_mode(request: RunRequest, attempt_dir: Path, device: str = "cpu") -> 
     train = request.model_mode == "train"
     subject = _build(request.recipe, train=train, device=device)
     truth, forward_secs, _ = _timed_forward(subject)
+    _finite(truth, request.model_mode)
     forward_peak = _rss_mb()
     boundary = input_boundary(subject, truth)
     del subject

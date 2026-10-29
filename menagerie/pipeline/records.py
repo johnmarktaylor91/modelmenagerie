@@ -48,6 +48,9 @@ FAILURE_CLASSES = frozenset(
         # paper (`no_paper:<why>`); June code whose constructor is neither library defaults nor a
         # named published config; a row waiting on an environment (`needs_env:<name>`).
         "describe", "no_paper", "june_code", "needs_env",
+        # A forward whose output holds NaN or inf (`degenerate_forward:nonfinite`; JMT via Lead,
+        # 2026-10-28): never validated, so the worker types it before any capture.
+        "degenerate_forward",
     }
 )
 CLASS_PATTERN = r"(" + "|".join(sorted(FAILURE_CLASSES)) + r")(:\S+)?"
@@ -58,12 +61,13 @@ CLASS_PATTERN = r"(" + "|".join(sorted(FAILURE_CLASSES)) + r")(:\S+)?"
 # name); `oversized:beyond_allocation` (refused by the largest allocation); `unpublishable:fidelity`
 # (fabrication after the repair round); `standin:no_published_config` (a `standin:kwargs` row with
 # neither library defaults nor a named published config to rebuild at); `describe:ungrounded`,
-# `describe:no_text`; `june_code:flagged`.
+# `describe:no_text`; `june_code:flagged`; `degenerate_forward:nonfinite`.
 CLASS_DETAILS = {
     "standin": frozenset({"exec", "compact", "kwargs", "dense", "no_published_config"}),
     "unpublishable": frozenset({"fidelity"}),
     "describe": frozenset({"ungrounded", "no_text"}),
     "june_code": frozenset({"flagged"}),
+    "degenerate_forward": frozenset({"nonfinite"}),
 }
 # Heads whose detail is open but required: `no_paper:<why>`, `needs_env:<environment>`.
 NEEDS_DETAIL = frozenset({"no_paper", "needs_env"})
