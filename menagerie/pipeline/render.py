@@ -26,6 +26,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+from menagerie import tl_compat
 from menagerie.pipeline import NON_TRACE_ROOTS, now, tree_sha256
 from menagerie.pipeline.records import (
     VARIANT,
@@ -36,6 +37,8 @@ from menagerie.pipeline.records import (
 )
 
 # The June draw options (``generate_menagerie.py`` ``render_one``); the variant adds the view.
+# Written in the pinned keyword names, which ``tl_compat.draw`` renames for TorchLens 3.0; they are
+# hashed into ``renderer_rev`` as written, so the adapter alone re-arms no render.
 DRAW_OPTIONS: dict[str, Any] = {"vis_save_only": True, "show_legend": False}
 # The renderer's packages. They are in the ``torch-main`` lock as declared non-trace roots, so
 # recipe revisions leave them out and ``renderer_rev`` carries their versions instead: a renderer
@@ -115,13 +118,15 @@ def renderer_rev() -> str:
 def rolled_units(trace: Any) -> int:
     """Return the op count of the rolled view: each multi-pass layer drawn once."""
 
-    return int(trace.num_ops) - sum(n - 1 for n in trace.layer_num_calls.values() if n > 1)
+    repeats = sum(n - 1 for n in tl_compat.layer_calls(trace).values() if n > 1)
+    return tl_compat.num_ops(trace) - repeats
 
 
 def reuses_weights(trace: Any) -> bool:
     """Whether a layer with parameters ran more than once: TorchLens's true recurrence."""
 
-    return any(layer.num_passes > 1 and layer.uses_params for layer in trace.layer_logs.values())
+    return any(layer.num_passes > 1 and tl_compat.layer_has_params(layer)
+               for layer in tl_compat.layers(trace))
 
 
 def variants_for(trace: Any, *, train: bool = False) -> list[str]:
@@ -133,10 +138,10 @@ def variants_for(trace: Any, *, train: bool = False) -> list[str]:
     """
 
     keys = ["unrolled-none"]
-    if trace.num_ops > READABLE_OPS:
+    if tl_compat.num_ops(trace) > READABLE_OPS:
         keys += ["unrolled-auto", "unrolled-max"]
     rolled = rolled_units(trace)
-    if reuses_weights(trace) and rolled <= ROLLED_FRACTION * trace.num_ops:
+    if reuses_weights(trace) and rolled <= ROLLED_FRACTION * tl_compat.num_ops(trace):
         keys.append("rolled-none")
         if rolled > READABLE_OPS:
             keys += ["rolled-auto", "rolled-max"]
@@ -165,7 +170,7 @@ def _draw(trace: Any, key: str, stem: Path, fmt: str, log: dict[str, Any]) -> No
     match = re.fullmatch(VARIANT, key)
     if match is None:
         raise ValueError(f"not a variant key: {key!r}")
-    units = rolled_units(trace) if match[1] == "rolled" else trace.num_ops
+    units = rolled_units(trace) if match[1] == "rolled" else tl_compat.num_ops(trace)
     placement = "rank" if match[2] == "none" and units > MONSTER_NODES else "auto"
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -202,8 +207,8 @@ def _draw_at(trace: Any, match: re.Match[str], stem: Path, fmt: str, placement: 
              log: dict[str, Any]) -> None:
     log["placement"] = placement
     try:
-        trace.draw(vis_mode=match[1], collapse=match[2], vis_outpath=str(stem),
-                   vis_fileformat=fmt, vis_node_placement=placement, **DRAW_OPTIONS)
+        tl_compat.draw(trace, vis_mode=match[1], collapse=match[2], vis_outpath=str(stem),
+                       vis_fileformat=fmt, vis_node_placement=placement, **DRAW_OPTIONS)
     except Exception as exc:
         if isinstance(exc.__cause__, subprocess.TimeoutExpired):
             stem.unlink(missing_ok=True)
@@ -357,8 +362,8 @@ def render_set(trace: Any, *, model_id: str, trace_sha: str, out_dir: Path,
     for kind, name in EXPORTS:
         path = out_dir / name
         out.make(kind, None, path, lambda e, k=kind, p=path: _export(k, trace, p, e))
-    default = default_variant(drawn or keys, is_recurrent=bool(trace.is_recurrent),
-                              n_ops=int(trace.num_ops))
+    default = default_variant(drawn or keys, is_recurrent=bool(tl_compat.trace_field(trace, "is_recurrent")),
+                              n_ops=tl_compat.num_ops(trace))
     if not drawn or {(default, "svg"), (default, "thumb")} & out.failed:
         outcome = "fail"
     else:
@@ -375,7 +380,7 @@ def _export(kind: str, trace: Any, path: Path, log: dict[str, Any]) -> None:
         warnings.simplefilter("always")
         try:
             if kind == "html":
-                options = tl.export.ReportOptions(deterministic=True, share_safe=True)
+                options = tl_compat.report_options(deterministic=True, share_safe=True)
                 tl.export.html(trace, path, options=options)
             else:
                 getattr(tl.export, kind)(trace, path)

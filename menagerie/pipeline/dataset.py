@@ -43,7 +43,7 @@ def _commit() -> str:
 
 
 def _trace(model: ModelRecord, rows: Sequence[Any], tl: str) -> LedgerRow | None:
-    if model.recipe is None:
+    if model.recipe is None or ledger.gave_up(model):  # a give-up is the record's outcome
         return None
     full = ledger.deciding_trace(model.id, rows, recipe_rev=model.recipe.rev, tl=tl)
     if full is not None:

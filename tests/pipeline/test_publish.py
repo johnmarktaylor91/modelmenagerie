@@ -16,6 +16,7 @@ import pytest
 from menagerie.pipeline import (
     DataLayout,
     append_jsonl,
+    ledger,
     month_of,
     publish,
     read_json,
@@ -46,6 +47,20 @@ JUNE_GRAPH_HASH = "909da2bb8dc29f34a8120d701c9c91eb0b0fe6a4cee6d3c49bb712a11ea03
 def _fixture_pin(monkeypatch: pytest.MonkeyPatch) -> None:
     # The fixture rows were captured at TorchLens 2.35.0; export them as current at that pin.
     monkeypatch.setattr(publish, "torchlens_pin", lambda: FIXTURE_TL)
+    # An export checks its blobs against the store only when one is named; a test names its own.
+    monkeypatch.delenv("MENAGERIE_STORE", raising=False)
+
+
+def stock_store(store: Path, export: Path, *, leave_out: set[str] = frozenset()) -> None:
+    """Put a placeholder blob in ``store`` for every svg, thumb and pdf ``export`` lists."""
+
+    with (export / "assets.tsv").open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    for row in rows:
+        if row["kind"] in ("svg", "thumb", "pdf") and row["sha256"] not in leave_out:
+            blob = store / "sha256" / row["sha256"][:2] / row["sha256"]
+            blob.parent.mkdir(parents=True, exist_ok=True)
+            blob.write_bytes(b"placeholder")
 
 
 def _data_root(tmp_path: Path) -> DataLayout:
@@ -73,6 +88,19 @@ def _data_root(tmp_path: Path) -> DataLayout:
 
 def _rows(data: DataLayout) -> list:
     return read_jsonl(parse_ledger_line, data.ledger("2026-10"))
+
+
+def test_a_shown_only_export_leaves_out_what_the_site_hides(tmp_path: Path) -> None:
+    data = _data_root(tmp_path)
+    out = publish.export_site(data=data, out_dir=tmp_path / "export", ids=["m8839"], as_of=AS_OF,
+                              shown_only=True)
+    # The fixture's trace is unverified, so the site would give it no page: it becomes a text entry.
+    assert (out / "models.jsonl").read_text() == ""
+    counts = json.loads((out / "export_manifest.json").read_text())["counts"]
+    assert counts["dropped_hidden"] == {"not_validated": 1} and counts["models"] == 0
+    listed = [json.loads(line)["stable_id"] for line in (out / "roster-index.jsonl").read_text().splitlines()]
+    assert "m8839" in listed
+    assert counts["catalog_entries"] == counts["models"] + counts["roster_index"]
 
 
 def test_preview_export_of_resnet18(tmp_path: Path) -> None:
@@ -120,6 +148,7 @@ def test_preview_export_of_resnet18(tmp_path: Path) -> None:
     assert funnel == {
         "as_of": AS_OF, "roster_names": 2, "validated_records": 0, "structure_only_records": 0,
         "distinct_architectures": 0, "distinct_basis": "legacy graph_shape_hash",
+        "catalog_entries": 2,  # the page plus the roster index's text entry
     }
     manifest = json.loads((out / "export_manifest.json").read_text())
     assert manifest["counts"]["preview_unvalidated"] == 1
@@ -348,7 +377,8 @@ def test_a_recipe_typed_standin_for_another_id_is_refused_and_swept(tmp_path: Pa
     standin.sweep(data=data, apply=True)
     typed = read_json(ModelRecord, data.model("m8839")).give_up
     assert typed is not None and typed.cls == "standin:dense" and "m3631" in typed.reason
-    row = _rows(data)[-1]
+    # The sweep's row is stamped now, so it lands in the current month's shard: read them all.
+    row = ledger.read_all(data=data)[-1]
     assert (row.id, row.outcome, row.cls, row.recipe_rev) == (
         "m8839", "giveup", "standin:dense", model.recipe.rev)
     assert standin.sweep(data=data)["typed"] == []  # typed once
@@ -411,6 +441,8 @@ def test_trace_statistics_come_from_the_summary_blob_in_the_store(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data = _data_root(tmp_path)
     store = tmp_path / "store"
+    stock_store(store, publish.export_site(data=data, out_dir=tmp_path / "unchecked",
+                                           ids=["m8839"], as_of=AS_OF))
     monkeypatch.setenv("MENAGERIE_STORE", str(store))
     out = publish.export_site(data=data, out_dir=tmp_path / "bare", ids=["m8839"], as_of=AS_OF)
     (record,) = [json.loads(line) for line in (out / "models.jsonl").read_text().splitlines()]

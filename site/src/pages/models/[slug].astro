@@ -3,7 +3,7 @@ import ModelPage from "@/components/ModelPage.astro";
 import BaseLayout from "@/layouts/BaseLayout.astro";
 import { fixtureModelPages, fixturePagesEnabled, realNeighbours } from "@/fixtures/records";
 import { getAdjacentModels, getModelBySlug, listModelSlugs, type ModelRecord } from "@/lib/catalog";
-import { familyHref, familyRelatives, getFamilyOf, sameShapeModels, type Family } from "@/lib/families";
+import { familyHref, familyRelatives, getFamilyOf, sameDiagramModels, sameShapeModels, type Family } from "@/lib/families";
 import { formatNumber } from "@/lib/labels";
 import { modelSeo } from "@/lib/seo";
 
@@ -26,15 +26,17 @@ const ownFamily = fixture ? fixture.family : getFamilyOf(model);
 const family = ownFamily && ownFamily.members.length > 1 ? ownFamily : null;
 const familyMembers = familyRelatives(model, family);
 const sameShape = fixture ? (fixture.family ? realNeighbours(3) : []) : sameShapeModels(model);
+const sameDiagram = fixture ? [] : sameDiagramModels(model);
 const description = `Architecture diagram of ${model.display_name}, traced with TorchLens${model.n_ops !== null ? `: ${formatNumber(model.n_ops)} operations` : ""}.`;
 ---
 
 <BaseLayout title={model.display_name} description={description} noindex={Boolean(fixture)} {...modelSeo(model)}>
   <ModelPage
     model={model}
-    family={family ? { name: family.name, href: familyHref(family), size: family.members.length } : null}
+    family={family ? { name: family.displayName, href: familyHref(family), size: family.members.length } : null}
     familyMembers={familyMembers}
     sameShape={sameShape}
+    sameDiagram={sameDiagram}
     prev={prev}
     next={next}
   />

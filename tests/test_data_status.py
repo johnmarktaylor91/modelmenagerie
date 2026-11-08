@@ -43,17 +43,31 @@ def root(tmp_path: Path) -> Path:
     (data / "catalog").mkdir()
     (data / "catalog" / "plan.tsv").write_text("id\twave\nm1\tC1\nm2\tC2\n", encoding="utf-8")
     (data / "models" / "00").mkdir(parents=True)
-    (data / "models" / "00" / "m1.json").write_text(json.dumps({"id": "m1", "give_up": {"class": "x"}}))
-    (data / "models" / "00" / "m2.json").write_text(json.dumps({"id": "m2"}))
+    recipe = {"rev": "0123456789ab", "kind": "library", "env": "torch-main", "backend": "torch",
+              "input": {"preset": "randn", "kind": "random-fallback", "shape": [1, 3]},
+              "call": "torch.nn.Linear", "args": [3, 2]}
+    model = {"schema": "model/1", "zoo": "timm", "family": "f-x", "source_case": "library",
+             "recipe": recipe}
+    give_up = {"class": "budget", "reason": "ran out", "at": "2026-10-08T00:00:00Z"}
+    for mid, extra in (("m1", {"give_up": give_up}), ("m2", {}), ("m3", {"give_up": give_up})):
+        (data / "models" / "00" / f"{mid}.json").write_text(
+            json.dumps({**model, "id": mid, "name": mid, **extra}))
+    row = {"schema": "ledger/1", "stage": "trace", "host": "w", "env": "torch-main",
+           "recipe_rev": "0123456789ab",
+           "outcome": "pass", "mode": "eval", "capture": "full", "tl": "2.36.0", "n_ops": 3,
+           "graph_hash": "a" * 64, "validation_state": "passed"}
     _jsonl(data / "ledger" / "2026-10.jsonl", [
-        {"id": "m2", "stage": "trace", "at": "2026-10-05T00:00:00Z", "validation_state": "failed"},
-        {"id": "m2", "stage": "trace", "at": "2026-10-06T00:00:00Z", "validation_state": "passed"},
-        {"id": "m1", "stage": "forward", "at": "2026-10-07T00:00:00Z"},
+        {**row, "id": "m2", "at": "2026-10-05T00:00:00Z", "outcome": "fail",
+         "class": "torchlens_gap:replay", "validation_state": "failed"},
+        {**row, "id": "m2", "at": "2026-10-06T00:00:00Z"},
+        {**row, "id": "m3", "at": "2026-10-06T00:00:00Z"},  # a pass beside a give-up
+        {**row, "id": "m1", "stage": "forward", "at": "2026-10-07T00:00:00Z"},
     ])
     site = tmp_path / "site" / "site-data"
     site.mkdir(parents=True)
     (site / "export_manifest.json").write_text(json.dumps(
-        {"counts": {"models": 7}, "export_version": "phase0-preview"}))
+        {"counts": {"models": 7, "validated": 6, "by_torchlens_version": {"2.36.0": 7}},
+         "export_version": "phase0-preview"}))
     (tmp_path / "docs").mkdir()
     return tmp_path
 
@@ -65,10 +79,11 @@ def test_render_names_each_count_with_its_file(root: Path) -> None:
     assert "latest frontier 2026-07-04; open axes: S001/recent" in text
     assert "`menagerie/data/master_catalog.jsonl`: 2 recipe rows" in text
     assert "2 rows; by wave C1 1, C2 1" in text
-    assert "7 render-only rows, export `phase0-preview`" in text
+    assert ("7 models, 6 of them validated, export `phase0-preview`; traces by TorchLens "
+            "version 2.36.0 7." in text)
     assert "As of ledger entry 2026-10-07T00:00:00Z" in text
-    assert "2, of which 1 carry a typed give-up reason" in text
-    assert "Models with a trace row: 1; whose latest trace passed validation: 1" in text
+    assert "3, of which 2 carry a typed give-up reason" in text
+    assert "Models with a trace row: 2; validated: 1 (" in text  # m3's give-up wins
 
 
 def test_check_passes_after_write_and_fails_when_the_roster_changes(root: Path) -> None:

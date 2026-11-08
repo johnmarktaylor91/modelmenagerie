@@ -11,6 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
+import { makeAssetHref } from "../src/lib/asset-href.mjs";
 
 const require = createRequire(new URL("../qa/package.json", import.meta.url));
 const { chromium } = require("playwright-core");
@@ -23,6 +24,7 @@ const TOP_MARGIN = 28;
 const siteDir = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const outDir = path.join(siteDir, "src", "assets", "share");
 const base = (process.env.PUBLIC_R2_BASE ?? "").replace(/\/+$/, "");
+const assetHref = makeAssetHref(base, process.env.PUBLIC_ASSET_CACHE_KEY);
 if (!base) {
   throw new Error("Set PUBLIC_R2_BASE to the asset host the site uses.");
 }
@@ -49,7 +51,7 @@ for (const [key, slug] of Object.entries(SHARE_IMAGE_SLUGS)) {
     continue;
   }
   const variant = record.variants.find((v) => v.key === record.default_variant) ?? record.variants[0];
-  const response = await fetch(`${base}/${variant.svg.sha256}.svg`);
+  const response = await fetch(assetHref(`${variant.svg.sha256}.svg`));
   if (!response.ok) {
     report.push({ key, slug, error: `fetch ${response.status}` });
     continue;

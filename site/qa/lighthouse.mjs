@@ -6,14 +6,17 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+import { modelRoutes } from "./lib/routes.mjs";
+
 const [base, outDir] = process.argv.slice(2);
 fs.mkdirSync(outDir, { recursive: true });
+const models = modelRoutes();
 const ROUTES = {
   home: "/",
   listing: "/models/",
-  small: "/models/pi-sigma-network/",
-  large: "/models/espnet-tts-tacotron2-gst/",
-  monster: "/models/nllb-moe/",
+  small: models.small,
+  large: models.large,
+  monster: models.monster,
   dataset: "/dataset/",
   about: "/about/",
   legal: "/legal/",
@@ -22,7 +25,7 @@ const ROUTES = {
 const bin = path.join(path.dirname(new URL(import.meta.url).pathname), "node_modules", ".bin", "lighthouse");
 
 const summary = {};
-for (const [name, route] of Object.entries(ROUTES)) {
+for (const [name, route] of Object.entries(ROUTES).filter(([, value]) => value)) {
   const file = path.join(outDir, `${name}-mobile.json`);
   try {
     execFileSync(

@@ -20,10 +20,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from menagerie.pipeline import DataLayout, StoreLayout, ledger, roster
+from menagerie.pipeline import DataLayout, StoreLayout, ledger, paper_check, read_json, roster, write_json
 from menagerie.pipeline import store as store_mod
 from menagerie.pipeline.describe import _bib_abstract
-from menagerie.pipeline.records import LedgerRow, to_dict
+from menagerie.pipeline.records import LedgerRow, Packet, RecordError, to_dict
 
 TEXT_ROLES = ("paper", "page")
 ABSTRACT_APIS = ("s2", "openalex")
@@ -198,12 +198,14 @@ def candidates(packet: Mapping[str, Any], *, abstracts: bool = False) -> dict[st
     ``full`` (a paper or page text), ``docs`` (a code source's text: a library's documentation at
     the validated version), ``readme`` (a code snapshot, which may hold a README) and, with
     ``abstracts`` and no full text, ``abstract`` (a saved S2 or OpenAlex record). A sid that is
-    not a plain file name is left unread, never a path."""
+    not a plain file name is left unread, never a path; a retired or held source
+    (``paper_check.retired``) is never read."""
 
     found: dict[str, str] = {}
+    gone = paper_check.retired_raw(packet)
     for src in packet.get("sources", []):
         sid, role = src.get("sid", ""), src.get("role")
-        if not readable_sid(sid):
+        if not readable_sid(sid) or sid in gone:
             continue
         if role in TEXT_ROLES and src.get("text"):
             found[sid] = "full"
@@ -290,6 +292,25 @@ def stage3_outputs(members: Sequence[Mapping[str, Any]], rows: Sequence[Any], *,
     return out
 
 
+def _check_papers(family: str, *, data: DataLayout, store: StoreLayout, folder: Path
+                  ) -> list[str]:
+    """Retire (in the packet) each paper or page text that never names the family
+    (``paper_check``), before any prose can rest on it; returns the sids retired."""
+
+    path = data.packet(family)
+    try:
+        packet = read_json(Packet, path)
+    except RecordError:
+        return []  # Describe reads a malformed packet as plain JSON; there is nothing to retire by.
+    with tempfile.TemporaryDirectory(dir=folder.parent if folder.parent.is_dir() else None) as tmp:
+        verdicts = paper_check.check(packet, data=data, store=store, tmp=Path(tmp))
+    bad = sorted(sid for sid, verdict in verdicts.items() if verdict == "mismatch")
+    if bad:
+        write_json(paper_check.retire(read_json(Packet, path), bad,
+                                      "describe found the saved text never names the family"), path)
+    return bad
+
+
 def gather(family: str, *, data: DataLayout, store: StoreLayout, folder: Path, tl: str,
            rows: Sequence[Any] | None = None, vocab: Mapping[str, Sequence[str]] | None = None,
            jev: Mapping[str, Any] | None = None, abstracts: bool = False) -> Inputs:
@@ -302,6 +323,7 @@ def gather(family: str, *, data: DataLayout, store: StoreLayout, folder: Path, t
     when the caller already read them.
     """
 
+    refused = _check_papers(family, data=data, store=store, folder=folder)
     packet = _read_json(data.packet(family))
     rows = ledger.read_all(data=data) if rows is None else rows
     roster_rows = {r.stable_id: to_dict(r) for r in roster.read(data=data) if r.stable_id}
@@ -313,6 +335,7 @@ def gather(family: str, *, data: DataLayout, store: StoreLayout, folder: Path, t
     facts = {
         "family": family, "mode": inputs.mode, "sids": sorted(texts),
         "considered": sorted(candidates(packet, abstracts=abstracts)),
+        "refused_papers": refused,
         "era": _era(packet, members), "institutions": names, "institutions_sid": bib_sid,
         "output": stage3_outputs(members, rows, tl=tl, folder=folder, store=store),
         "vocab": dict(vocab or {}), "jev": dict(jev or {}),

@@ -75,14 +75,14 @@ class _Attn(nn.Module):
 def _summarize_via_observer(model: nn.Module, example: torch.Tensor) -> dict:
     """Summarize from a VALIDATION-config trace, exactly as the worker observer does."""
 
-    from torchlens.user_funcs import _validate_forward_pass_torch
+    from menagerie import tl_validation
 
     captured: dict[str, dict] = {}
 
     def observe(trace: object) -> None:
         captured["row"] = summarize_trace("m", trace, "")
 
-    _validate_forward_pass_torch(model, example, validate_metadata=True, _trace_observer=observe)
+    tl_validation.validate_forward(model, example, observer=observe)
     return captured["row"]
 
 
@@ -229,7 +229,7 @@ def test_validation_config_summary_rejects_a_refusal_without_a_trace(
             _trace_observer(None)
         return False
 
-    monkeypatch.setattr("torchlens.user_funcs._validate_forward_pass_torch", refuse)
+    monkeypatch.setattr("menagerie.tl_validation._legacy_validator", lambda: refuse)
 
     with pytest.raises(RuntimeError, match="observer did not fire"):
         _validation_config_summary(_CNN().eval(), torch.randn(1, 3, 8, 8), "m")

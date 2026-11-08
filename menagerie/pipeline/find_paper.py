@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from menagerie.pipeline import (
-    DataLayout, StoreLayout, bib_harvest, fetch, now, read_json, read_jsonl, write_json,
+    DataLayout, StoreLayout, bib_harvest, fetch, now, read_json, read_json_cached, read_jsonl, write_json,
 )
 from menagerie.pipeline.citecheck import api_titles, norm_title
 from menagerie.pipeline import store as store_mod
@@ -42,6 +42,8 @@ BATCH_SIZE = 15
 TEXT_LIMIT = 2**20
 MAX_CANDIDATES = 8
 MAX_TITLES = 3
+# A module docstring's paper line: ``Paper: "Title", Authors`` or ``Paper: Authors 2020, "Title."``.
+PAPER_LINE = re.compile(r'(?m)^\s*Paper:[^"\n]*"([^"\n]{6,200})"')
 IDENTIFIER = re.compile(
     r"(?:arxiv(?:\.org/(?:abs|pdf)/|\s*:\s*))"
     r"(\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})(?:v\d+)?"
@@ -51,7 +53,7 @@ IDENTIFIER = re.compile(
 def _packets(families: Sequence[str] | None, data: DataLayout) -> list[Packet]:
     paths = ([_packet_path(f, data) for f in dict.fromkeys(families)] if families is not None
              else sorted(data.root.glob("research/*/*.json")))
-    return [read_json(Packet, p) for p in paths]
+    return [read_json_cached(Packet, p) for p in paths]
 
 
 def _packet_path(family: str, data: DataLayout) -> Path:
@@ -123,6 +125,7 @@ def _titles(packet: Packet | None, texts: Sequence[tuple[str, str]]) -> list[str
                 titles.append(value.strip("\"'"))
         titles.extend(re.findall(r'\btitle\s*=\s*[{"]([^\n]+?)[}"]\s*,', text, re.I))
         titles.extend(re.findall(r'"([^"\n]{15,200})"\s*[,\n]\s*(?:arXiv|https?://)', text))
+        titles.extend(t.rstrip(".,") for t in PAPER_LINE.findall(text))
     return list(dict.fromkeys(titles))[:MAX_TITLES]
 
 

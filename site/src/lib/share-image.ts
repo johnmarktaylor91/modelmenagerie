@@ -10,6 +10,7 @@ import { Resvg } from "@resvg/resvg-js";
 import satori from "satori";
 
 import { SHARE_IMAGE_HEIGHT, SHARE_IMAGE_WIDTH } from "@/lib/seo";
+import { SITE_NAME } from "@/lib/site";
 
 /** Inner size of the diagram inset; `scripts/share_crops.mjs` writes crops at exactly this size. */
 export const CROP_WIDTH = 460;
@@ -66,10 +67,7 @@ function el(type: string, style: Record<string, unknown>, children?: unknown, ex
 function layout(card: ShareCard): Node {
   const crop = cropDataUrl(card.crop);
   const text = el("div", { display: "flex", flexDirection: "column", position: "absolute", left: 72, top: 64, width: 560 }, [
-    el("div", { display: "flex", fontFamily: "Source Serif 4", fontSize: 34, fontWeight: 600, color: PAPER.text }, [
-      el("span", { color: PAPER.secondary, marginRight: 10 }, "TorchLens"),
-      el("span", {}, "Model Menagerie"),
-    ]),
+    el("div", { display: "flex", fontFamily: "Source Serif 4", fontSize: 34, fontWeight: 600, color: PAPER.text }, SITE_NAME),
     el(
       "div",
       { display: "flex", marginTop: 72, fontFamily: "Source Serif 4", fontSize: card.headline.length > 28 ? 52 : 64, fontWeight: 600, lineHeight: 1.1, color: PAPER.text },

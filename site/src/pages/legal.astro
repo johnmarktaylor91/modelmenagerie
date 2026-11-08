@@ -8,11 +8,11 @@ const CLOUDFLARE_PRIVACY = "https://www.cloudflare.com/privacypolicy/";
 ---
 
 <BaseLayout
-  title="Privacy and licences"
-  description="What the Model Menagerie records about visits (a cookieless page count), what your browser keeps, the licences of the site and of each model, and how to ask for a correction or removal."
+  title="Privacy and licenses"
+  description="What Model Menagerie records about visits (a cookieless page count), what your browser keeps, the licenses of the site and of each model, and how to ask for a correction or removal."
 >
   <article class="shell legal py-10">
-    <h1 class="text-3xl font-semibold sm:text-4xl">Privacy and licences</h1>
+    <h1 class="text-3xl font-semibold sm:text-4xl">Privacy and licenses</h1>
     <p class="lead mt-4 text-secondary">
       No accounts, no cookies, no advertising: one cookieless page counter, and a few settings your browser keeps for you.
     </p>
@@ -42,17 +42,17 @@ const CLOUDFLARE_PRIVACY = "https://www.cloudflare.com/privacypolicy/";
       <p>These stay in your browser and are never sent anywhere. Clearing the site's data in your browser removes them.</p>
     </section>
 
-    <section aria-labelledby="licences">
-      <h2 id="licences">Licences</h2>
+    <section aria-labelledby="licenses">
+      <h2 id="licenses">Licenses</h2>
       <p>
         The site's text, its diagrams and the dataset are licensed under
         <a class="textlink" href={CONTENT_LICENCE.url} rel="license">{CONTENT_LICENCE.name} ({CONTENT_LICENCE.short})</a>.
-        You may share and adapt them for any purpose, with credit to the {SITE_NAME} and a link to the licence; the
+        You may share and adapt them for any purpose, with credit to the {SITE_NAME} and a link to the license; the
         <a class="textlink" href="/about/#cite">About page</a> has a citation.
       </p>
       <p>
         Each diagram is this site's drawing of a trace of a model's code. It is not the model's code or weights, which keep
-        the licence their authors chose. A model page names that licence and links the source where it is recorded; check
+        the license their authors chose. A model page names that license and links the source where it is recorded; check
         it before you reuse the model itself.
       </p>
       <p>
@@ -65,9 +65,11 @@ const CLOUDFLARE_PRIVACY = "https://www.cloudflare.com/privacypolicy/";
     <section aria-labelledby="contact">
       <h2 id="contact">Corrections and removal</h2>
       <p>
-        To report a wrong diagram or fact, open an issue on the <a class="textlink" href={CONTACT.issues}>TorchLens issues
-        page</a>. To ask for a model, its diagram or its record to be removed, or for anything else you would rather not
-        post in public, email <EmailLink email={CONTACT.email} />.
+        To report a wrong diagram or fact, or to ask for a model, its diagram or its record to be removed,
+        <a class="textlink" href={CONTACT.newIssue}>open an issue</a> on the
+        <a class="textlink" href={CONTACT.issues}>Menagerie's GitHub repository</a>{CONTACT.email ? (
+          <>; for anything you would rather not post in public, email <EmailLink email={CONTACT.email} /></>
+        ) : null}.
       </p>
     </section>
   </article>

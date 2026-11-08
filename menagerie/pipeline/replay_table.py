@@ -79,13 +79,39 @@ def _op_index(state: Mapping[str, Any]) -> dict[str, Any]:
     return indexed
 
 
+class OldSaveError(RuntimeError):
+    """A save from TorchLens 2.37 or earlier, read under a TorchLens that cannot read it."""
+
+
+class BackendSaveError(RuntimeError):
+    """A 3.0 save made by another backend (TensorFlow, JAX), read where that backend is missing."""
+
+
 def _metadata(path: Path) -> dict[str, Any]:
+    """The saved ops by label. A save from TorchLens 2.37 or earlier keeps them in
+    ``metadata.pkl``, which only a TorchLens before 2.38 reads (the ``torchlens<2.38`` reader
+    environment, ``docs/torchlens-boundary.md``); a later save is read through ``tl.load``."""
+
+    if path.is_symlink():
+        raise ValueError("symlinked trace metadata refused")
+    if (path / "metadata.pkl").exists() or (path / "metadata.pkl").is_symlink():
+        return _pickled_metadata(path)
+    return _loaded_metadata(path)
+
+
+def _pickled_metadata(path: Path) -> dict[str, Any]:
     # Slim saves omit tensor blobs. Reuse TorchLens's default-deny metadata reader,
     # including its rename map; never use an unrestricted pickle loader.
-    from torchlens._io.bundle import _prescan_metadata_pickle_opcodes, _RenameAwareUnpickler
+    try:
+        from torchlens._io.bundle import _prescan_metadata_pickle_opcodes, _RenameAwareUnpickler
+    except ImportError as exc:
+        import torchlens as tl
 
+        raise OldSaveError(
+            f"saved by TorchLens 2.37 or earlier; TorchLens {tl.__version__} cannot read it, so "
+            "run the table in the torchlens<2.38 reader environment") from exc
     metadata = path / "metadata.pkl"
-    if metadata.is_symlink() or path.is_symlink():
+    if metadata.is_symlink():
         raise ValueError("symlinked trace metadata refused")
     with os.fdopen(os.open(metadata, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
         size = os.fstat(handle.fileno()).st_size
@@ -97,6 +123,30 @@ def _metadata(path: Path) -> dict[str, Any]:
     if not isinstance(state, Mapping):
         raise TypeError("trace metadata is not a mapping")
     return _op_index(state)
+
+
+def _loaded_metadata(path: Path) -> dict[str, Any]:
+    """A TorchLens 2.38-or-later save (typed records, no pickle) through the public ``tl.load``."""
+
+    import torchlens as tl
+
+    from menagerie import tl_compat
+
+    try:
+        loaded = tl.load(path)
+    except Exception as exc:
+        # TorchLens 3.0 refuses a TensorFlow or JAX save where that framework is not installed
+        # (torch-main); matched by name, the class lives in a private module.
+        if type(exc).__name__ != "BackendRuntimeCompatibilityError":
+            raise
+        raise BackendSaveError(
+            f"saved by another backend; TorchLens {tl.__version__} needs that framework installed, "
+            f"so read it in the recipe's environment (tf, jax): {exc}"[:300]) from exc
+    ops = [{"label": op.label, "func_name": getattr(op, "func_name", None),
+            "type": getattr(op, "type", None), "shape": getattr(op, "shape", None),
+            "parents": [p if isinstance(p, str) else p.label for p in (op.parents or ())]}
+           for op in tl_compat.layer_list(loaded)]
+    return _op_index({"layer_list": ops})
 
 
 def _resolve(index: Mapping[str, Any], label: str) -> Any:

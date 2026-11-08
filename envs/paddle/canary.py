@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import importlib
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the checkout: names that differ by pin
+from menagerie import tl_compat  # noqa: E402
 
 PROMISED = ("paddle", "torch", "torchlens", "numpy", "psutil", "yaml", "pydantic", "jsonschema",
             "referencing", "PIL")
@@ -38,14 +42,15 @@ def main() -> int:
     verdict = state(trace.validate_forward_pass([model(x)], validate_metadata=True))
     fn_trace = tl.trace(lambda v: paddle.nn.functional.relu(v) * 2.0, [x], backend="paddle")
     fn_verdict = state(fn_trace.validate_forward_pass([], validate_metadata=True))
+    mode, fn_mode = (tl_compat.trace_field(t, "module_identity_mode") for t in (trace, fn_trace))
     print(f"canary: python {sys.version.split()[0]}, paddle {paddle.__version__}, torch "
-          f"{torch.__version__}, torchlens {tl.__version__}, {trace.num_ops} ops, module mode "
-          f"{trace.module_identity_mode}, validation {verdict}; function {fn_trace.num_ops} ops, "
-          f"module mode {fn_trace.module_identity_mode}, validation {fn_verdict}")
+          f"{torch.__version__}, torchlens {tl.__version__}, {tl_compat.num_ops(trace)} ops, module mode "
+          f"{mode}, validation {verdict}; function {tl_compat.num_ops(fn_trace)} ops, "
+          f"module mode {fn_mode}, validation {fn_verdict}")
     # At TorchLens 2.35.3 the Paddle coverage oracle fails any op that reads a layer's
     # parameters (functional.linear), so a Layer validates `failed`; the environment and the
     # preview are healthy when the capture runs and a parameter-free function passes.
-    assert trace.num_ops > 0 and fn_verdict == "passed", (verdict, fn_verdict)
+    assert tl_compat.num_ops(trace) > 0 and fn_verdict == "passed", (verdict, fn_verdict)
     return 0
 
 

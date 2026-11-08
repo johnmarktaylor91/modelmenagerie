@@ -9,7 +9,7 @@ requires-python = "==3.11.*"
 dependencies = [
     "mlx[cpu]>=0.26,<0.27,!=0.26.5",
     "torch==2.6.*",
-    "torchlens[mlx]==2.36.0",
+    "torchlens[mlx]==3.0.2",
     # Menagerie's runtime dependencies, so the worker runs here without installing anything.
     "numpy",
     "packaging",

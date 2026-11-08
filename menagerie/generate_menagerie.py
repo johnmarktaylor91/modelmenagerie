@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, ContextManager, Mapping, Sequence
 
 from menagerie.paths import work_dir
+from menagerie import tl_compat
 from menagerie.catalog import CatalogRow, catalog_row_from_payload
 from menagerie.recipe import (
     build_input_for_row,
@@ -512,10 +513,11 @@ def render_one(
                 attempt_model,
                 attempt_input,
                 save=None,
-                capture=tl.options.CaptureOptions(layers_to_save=None, save_rng_states=False, inference_only=True),
+                capture=tl_compat.capture_options(
+                    layers_to_save=None, save_rng_states=False, inference_only=True),
             )
-        graph_shape_hash = str(getattr(trace, "graph_shape_hash", "") or "")
-        n_nodes = len(getattr(trace, "layer_logs", {}) or {})
+        graph_shape_hash = tl_compat.graph_hash(trace, missing_ok=True) or ""
+        n_nodes = len(tl_compat.layers(trace))
         draw_call_kwargs = {
             "vis_save_only": True,
             "show_legend": False,
@@ -523,7 +525,7 @@ def render_one(
             "vis_outpath": str(render_stem),
             "vis_fileformat": file_format,
         }
-        trace.draw(**draw_call_kwargs)
+        tl_compat.draw(trace, **draw_call_kwargs)
         render_path = model_render_path(row, out_dir, file_format)
         if is_featured(row):
             link_featured_copy(row, render_path, out_dir)

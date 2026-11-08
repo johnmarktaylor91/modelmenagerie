@@ -268,8 +268,10 @@ def run_job(repo: Path, host: str, job: str, command: str, *, pull: str = "outpu
     outputs whether it passed or failed. Returns the pulled folder and the job's last status."""
     ref = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
                          capture_output=True, text=True).stdout.strip()
+    # --full: the trim pins every blob any data file names (store_trim._pinned), so it reads the
+    # whole data tree past the registry's sparse_exclude
     subprocess.run(["run-on", "submit", "--admit-wait", "3600", "--project", "menagerie", "--host", host,
-                    "--os", "linux", "--no-fallback", "--ref", ref, "--cpus", "1", "--memory-gib",
+                    "--os", "linux", "--no-fallback", "--full", "--ref", ref, "--cpus", "1", "--memory-gib",
                     str(memory_gib), "--job", job, "--pull", pull, "--", "env",
                     f"MENAGERIE_MEMORY_GB={memory_gib}", "MENAGERIE_CPUS=1", "bash", "-c", command],
                    cwd=repo, check=True, capture_output=True, text=True)
@@ -382,6 +384,32 @@ TRIM_STEPS = ("superseded", "tiles", "portable-rendered", "portable-twin", "pack
 TRIM_CATALOG = "scratch/menagerie/store-trim/catalog"  # on the worker, under $HOME
 TRIM_JOURNAL = "scratch/menagerie/store-trim/journal"  # placement lines, kept until committed
 PLACEMENT = Path("menagerie/data/store-index/placement.jsonl")
+# A lower ceiling target for the next trim, written by the tick's store_pressure step when free disk
+# is under the guard's resume line (decisions.md 2026-11-03); the trim reads it once and removes it.
+CEILING_REQUEST = "ceiling-target.json"  # in the daily run's state folder
+CEILING_REQUEST_MAX_AGE_S = 6 * 3600  # an older request (its trim never ran) no longer applies
+
+
+def request_ceiling(repo: Path, target_gib: float, now: dt.datetime) -> Path:
+    """Ask the next trim to cap the store at ``target_gib`` instead of the ceiling's default."""
+    state = repo / "outputs" / "store-box-daily"
+    state.mkdir(parents=True, exist_ok=True)
+    path = state / CEILING_REQUEST
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"target_gib": target_gib, "at": now.isoformat(timespec="seconds")}))
+    os.replace(tmp, path)
+    return path
+
+
+def requested_ceiling(state: Path, now: dt.datetime) -> float | None:
+    """The fresh ceiling target a store_pressure request names, else None (unreadable is none)."""
+    try:
+        row = json.loads((state / CEILING_REQUEST).read_text())
+        target, at = float(row["target_gib"]), dt.datetime.fromisoformat(row["at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    age = (now - at).total_seconds()
+    return target if 0 <= age <= CEILING_REQUEST_MAX_AGE_S and target > 0 else None
 
 
 BOX_ROOT = f"scratch/menagerie/{JOB}"  # the job root on the worker, under $HOME
@@ -440,12 +468,19 @@ def trim(repo: Path, host: str, stamp: str, ssh: str, state: Path) -> int:
     checkout; every run first and last commits whatever the journals hold (``reconcile``), so a
     failed pull or a timeout never loses a line."""
     last, job = "", f"menagerie-storetrim-{stamp}"
+    ceiling = requested_ceiling(state, dt.datetime.now(dt.timezone.utc))
+    (state / CEILING_REQUEST).unlink(missing_ok=True)  # one trim per request, fresh or not
     try:
         reconcile(repo, ssh, stamp, state)
         count = sync_catalog(repo, ssh, state)
         command = (f"TRIM_HOST={host} TRIM_CATALOG=$HOME/{TRIM_CATALOG} TRIM_JOURNAL=$HOME/{TRIM_JOURNAL} "
-                   f"TRIM_TAG={job} bash menagerie/pipeline/store_trim_job.sh apply {' '.join(TRIM_STEPS)}")
-        _, last = run_job(repo, host, job, command, pull="outputs/*", memory_gib=8, hours=2)
+                   f"TRIM_TAG={job} " + (f"TRIM_CEILING_GIB={ceiling:g} " if ceiling else "")
+                   + f"bash menagerie/pipeline/store_trim_job.sh apply {' '.join(TRIM_STEPS)}")
+        if ceiling:
+            log(f"trim {job}: ceiling target {ceiling:g} GiB (store_pressure request)", state)
+        # 2 GiB: an apply run peaked at 1.04 GiB RSS and a report run at 1.12 (31 Oct 2026); 8 and
+        # 4 waited hours for admission beside the runners and TorchLens jobs
+        _, last = run_job(repo, host, job, command, pull="outputs/*", memory_gib=2, hours=2)
         log(f"trim {job} ({count} catalog manifests): {last}", state)
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         log(f"trim {job} failed before it finished: {exc}", state)
@@ -493,6 +528,8 @@ def commit_placement(repo: Path, texts: list[str], stamp: str, state: Path) -> i
     """Append the placement lines the committed shard does not already hold (each was written
     before its delete, so true even after a failure) and commit that file alone; -1 when
     refused."""
+    from menagerie.pipeline import store
+
     shard = repo / PLACEMENT
     dirty = subprocess.run(["git", "-C", str(repo), "diff", "--quiet", "HEAD", "--", str(PLACEMENT)])
     if dirty.returncode != 0:  # clean, so the file read below is the committed shard
@@ -500,8 +537,8 @@ def commit_placement(repo: Path, texts: list[str], stamp: str, state: Path) -> i
         return -1
     body = shard.read_bytes() if shard.is_file() else b""
     held = set(body.decode("utf-8").splitlines())
-    new = list(dict.fromkeys(line for text in texts for line in text.splitlines()
-                             if line.strip() and line not in held))
+    lines = (store.public_line(line) for text in texts for line in text.splitlines() if line.strip())
+    new = list(dict.fromkeys(line for line in lines if line not in held))
     if not new:
         return 0
     with shard.open("a", encoding="utf-8") as handle:

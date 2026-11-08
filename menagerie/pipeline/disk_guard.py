@@ -15,8 +15,11 @@ guard keeps rung 3 from filling it: ``decide`` is a pure state machine over one 
 - Crawler gets one FACT on each entry to paused, critical or unknown; a restart reads the saved
   state, so it never repeats one. Resuming is a log line only.
 
-The worker side (``claim_ok``) idles ``stage3 serve`` and ``runner serve`` below the pause line
-the runner job was started with (``MENAGERIE_DISK_PAUSE_GIB``); a job without it never idles.
+The worker side (``claim_ok``) idles ``stage3 serve`` and ``runner serve`` below the pause line:
+the one the tick last wrote to the spool's ``LIVE_PAUSE`` file each pass, else the one the runner
+job was started with (``MENAGERIE_DISK_PAUSE_GIB``); a job without that variable never idles. The
+file lets a changed guard line reach running jobs (2026-11-03: the push lowered the line from 62 to
+58, the runners kept 62 and stopped claiming at 61 GiB free for an hour).
 Inside a running attempt, ``attempt_watch`` kills it under ``free_and_floor``'s floor plus a
 margin, or when the attempt's own output passes its cap.
 """
@@ -41,6 +44,7 @@ HELD = {  # what each state holds; everything else (collect, commits, status, ..
     "critical": frozenset({"top_up", "stage3_queue", "runner_submit", "cluster", "drain"}),
 }
 PAUSE_ENV = "MENAGERIE_DISK_PAUSE_GIB"
+LIVE_PAUSE = "disk_pause_gib"  # under a spool: the tick's current pause line, written each pass
 
 
 class GuardConfigError(ValueError):
@@ -235,16 +239,29 @@ def free_and_floor(path: Path | str, *,
     return st.f_bavail * st.f_frsize / GIB, max(config.floor_gib, config.floor_fraction * total)
 
 
-def claim_ok(path: Path | str, *, statvfs: Callable[[str], Any] = os.statvfs) -> bool:
-    """Worker side: may ``stage3 serve`` or ``runner serve`` claim? False below
-    ``MENAGERIE_DISK_PAUSE_GIB``.
+def claim_ok(path: Path | str, *, statvfs: Callable[[str], Any] = os.statvfs,
+             live: Path | str | None = None) -> bool:
+    """Worker side: may ``stage3 serve`` or ``runner serve`` claim? False below the pause line.
 
-    The runner job sets that variable from the tick's effective pause line; without it the
-    worker never idles (jobs started before the guard).
+    The runner job sets ``MENAGERIE_DISK_PAUSE_GIB`` from the tick's effective pause line; without
+    it the worker never idles (jobs started before the guard). With it, ``live`` (the spool's
+    ``LIVE_PAUSE`` file) gives the tick's current line when it reads as a positive number.
     """
 
     pause = os.environ.get(PAUSE_ENV)
     if not pause:
         return True
     st = statvfs(str(path))
-    return st.f_bavail * st.f_frsize / GIB >= float(pause)
+    return st.f_bavail * st.f_frsize / GIB >= (live_pause(live) or float(pause))
+
+
+def live_pause(path: Path | str | None) -> float | None:
+    """The pause line in the tick's ``LIVE_PAUSE`` file, or None when absent or unreadable."""
+
+    if path is None:
+        return None
+    try:
+        value = float(Path(path).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    return value if value > 0 else None

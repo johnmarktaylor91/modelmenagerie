@@ -18,6 +18,7 @@ come from the store by sha (``store.materialize``); nothing in a case folder is 
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -25,6 +26,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,20 +34,37 @@ from menagerie.paths import work_dir
 from menagerie.pipeline import DataLayout, StoreLayout, now, read_json, tree_sha256
 from menagerie.pipeline import admission, bib_harvest, calibration, drive, implement, ledger
 from menagerie.pipeline import store as store_mod
+from menagerie.pipeline.paper_check import CONFIRMED
 from menagerie.pipeline.records import (
     LedgerLine, LedgerRow, ModelRecord, Packet, RecordError, to_dict,
 )
 
 MAIN_ROLES = ("model-design-review", "model-default")  # tried in this order
 THIRD_LAB = "model-review-third-lab-plan"  # Gemini on the subscription, read-only
-REVIEWER_ROLES = (*MAIN_ROLES, THIRD_LAB)
+# Confirm-only seats (decisions.md 2026-10-29): a second review of a provisional fabrication on
+# any lab's rows. Its fabrication confirms the call; any other answer leaves the row waiting.
+# A voting seat (decisions.md 2026-10-30): its answer on a case is the majority of ``votes``
+# lanes of its base role on the same case folders; fabrication needs a strict majority. Its
+# calibration runs are its base role's, ``votes`` per run (``calibration._voted``).
+ENSEMBLES = {"model-judgment-3vote": ("model-judgment", 3)}
+CONFIRM_ROLES = ("model-judgment", "model-judgment-3vote")
+REVIEWER_ROLES = (*MAIN_ROLES, THIRD_LAB, *CONFIRM_ROLES)
 VERDICTS = ("faithful", "minor", "fabrication", "cannot_judge")
 FINDINGS = ("match", "minor", "missing", "invented", "unclear")
 BATCH = 5
 # The lab each seat was calibrated on: its lanes start only there (the lab guard), so a role that
 # routing moves to the other lab is refused and waits rather than reviewing as another seat.
-SEAT_LAB = {"model-design-review": "codex", "model-default": "claude", THIRD_LAB: "antigravity"}
+SEAT_LAB = {"model-design-review": "codex", "model-default": "claude", THIRD_LAB: "antigravity",
+            "model-judgment": "claude", "model-judgment-3vote": "claude"}
 PROVISIONAL = "provisional seat: a second review confirms this fabrication before a repair"
+# What a case folder holds; bump it when the builder adds what reviewers lacked. A
+# ``cannot_judge`` from a lane built at an older version is reviewed again (``drive``). 2: an
+# adapter's imported classics modules are copied beside it (2026-10-29).
+CASE_VERSION = 2
+CASE_NOTE = re.compile(r"; case (\d+)")
+# The source texts a verdict was given against (``source_digest``); a review row carries it as
+# ``; src <digest>`` and is reviewed again once its packet's texts differ (``stale``).
+SOURCE_NOTE = re.compile(r"; src ([0-9a-f]{12})")
 PROMPT = Path(__file__).resolve().parents[2] / "prompts" / "review.md"
 CLASSICS = Path(__file__).resolve().parents[1] / "classics"
 HANDED_OFF = re.compile(r"lane (\S+) handed off to (\S+)")
@@ -196,6 +215,60 @@ def _recipe_rev(model_id: str, data: DataLayout) -> str:
     return model.recipe.rev
 
 
+def _case_version(path: Path) -> int:
+    """The case version a verdict's lane was built at (its launch record); 1 before versions."""
+
+    lane = Path(path).resolve().parent.parent / "lane.json"
+    return int(json.loads(lane.read_text(encoding="utf-8")).get("case", 1)) if lane.is_file() else 1
+
+
+def source_digest(packet: Packet) -> str:
+    """The texts a case copies from its packet (``_model_case``: paper, code and page sources
+    with saved content, held ones left out), as 12 hex digits."""
+
+    held = bib_harvest.held_sources(packet)
+    lines = sorted(f"{s.sid} {s.role} {s.text or s.blob}" for s in packet.sources
+                   if s.role in drive.REVIEW_SOURCES and (s.text or s.blob) and s.sid not in held)
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()[:12]
+
+
+def stale(row: LedgerRow, packet: Packet | None) -> bool:
+    """Whether a review verdict was given against other source texts than its packet holds now
+    (reverted, retired, replaced or added since): its ``src`` digest differs or, for a row from
+    before digests, a source amendment after it names one of the packet's paper, code or page
+    sources. A paper check's confirmation changes no text."""
+
+    if packet is None:
+        return False
+    found = SOURCE_NOTE.search(row.msg or "")
+    if found:
+        return found.group(1) != source_digest(packet)
+    sids = {s.sid for s in packet.sources if s.role in drive.REVIEW_SOURCES}
+    return any(a.at > row.at and a.by != CONFIRMED and sids.intersection(_named(a))
+               for a in packet.amendments)
+
+
+def _named(amendment: Any) -> set[str]:
+    """The sources a sources amendment names: its evidence and its ``sources.<sid>`` fields."""
+
+    fields = [c for c in amendment.changed if c == "sources" or c.startswith("sources.")]
+    return {*amendment.evidence, *(c.split(".", 1)[1] for c in fields if "." in c)} if fields else set()
+
+
+def _case_digest(path: Path, model_id: str) -> str | None:
+    """The source digest a lane's case for ``model_id`` was built with (``sources.json``)."""
+
+    lane = Path(path).resolve().parent.parent / "sources.json"
+    return json.loads(lane.read_text(encoding="utf-8")).get(model_id) if lane.is_file() else None
+
+
+def case_version(row: LedgerRow) -> int:
+    """The case version a review row's verdict was given at (``; case N`` in its msg)."""
+
+    found = CASE_NOTE.search(row.msg or "")
+    return int(found.group(1)) if found else 1
+
+
 def _review_prompt(path: Path) -> str:
     """The prompt hash a verdict was written under: its lane's launch record when the file sits in
     a review lane folder (``<lane>/out/<id>.json``), else the prompt in force. A lane launched
@@ -234,7 +307,10 @@ def record(model_id: str, path: Path, *, data: DataLayout, store: StoreLayout) -
                           f"{prompt} (set {seat['set']}: {seat['state']}, {seat['runs']} runs); "
                           "run `review calibrate` for it first")
     rev = _recipe_rev(model_id, data)
-    msg = f"prompt {prompt}"
+    msg = f"prompt {prompt}; case {_case_version(path)}"
+    digest = _case_digest(path, model_id)
+    if digest:
+        msg = f"{msg}; src {digest}"
     if seat["state"] == "provisional" and review["verdict"] == "fabrication":
         msg = f"{msg}; {PROVISIONAL}"
     blob = store_mod.put(Path(path), store=store, data=data, mime="application/json",
@@ -406,7 +482,7 @@ def _lane_record(folder: Path, run_id: str, role: str, ids: Sequence[str], *,
     (folder / "lane.json").write_text(json.dumps(
         {"run": run_id, "runs": list(runs) or [run_id], "role": role, "harness": harness,
          "ids": list(ids), "at": now(), "prompt": prompt or prompt_version(),
-         **(extra or {})}) + "\n", encoding="utf-8")
+         "case": CASE_VERSION, **(extra or {})}) + "\n", encoding="utf-8")
 
 
 def lane_state(folder: Path) -> tuple[str, str]:
@@ -421,6 +497,65 @@ def lane_state(folder: Path) -> tuple[str, str]:
     return lane["run"], live[0] if live else "TERMINAL"
 
 
+def majority(verdicts: Sequence[str | None]) -> str | None:
+    """A voting seat's call: ``fabrication`` when a strict majority of the votes is, else the
+    commonest other answer (``None`` when no vote answered)."""
+
+    if sum(v == "fabrication" for v in verdicts) * 2 > len(verdicts):
+        return "fabrication"
+    others = [v for v in verdicts if v not in (None, "fabrication")]
+    return max(others, key=others.count) if others else None
+
+
+def _start_votes(role: str, brief: Path, ids: Sequence[str], label: str,
+                 keys: Sequence[str] = (), prompt: str | None = None) -> str:
+    """Start a voting seat's lanes: ``votes`` lanes of its base role, each in ``v<k>/`` over a
+    hard-linked copy of the folder's case folders, its answers tallied on the hub (``_tally``). The first lane leases
+    ``keys``; ``lane.json`` lists every lane, written after each start, and a refusal after the
+    first leaves the votes that started. Returns the first lane's id."""
+
+    base, votes = ENSEMBLES[role]
+    folder, runs = brief.parent, []
+    (folder / "ids.json").write_text(json.dumps(list(ids)) + "\n", encoding="utf-8")
+    for k in range(1, votes + 1):
+        vote = folder / f"v{k}"
+        vote.mkdir(exist_ok=True)
+        if not (vote / "cases").exists():  # hard links: each lane reads only its own folder
+            shutil.copytree(folder / "cases", vote / "cases", copy_function=os.link, symlinks=True)
+        try:
+            runs.append(drive.launch("review", base, _brief(base, vote, ids), keys=keys if k == 1 else (),
+                                     label=f"{label}-v{k}", parent=os.environ.get("FLEET_RUN_ID"),
+                                     lab=SEAT_LAB[role]))
+        except drive.Refused:
+            if not runs:
+                raise
+            break
+        _lane_record(folder, runs[0], role, ids, harness="votes", prompt=prompt, runs=runs)
+    return runs[0]
+
+
+def _tally(folder: Path, role: str) -> None:
+    """Write a voting lane's ``out/<case>.json`` from its votes (``v*/out/<case>.json``) once at
+    least two answered: the majority's call with a vote's findings (a fabrication vote's when it
+    is fabrication) and every vote's verdict under ``votes``."""
+
+    (folder / "out").mkdir(exist_ok=True)
+    for case in json.loads((folder / "ids.json").read_text(encoding="utf-8")):
+        answers = []
+        for path in sorted(folder.glob(f"v*/out/{case}.json")):
+            try:
+                answers.append(check_review(json.loads(path.read_text(encoding="utf-8"))))
+            except (RecordError, ValueError):
+                continue
+        call = majority([a["verdict"] for a in answers])
+        if len(answers) < 2 or call is None:
+            continue
+        chosen = next(a for a in answers if a["verdict"] == call)
+        body = {**chosen, "reviewer": role, "votes": [a["verdict"] for a in answers]}
+        (folder / "out" / f"{case}.json").write_text(json.dumps(body, indent=1) + "\n",
+                                                     encoding="utf-8")
+
+
 def _start(role: str, brief: Path, ids: Sequence[str], label: str,
            keys: Sequence[str] | None = None, prompt: str | None = None) -> str:
     """Start a review lane on ``ids`` (leasing ``keys``, by default the ids) and write its launch
@@ -430,6 +565,8 @@ def _start(role: str, brief: Path, ids: Sequence[str], label: str,
     keys = tuple(ids if keys is None else keys)
     if role == THIRD_LAB:
         return _start_agy(role, brief, ids, label, keys=keys, prompt=prompt)
+    if role in ENSEMBLES:
+        return _start_votes(role, brief, ids, label, keys=keys, prompt=prompt)
     (brief.parent / "ids.json").write_text(json.dumps(list(ids)) + "\n", encoding="utf-8")
     run_id = drive.launch("review", role, brief, keys=keys, label=label,
                           parent=os.environ.get("FLEET_RUN_ID"), lab=SEAT_LAB.get(role))
@@ -444,11 +581,32 @@ def _ours(model: ModelRecord, dest: Path, data: DataLayout) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     if recipe.kind == "adapter":
         shutil.copyfile(data.root / recipe.adapter, dest / Path(recipe.adapter).name)
+        _copy_classics(dest / Path(recipe.adapter).name, dest)
     elif recipe.kind == "classic":  # "menagerie.classics.<module>:<builder>"
         module = (recipe.adapter or "").partition(":")[0].rsplit(".", 1)[-1]
         shutil.copyfile(CLASSICS / f"{module}.py", dest / f"{module}.py")
     (dest / "recipe.json").write_text(json.dumps(to_dict(recipe), indent=1) + "\n",
                                       encoding="utf-8")
+
+
+CLASSIC_IMPORT = re.compile(r"menagerie\.classics(?:\.(\w+)|\s+import\s+([\w, ()]+))")
+
+
+def _copy_classics(code: Path, dest: Path) -> None:
+    """Copy the classics modules ``code`` imports (and theirs) beside it: an adapter that builds
+    its model from a classic is judged by that module, which the reviewer must see."""
+
+    todo, seen = [code], set()
+    while todo:
+        text = todo.pop().read_text(encoding="utf-8", errors="replace")
+        for dotted, listed in CLASSIC_IMPORT.findall(text):
+            for name in [dotted] if dotted else re.findall(r"\w+", listed):
+                src = CLASSICS / f"{name}.py"
+                if name in seen or not src.is_file():
+                    continue
+                seen.add(name)
+                shutil.copyfile(src, dest / src.name)
+                todo.append(dest / src.name)
 
 
 def _member(model_id: str, packet: dict[str, Any], dest: Path) -> None:
@@ -469,12 +627,14 @@ def _last_forward(model_id: str, rows: Sequence[LedgerLine]) -> dict[str, Any] |
 
 
 def _model_case(model_id: str, folder: Path, data: DataLayout, store: StoreLayout,
-                rows: Sequence[LedgerLine]) -> None:
-    """One model's case folder: the packet's saved sources, our code and its run result."""
+                rows: Sequence[LedgerLine]) -> str:
+    """One model's case folder: the packet's saved sources, our code and its run result.
+    Returns: the digest of the sources it copied (``source_digest``)."""
 
     model = read_json(ModelRecord, data.model(model_id))
     packet = json.loads(data.packet(model.family).read_text(encoding="utf-8"))
-    held = bib_harvest.held_sources(read_json(Packet, data.packet(model.family)))
+    typed = read_json(Packet, data.packet(model.family))
+    held = bib_harvest.held_sources(typed)
     for src in packet.get("sources", []):
         if src["sid"] in held:  # a paper link waiting for its spot check
             continue
@@ -487,6 +647,7 @@ def _model_case(model_id: str, folder: Path, data: DataLayout, store: StoreLayou
     run = _last_forward(model_id, rows)
     if run:
         (folder / "run.json").write_text(json.dumps(run, indent=1) + "\n", encoding="utf-8")
+    return source_digest(typed)
 
 
 def _events() -> list[tuple[str, dict[str, Any]]]:
@@ -534,8 +695,8 @@ def launch(ids: Sequence[str], *, data: DataLayout,
             label = f"review-{batch[0]}-{len(batch)}"
             folder = work_root() / "lanes" / f"{label}-{now().replace(':', '')}"
             try:
-                for model_id in batch:
-                    _model_case(model_id, folder / "cases" / model_id, data, store, rows)
+                digests = {m: _model_case(m, folder / "cases" / m, data, store, rows) for m in batch}
+                (folder / "sources.json").write_text(json.dumps(digests) + "\n", encoding="utf-8")
             except (ReviewError, RecordError, OSError):  # leave no half-built lane folder
                 calibration._clear(folder)
                 raise
@@ -543,9 +704,14 @@ def launch(ids: Sequence[str], *, data: DataLayout,
             wrapper = implement.lane_wrapper(folder, data=data, comment="this review lane")
             note = (f"Then run `{wrapper} review record <case> {folder}/out/<case>.json` for "
                     "each case and fix any refusal.")
-            if role == THIRD_LAB:  # read-only: its answers are recorded from the hub
+            if role == THIRD_LAB or role in ENSEMBLES:  # its answers are recorded from the hub
                 note = ""
-            runs.append(_start(role, _brief(role, folder, batch, note), batch, label))
+            try:
+                runs.append(_start(role, _brief(role, folder, batch, note), batch, label))
+            except drive.Refused:
+                if not (folder / "lane.json").is_file():  # nothing started: leave no folder
+                    calibration._clear(folder)
+                raise
     return runs
 
 
@@ -596,7 +762,7 @@ def calibrate_all(*, data: DataLayout, runs: int | None = None) -> dict[str, Any
         except drive.Refused as refused:
             seats[role] = {**refused.result, "role": role, "state": "refused"}
     prompt = prompt_version()
-    non_codex = [r for r in REVIEWER_ROLES if SEAT_LAB[r] != "codex"
+    non_codex = [r for r in REVIEWER_ROLES if SEAT_LAB[r] != "codex" and r not in CONFIRM_ROLES
                  and calibration.counts(r, prompt, data=data)]
     return {"prompt": prompt, "set": calibration.set_id(calibration.cases(data)), "at": now(),
             "seats": seats, "non_codex": non_codex}
@@ -620,7 +786,7 @@ def seats(data: DataLayout) -> dict[str, str]:
 
     prompt = prompt_version()
     return {role: calibration.standing(role, prompt, data=data)["state"]
-            for role in (*MAIN_ROLES, *_third_lab())}
+            for role in (*MAIN_ROLES, *_third_lab(), *CONFIRM_ROLES)}
 
 
 def _recorded(rows: Sequence[LedgerLine]) -> set[tuple[str, str]]:
@@ -649,6 +815,9 @@ def settle(*, data: DataLayout, store: StoreLayout) -> dict[str, Any]:
         if lane_state(folder)[1] != "TERMINAL":
             out["live"] += 1
             continue
+        lane = json.loads(lane_file.read_text(encoding="utf-8"))
+        if lane.get("harness") == "votes":
+            _tally(folder, lane["role"])
         mine: dict[str, Any] = {}
         for path in sorted((folder / "out").glob("*.json")):
             if (path.stem, tree_sha256(path)) in recorded:
@@ -710,17 +879,32 @@ def _reviewers(families: Sequence[str], data: DataLayout) -> dict[str, str | Non
     return out
 
 
-def _taken_up() -> set[str]:
-    """Ids a review lane took up in the last ``RETRY_AFTER_S`` (its case folder's age)."""
+def _taken_up(data: DataLayout) -> set[str]:
+    """Ids a review lane took up in the last ``RETRY_AFTER_S`` (its case folder's age) and has
+    not answered: a review row recorded since the case was built frees the id at once, so a row
+    sent back (a stale verdict, a second seat's turn) is not held a day. A folder with no
+    ``lane.json`` holds nothing: its launch was refused, and from 2 Nov 2026 such refused batches
+    (5 rows a pass) held 226 of the 231 rows at review for a day each."""
 
-    root, stamp, found = work_root() / "lanes", time.time(), set()
+    root, stamp, built = work_root() / "lanes", time.time(), {}
     for case in root.glob("review-*/cases/*") if root.is_dir() else ():
+        if not (case.parent.parent / "lane.json").is_file():
+            continue  # no lane started on it (refused at launch): it holds nothing
         try:
-            if stamp - case.stat().st_mtime < RETRY_AFTER_S:
-                found.add(case.name)
+            mtime = case.stat().st_mtime
         except FileNotFoundError:
             continue
-    return found
+        if stamp - mtime < RETRY_AFTER_S:
+            built[case.name] = max(mtime, built.get(case.name, 0.0))
+    if not built:
+        return set()
+    answered = {r.id for r in ledger.read_all(data=data) if isinstance(r, LedgerRow)
+                and r.stage == "review" and r.id in built and _epoch(r.at) >= built[r.id]}
+    return set(built) - answered
+
+
+def _epoch(at: str) -> float:
+    return datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp()
 
 
 def plan(ids: Sequence[str], *, data: DataLayout,
@@ -730,7 +914,7 @@ def plan(ids: Sequence[str], *, data: DataLayout,
     ``unlooked`` past this pass's lookups, ``second``: a provisional fabrication waiting for a
     seat other than the one that made it)."""
 
-    taken = _taken_up()
+    taken = _taken_up(data)
     want = [i for i in ids if i not in held and i not in taken]
     records = {i: read_json(ModelRecord, data.model(i)) for i in want}
     family = {i: r.family for i, r in records.items()}
@@ -759,42 +943,51 @@ def plan(ids: Sequence[str], *, data: DataLayout,
     return sorted(batches, key=lambda b: len(b[1]), reverse=True), left
 
 
-def _awaiting_second(records: dict[str, ModelRecord], data: DataLayout) -> dict[str, str]:
+def _awaiting_second(records: dict[str, ModelRecord], data: DataLayout) -> dict[str, frozenset[str]]:
     """Rows whose only fabrication verdicts at the current recipe came from one provisional
-    seat, mapped to that seat (``drive._confirmed`` wants a second, different seat)."""
+    seat, mapped to every seat that reviewed them there (``drive._confirmed`` wants a fabrication
+    from a different seat; a seat that already answered is not asked again). A verdict given
+    against texts its packet no longer holds (``stale``) is not counted."""
 
     if not records:
         return {}
-    seats: dict[str, set[str | None]] = {}
+    fabs: dict[str, set[str | None]] = {}
+    seen: dict[str, set[str]] = {}
+    packets = {f: read_json(Packet, data.packet(f)) for f in {r.family for r in records.values()}
+               if data.packet(f).is_file()}
     for row in ledger.read_all(data=data):
         if not (isinstance(row, LedgerRow) and row.stage == "review" and row.outcome != "infra"
-                and row.verdict == "fabrication" and row.id in records):
+                and row.id in records) or stale(row, packets.get(records[row.id].family)):
             continue
         recipe = records[row.id].recipe
-        if recipe is not None and row.recipe_rev == recipe.rev:
-            seats.setdefault(row.id, set()).add(row.reviewer if needs_second_review(row) else None)
-    return {i: next(iter(s)) for i, s in seats.items() if len(s) == 1 and None not in s}
+        if recipe is None or row.recipe_rev != recipe.rev:
+            continue
+        seen.setdefault(row.id, set()).add(str(row.reviewer))
+        if row.verdict == "fabrication":
+            fabs.setdefault(row.id, set()).add(row.reviewer if needs_second_review(row) else None)
+    return {i: frozenset(seen[i]) for i, s in fabs.items() if len(s) == 1 and None not in s}
 
 
-def _other_seat_counts(first: str, data: DataLayout) -> bool:
+def _other_seat_counts(seen: frozenset[str], data: DataLayout) -> bool:
     prompt = prompt_version()
-    return any(r != first and calibration.counts(r, prompt, data=data) for r in REVIEWER_ROLES)
+    return any(r not in seen and calibration.counts(r, prompt, data=data) for r in REVIEWER_ROLES)
 
 
-def _second_seat(first: str, author: str | None, data: DataLayout) -> str | None:
-    """A calibrated seat other than ``first`` that may review a row whose family ``author``
-    built (``None``: a June classic, any other seat), or ``None`` while there is none."""
+def _second_seat(seen: frozenset[str], author: str | None, data: DataLayout) -> str | None:
+    """A calibrated seat that has not reviewed the row yet: another lab's seat for the family
+    ``author`` built (``None``: a June classic, any such seat), else a confirm-only seat."""
 
-    if not _other_seat_counts(first, data):
+    if not _other_seat_counts(seen, data):
         return None
+    prompt = prompt_version()
     try:
         if author:
-            return pick_reviewer(author, data=data, exclude=frozenset({first}))
-        prompt = prompt_version()
+            return pick_reviewer(author, data=data, exclude=seen)
         return next(r for r in (*MAIN_ROLES, *_third_lab())
-                    if r != first and calibration.counts(r, prompt, data=data))
+                    if r not in seen and calibration.counts(r, prompt, data=data))
     except (ReviewError, StopIteration):
-        return None
+        return next((r for r in CONFIRM_ROLES
+                     if r not in seen and calibration.counts(r, prompt, data=data)), None)
 
 
 def _calibrate(standing: dict[str, str], data: DataLayout) -> dict[str, str]:
@@ -830,10 +1023,12 @@ def stage(ids: Sequence[str], *, data: DataLayout, room: int, held: set[str],
         out["held"] = f"no reviewer seat counts at prompt {out['prompt']}"
         return out
     batches, out["left"] = plan(ids, data=data, held=held) if room > 0 else ([], {})
-    out["launched"], started = [], 0
+    out["launched"], started, refused_roles = [], 0, set()
     for role, batch in batches:
         if started >= room:
             break
+        if role in refused_roles:  # one refused seat does not hold the other seats' batches
+            continue
         if dry_run:
             out["launched"].append([role, batch])
             started += 1
@@ -843,7 +1038,7 @@ def stage(ids: Sequence[str], *, data: DataLayout, room: int, held: set[str],
             started += 1
         except drive.Refused as refused:
             out["refused"] = str(refused)[:200]
-            break
+            refused_roles.add(role)
         except (ReviewError, RecordError, OSError) as error:  # one bad case skips its batch only
             out.setdefault("failed", []).append({"ids": list(batch), "error": str(error)[:200]})
     return out

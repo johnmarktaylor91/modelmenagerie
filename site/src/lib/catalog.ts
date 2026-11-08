@@ -1,13 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { assetRefHref } from "@/lib/assets";
+import { getListingFeatured } from "@/lib/featured-select";
 import { hasUsablePreview } from "@/lib/preview";
+import { hasPage, isListedByDefault } from "@/lib/shown";
+import { DISPLAY_NAMES } from "@/lib/featured";
+import { canonicalFamily, cleanModelName } from "@/lib/display-names";
 import type { AssetRef, Funnel, Manifest, ModelRecord, ModelVariant } from "@/types/record";
 export { HEAVY_SVG_BYTES, MIN_PREVIEW_THUMB_BYTES, hasUsablePreview, isHeavyVariant } from "@/lib/preview";
 
 const siteDataRoot = path.join(process.cwd(), "site-data");
 const modelsJsonlPath = path.join(siteDataRoot, "models.jsonl");
-const publicR2Base = (import.meta.env.PUBLIC_R2_BASE as string | undefined)?.replace(/\/+$/, "") ?? "";
 
 let catalogModels: ModelRecord[] | null = null;
 let catalogBySlug: Map<string, ModelRecord> | null = null;
@@ -16,7 +20,7 @@ let categoryNeighbours: Map<string, { prev: ModelRecord | null; next: ModelRecor
 let catalogFacets: CatalogIndex["facets"] | null = null;
 let diagramShares: Map<string, { count: number; families: number }> | null = null;
 let listingOrder: ModelRecord[] | null = null;
-let diagramFocus: Map<string, number> | null = null;
+let diagramFocus: { x: Map<string, number>; y: Map<string, number> } | null = null;
 
 /** A diagram shared by models from at least this many families is a stand-in, not the model's own graph. */
 export const STAND_IN_MIN_FAMILIES = 10;
@@ -70,18 +74,9 @@ export function assertFixtureReady(): void {
 }
 
 /** Return the asset basename used as the R2 object key. */
-function assetKey(ref: AssetRef): string {
-  const key = ref.url.split("/").filter(Boolean).pop();
-  if (!key) {
-    throw new Error(`Asset reference has no key: ${ref.url}`);
-  }
-  return key;
-}
-
-/** Return a build-time public URL for a content-addressed asset. */
+/** Return a build-time public URL for a content-addressed asset (`lib/assets.ts`). */
 function publicAssetUrl(ref: AssetRef): string {
-  const key = assetKey(ref);
-  return publicR2Base ? `${publicR2Base}/${key}` : `/assets/${key}`;
+  return assetRefHref(ref.url);
 }
 
 /** Return an asset reference with its URL rewritten for public delivery. */
@@ -121,7 +116,23 @@ export function withPublicModelAssetUrls(model: ModelRecord): ModelRecord {
   };
 }
 
-/** Load all model records from committed JSON Lines data once. */
+/**
+ * Apply a cleaner display name: one from `featured.ts` (a package identifier such as "googlenet"
+ * becomes "GoogLeNet"), else a "zoo:name" identifier written out (`cleanModelName`), keeping the
+ * catalog's own name as `source_name` for the page's Details. The family is folded too
+ * (`canonicalFamily`), so a family the export spells two ways is listed once.
+ */
+function withDisplayName(model: ModelRecord): ModelRecord {
+  const name = DISPLAY_NAMES[model.slug] ?? cleanModelName(model.display_name);
+  const family = canonicalFamily(model.family_normalized);
+  const named = name && name !== model.display_name ? { ...model, display_name: name, source_name: model.display_name } : model;
+  return family === model.family_normalized ? named : { ...named, family_normalized: family };
+}
+
+/**
+ * Load the records that get a page (see `lib/shown.ts`) from committed JSON Lines data once.
+ * Hidden records (fabricated, not the model's own diagram, not passed) never reach a page.
+ */
 function loadCatalogModels(): ModelRecord[] {
   assertFixtureReady();
   if (catalogModels === null) {
@@ -129,7 +140,10 @@ function loadCatalogModels(): ModelRecord[] {
       .readFileSync(modelsJsonlPath, "utf-8")
       .split("\n")
       .filter(Boolean)
-      .map((line) => withPublicModelAssetUrls(JSON.parse(line) as ModelRecord));
+      .map((line) => JSON.parse(line) as ModelRecord)
+      .filter(hasPage)
+      .map(withPublicModelAssetUrls)
+      .map(withDisplayName);
   }
   return catalogModels;
 }
@@ -161,9 +175,14 @@ export function getModelBySlug(slug: string): ModelRecord {
   return model;
 }
 
-/** Load the complete catalog for aggregate pages and search bootstrap data. */
+/** Every record with a page (validated and structure-only), for pages and the search index. */
 export function getAllModels(): ModelRecord[] {
   return loadCatalogModels();
+}
+
+/** The validated records: the default listing, home panels and counts of what is shown. */
+export function getShownModels(): ModelRecord[] {
+  return loadCatalogModels().filter(isListedByDefault);
 }
 
 /** Load funnel counts. */
@@ -260,33 +279,50 @@ function loadDiagramShares(): Map<string, { count: number; families: number }> {
 
 /**
  * Return how many catalog entries share this variant's exact diagram when it is a stand-in
- * (the same graph drawn for models from many unrelated families), else 0.
+ * (the same graph drawn for models from many unrelated families), else 0. A record that says
+ * whether the diagram is its own (`own_diagram`) is believed; the share count is the fallback.
  */
-export function getStandInShareCount(variant: ModelVariant | null): number {
-  if (!variant) {
+export function getStandInShareCount(variant: ModelVariant | null, model?: Pick<ModelRecord, "own_diagram">): number {
+  if (!variant || model?.own_diagram === true) {
     return 0;
   }
   const share = loadDiagramShares().get(variant.svg.sha256);
   return share && share.families >= STAND_IN_MIN_FAMILIES ? share.count : 0;
 }
 
-/** True when a model's card shows its own picture: a usable thumbnail that is not a stand-in. */
+/**
+ * True when a model's card shows its own picture: a top crop when the export has one, else a
+ * thumbnail above the near-blank size; never a stand-in diagram.
+ */
 export function hasCardPreview(model: ModelRecord): boolean {
   if (model.own_diagram === false) {
     return false;
   }
   const variant = findDefaultVariant(model);
-  return variant !== null && getStandInShareCount(variant) === 0 && (Boolean(variant.thumb_crop) || hasUsablePreview(variant.thumb.bytes));
+  return variant !== null && getStandInShareCount(variant, model) === 0 && (Boolean(variant.thumb_crop) || hasUsablePreview(variant.thumb.bytes));
+}
+
+/** The featured models' slugs in the order the browse page opens on (see `getListingFeatured`). */
+export function getListingFeaturedSlugs(): string[] {
+  return getListingFeatured(getShownModels()).map((model) => model.slug);
 }
 
 /**
- * The default listing order: models with a picture first, each group in catalog (name) order.
- * The listing's "Pictures first" sort reproduces it in the browser from the index.
+ * The default listing order: validated models only; the featured list first, then those with a
+ * picture, then the rest, each group in catalog (name) order. The listing's "Featured first" sort
+ * reproduces it in the browser.
  */
 export function getListingOrder(): ModelRecord[] {
   if (listingOrder === null) {
-    const models = loadCatalogModels();
-    listingOrder = [...models.filter(hasCardPreview), ...models.filter((model) => !hasCardPreview(model))];
+    const models = getShownModels();
+    const featured = getListingFeaturedSlugs();
+    const rank = new Map(featured.map((slug, position) => [slug, position]));
+    const rest = models.filter((model) => !rank.has(model.slug));
+    listingOrder = [
+      ...models.filter((model) => rank.has(model.slug)).sort((a, b) => (rank.get(a.slug) ?? 0) - (rank.get(b.slug) ?? 0)),
+      ...rest.filter(hasCardPreview),
+      ...rest.filter((model) => !hasCardPreview(model)),
+    ];
   }
   return listingOrder;
 }
@@ -296,12 +332,26 @@ export function getListingOrder(): ModelRecord[] {
  * or null when the viewer should centre it. A missing focus file means every diagram is centred.
  */
 export function getDiagramFocus(variant: ModelVariant): number | null {
+  return loadDiagramFocus().x.get(variant.svg.sha256) ?? null;
+}
+
+/**
+ * Where the readable view of a wide diagram starts down the page, as a fraction of its height, when
+ * the top of its opening window is blank paper (version 2 of the focus file); null opens at the top.
+ */
+export function getDiagramFocusY(variant: ModelVariant): number | null {
+  return loadDiagramFocus().y.get(variant.svg.sha256) ?? null;
+}
+
+function loadDiagramFocus(): { x: Map<string, number>; y: Map<string, number> } {
   if (diagramFocus === null) {
     const file = path.join(getExportRoot(), "diagram_focus.json");
-    const data = fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf-8")) as { focus?: Record<string, number> }) : {};
-    diagramFocus = new Map(Object.entries(data.focus ?? {}));
+    const data = fs.existsSync(file)
+      ? (JSON.parse(fs.readFileSync(file, "utf-8")) as { focus?: Record<string, number>; focus_y?: Record<string, number> })
+      : {};
+    diagramFocus = { x: new Map(Object.entries(data.focus ?? {})), y: new Map(Object.entries(data.focus_y ?? {})) };
   }
-  return diagramFocus.get(variant.svg.sha256) ?? null;
+  return diagramFocus;
 }
 
 /** Plain-word label for a diagram variant, for example "Unrolled, all layers". */
@@ -314,7 +364,7 @@ export function variantLabel(variant: ModelVariant): string {
 /** Format large integers compactly for UI metadata. */
 export function formatCount(value: number | null): string {
   if (value === null) {
-    return "unknown";
+    return "";
   }
   return new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -32,6 +32,14 @@ class Ops:
     fresh_dead: bool = False
     fed: set[str] = field(default_factory=set)  # runners whose queue refills: busy unless drained
     drained: dict[str, bool] = field(default_factory=dict)
+    requeued: list[str] = field(default_factory=list)
+    collecting_now: set[str] = field(default_factory=set)
+
+    def requeue(self, runner: runner_job.Runner) -> None:
+        self.requeued.append(runner.name)
+
+    def collecting(self, runner: runner_job.Runner) -> bool:
+        return runner.name in self.collecting_now
 
     def job_state(self, job: str) -> str:
         return self.states.get(job, "MISSING")
@@ -159,6 +167,43 @@ def test_g_replaces_b_at_night_and_b_returns_in_the_morning(policy: dict[str, An
     for _ in range(3):
         run(ops, state, 6)  # morning: G drains and stops, and B comes back
     assert state["runners"]["G"]["cancelled"] and ops.submitted[-1].name == "B"
+    assert state["runners"]["B"]["restarts"] == []  # the tick's own give-way is no restart
+
+
+def test_b_morning_start_during_g_drain_runs_three_workers(policy: dict[str, Any]) -> None:
+    policy["g_replaces_b"] = True
+    ops, state = Ops(), {}
+    for _ in range(5):
+        run(ops, state, 22)
+    assert state["runners"]["B"]["cancelled_for"] == "g"
+    ops.busy.add("G")
+    run(ops, state, 6)  # G still drains its row: B returns at its night size
+    b = ops.submitted[-1]
+    assert (b.name, b.workers, b.cpus, b.memory_gib) == ("B", 3, 3, 16)
+
+
+def test_a_give_way_drain_ends_at_its_deadline_unless_the_spool_is_collected(policy: dict[str, Any]) -> None:
+    policy["g_replaces_b"] = True
+    ops, state = Ops(), {}
+    ops.busy.add("B")  # one row's long renders: B never idles on its own
+
+    def at(minutes: int) -> dict[str, Any]:
+        now = clock(22) + timedelta(minutes=minutes)
+        result = runner_job.ensure(ops=ops, state=state, mode="full", demand={"2b": 20}, now=now)
+        state["runners"] = {r["runner"]: r["record"] for r in result}
+        return next(r for r in result if r["runner"] == "B")
+
+    assert "draining" in at(0)["detail"] and ops.drained["B"] is True
+    assert state["runners"]["B"]["drain_since"].startswith("2026-10-09T22:00")
+    assert "draining" in at(10)["detail"] and "b" not in ops.cancelled
+    assert state["runners"]["B"]["drain_since"].startswith("2026-10-09T22:00")  # kept, not restarted
+    ops.collecting_now.add("B")
+    assert "waits for the spool's collect" in at(16)["detail"] and "b" not in ops.cancelled
+    ops.collecting_now.clear()
+    b = at(20)
+    assert "15-minute drain" in b["detail"] and ops.cancelled.count("b") == 1 and ops.requeued == ["B"]
+    record = state["runners"]["B"]
+    assert record["cancelled_for"] == "g" and record["drain_since"] is None and record["restarts"] == []
 
 
 def test_g_replaces_b_only_while_big_rows_wait(policy: dict[str, Any]) -> None:
@@ -572,3 +617,162 @@ def test_g_drains_when_its_rows_run_out_before_morning(policy: dict[str, Any]) -
     for _ in range(3):
         run(ops, state, 23)
     assert ops.submitted[-1].name == "A" and ops.submitted[-1].memory_gib == 76
+
+
+
+@dataclass
+class FullOps(Ops):
+    """Other projects' claims on the worker (TorchLens benchmarks, 30 Oct): G never fits beside a
+    running B, and while ``g_room`` is false it fits nowhere, even in B's room."""
+
+    g_room: bool = True
+    probes: list[tuple[str, str | None]] = field(default_factory=list)
+
+    def probe(self, runner: runner_job.Runner, replacing: str | None) -> tuple[int, str]:
+        self.probes.append((runner.name, replacing))
+        b_runs = any(self.states.get(j) == "RUNNING" for j, n in self.spools.items() if n == "B")
+        if runner.name == "G" and not (self.g_room and (replacing or not b_runs)):
+            return runner_job.PROBE_REFUSED, "NO_CAPACITY: trace-host: Worker budget refused"
+        return runner_job.PROBE_ADMIT, ""
+
+
+def night_pass(ops: Ops, state: dict[str, Any], minutes: int) -> dict[str, dict[str, Any]]:
+    """One pass ``minutes`` after 10 PM; each runner's summary by name."""
+
+    result = runner_job.ensure(ops=ops, state=state, mode="full", demand={"2b": 20},
+                               now=clock(22) + timedelta(minutes=minutes))
+    state["runners"] = {r["runner"]: r["record"] for r in result}
+    ops.check_share()
+    return {r["runner"]: r for r in result}
+
+
+def small_night_layout() -> tuple[FullOps, dict[str, Any]]:
+    """A and B already at their night sizes, as after the 10 PM shrink."""
+
+    ops = FullOps(sizes={"a": (3, 20), "b": (3, 16)})
+    state = {"runners": {"A": runner_job.Record(job="a", size=0).to_mapping(),
+                         "B": runner_job.Record(job="b", size=0).to_mapping()}}
+    return ops, state
+
+
+def b_jobs(ops: Ops) -> list[str]:
+    return [j for j in ops.cancelled if ops.spools[j] == "B"]
+
+
+def test_b_keeps_running_while_g_fits_nowhere_and_gives_way_once_it_would(policy: dict[str, Any]) -> None:
+    policy["g_replaces_b"] = True
+    ops, state = small_night_layout()
+    ops.g_room = False
+    for minutes in range(0, 60, 5):
+        passed = night_pass(ops, state, minutes)
+    assert not b_jobs(ops) and not ops.drained.get("B")
+    assert not any(r.name == "G" for r in ops.submitted)
+    assert "B stays: run-on probe for G in B's room refused" in passed["B"]["detail"]
+    assert passed["G"]["action"] == "held-capacity"  # G keeps trying beside B on its own
+    assert ("G", "b") in ops.probes  # asked with B's job counted as ended
+    ops.g_room = True  # the other project's job ended
+    night_pass(ops, state, 60)
+    assert b_jobs(ops) == ["b"] and state["runners"]["B"]["cancelled_for"] == "g"
+    for minutes in (65, 70):
+        passed = night_pass(ops, state, minutes)
+    assert passed["B"]["action"] == "off" and ops.submitted[-1].name == "G"
+
+
+def test_a_give_way_that_ends_in_a_refused_g_brings_b_back_next_pass_and_waits_an_hour(
+        policy: dict[str, Any]) -> None:
+    policy["g_replaces_b"] = True
+    ops, state = small_night_layout()
+    night_pass(ops, state, 0)  # G fits in B's room: B gives way
+    assert b_jobs(ops) == ["b"]
+    ops.g_room = False  # another project's job takes the room before G starts
+    passed = night_pass(ops, state, 5)
+    assert passed["G"]["action"] == "held-capacity" and "B returns next pass" in passed["B"]["detail"]
+    night_pass(ops, state, 10)  # B back at its night size; a planned stop, no restart
+    b = ops.submitted[-1]
+    assert (b.name, b.cpus, b.memory_gib) == ("B", 3, 16)
+    assert state["runners"]["B"]["restarts"] == [] and state["runners"]["B"]["give_way_at"] is None
+    ops.g_room = True  # room in B's room again, but within the hour of the refusal
+    for minutes in (15, 30, 60):
+        passed = night_pass(ops, state, minutes)
+        assert "next give-way try after" in passed["B"]["detail"]
+        assert passed["G"]["action"] in ("held-capacity", "held-big")  # G keeps trying beside B
+    assert b_jobs(ops) == ["b"] and not ops.drained.get("B")
+    night_pass(ops, state, 66)  # the hour is up and G fits in B's room: B gives way again
+    assert len(b_jobs(ops)) == 2 and state["runners"]["B"]["cancelled_for"] == "g"
+
+
+def test_a_refused_probe_while_b_drains_lifts_the_drain_and_waits_an_hour(policy: dict[str, Any]) -> None:
+    policy["g_replaces_b"] = True
+    ops, state = small_night_layout()
+    ops.busy.add("B")
+    night_pass(ops, state, 0)
+    assert ops.drained["B"] is True and state["runners"]["B"]["give_way_at"]
+    ops.g_room = False
+    passed = night_pass(ops, state, 5)
+    assert ops.drained["B"] is False and not b_jobs(ops)
+    assert "B stays" in passed["B"]["detail"] and state["runners"]["B"]["give_way_failed_at"]
+    ops.g_room = True
+    night_pass(ops, state, 30)
+    assert ops.drained["B"] is False  # within the hour of the failed give-way
+    night_pass(ops, state, 66)
+    assert ops.drained["B"] is True and not b_jobs(ops)
+
+
+def test_a_g_that_cannot_restart_ends_the_give_way(policy: dict[str, Any]) -> None:
+    policy["g_replaces_b"] = True
+    ops, state = small_night_layout()
+    ops.states["g-old"], ops.spools["g-old"] = "FAILED", "G"
+    today = clock(22).date().isoformat()
+    state["runners"]["G"] = runner_job.Record(
+        job="g-old", restarts=tuple(f"{today}T0{h}:00:00-07:00" for h in (1, 2, 3))).to_mapping()
+    night_pass(ops, state, 0)
+    passed = night_pass(ops, state, 5)
+    assert passed["G"]["action"] == "escalate" and "B returns next pass" in passed["B"]["detail"]
+    night_pass(ops, state, 10)
+    assert ops.submitted[-1].name == "B"
+
+
+@dataclass
+class GrowOps(Ops):
+    """Runner A wants to grow; run-on admits its larger size only while ``a_room``."""
+
+    a_room: bool = False
+    published: list[tuple[str, float]] = field(default_factory=list)
+
+    def probe(self, runner: runner_job.Runner, replacing: str | None) -> tuple[int, str]:
+        if runner.name == "A" and not self.a_room:
+            return runner_job.PROBE_REFUSED, "NO_CAPACITY: trace-host: Worker budget refused"
+        return runner_job.PROBE_ADMIT, ""
+
+    def publish_pause(self, runner: runner_job.Runner, gib: float) -> None:
+        self.published.append((runner.name, gib))
+
+
+def test_a_records_its_refused_growth_and_live_runners_get_the_live_pause_line(
+        policy: dict[str, Any]) -> None:
+    a = next(r for r in runner_job.DEFAULT_RUNNERS if r.name == "A")
+    ops = GrowOps(sizes={"a": (3, 20)}, busy={"A"})
+    record = runner_job.Record(job="a", size=0)
+    kw: dict[str, Any] = {"now": clock(12), "hold_submit": False, "pause_gib": 58.0}
+    first = runner_job.ensure_one(a, record, ops, demand=10, **kw)  # 10 lanes: 2 workers, size 1
+    assert first.record.grow_to is None  # one pass is no want yet
+    second = runner_job.ensure_one(a, first.record, ops, demand=10, **kw)
+    assert second.record.grow_to == 1 and "run-on probe refused" in second.detail
+    assert not ops.cancelled and not ops.drained.get("A")
+    assert ops.published == [("A", 58.0), ("A", 58.0)]  # every pass, so a changed line reaches it
+    ops.a_room = True  # admitted: kept while A drains for it
+    third = runner_job.ensure_one(a, second.record, ops, demand=10, **kw)
+    assert third.record.grow_to == 1
+    settled = runner_job.ensure_one(a, third.record, ops, demand=3, **kw)  # the want ended
+    assert settled.record.grow_to is None
+    runner_job.ensure_one(a, record, ops, demand=3, **{**kw, "dry_run": True})
+    assert len(ops.published) == 4  # a dry run writes nothing
+
+
+def test_a_successor_starts_with_no_growth_want(policy: dict[str, Any]) -> None:
+    a = next(r for r in runner_job.DEFAULT_RUNNERS if r.name == "A")
+    ops = GrowOps(states={"a": "INTERRUPTED"}, sizes={"a": (3, 20)}, a_room=True)
+    record = runner_job.Record(job="a", size=0, grow_to=1, cancelled="a", cancelled_for="resize",
+                               resize_to=1)
+    out = runner_job.ensure_one(a, record, ops, now=clock(12), hold_submit=False, demand=10)
+    assert out.action == "restart" and out.record.size == 1 and out.record.grow_to is None

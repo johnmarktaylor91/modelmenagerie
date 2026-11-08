@@ -28,6 +28,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -242,6 +243,55 @@ def _place_gzipped(src: Path, sha256: str, out: Path) -> None:
         tmp.unlink(missing_ok=True)
 
 
+# Query parameters that make a URL a signed, expiring credential (S3 and R2 presigned links,
+# CloudFront, GCS, Azure SAS, bearer tokens): the index keeps such a URL without its query.
+# Query parameters that sign or authorize a URL: S3 and R2 presigning (X-Amz-*), Google signed
+# URLs (X-Goog-*), CloudFront (Expires, Policy, Signature, Key-Pair-Id), Azure SAS (sig, se, sp,
+# sv, sr, st), bearer tokens, any parameter whose value is a JWT (Cloudflare Access's ``meta``), and
+# the account ids the Hugging Face CDN adds (user_id, X-Xet-Cas-Uid). The store index keeps the rest.
+SIGNING_PREFIXES = ("x-amz-", "x-goog-")
+SIGNING_PARAMS = frozenset({
+    "signature", "expires", "key-pair-id", "policy", "sig", "se", "sp", "sv", "sr", "st", "token",
+    "access_token", "awsaccesskeyid", "user_id", "x-xet-cas-uid",
+})
+
+
+_JWT = re.compile(r"eyJ[\w-]+\.[\w-]+\.[\w-]*")
+
+
+def _signs(segment: str) -> bool:
+    name, _, value = (urllib.parse.unquote_plus(part) for part in segment.partition("="))
+    name = name.lower()
+    return name.startswith(SIGNING_PREFIXES) or name in SIGNING_PARAMS or bool(_JWT.fullmatch(value))
+
+
+def public_url(url: str | None) -> str | None:
+    """``url`` as the store index records it: without the query parameters that sign it, the
+    others kept as written."""
+
+    if not url or "?" not in url:
+        return url
+    parts = urllib.parse.urlsplit(url)
+    segments = parts.query.split("&")
+    kept = [seg for seg in segments if not _signs(seg)]
+    if len(kept) == len(segments):
+        return url
+    return urllib.parse.urlunsplit(parts._replace(query="&".join(kept)))
+
+
+def public_line(text: str) -> str:
+    """A store-index or placement JSON line with its ``url`` made public; other lines unchanged.
+
+    For lines a worker wrote as text (stage-3 results, trim journals), which may predate
+    ``public_url`` on that worker's checkout."""
+
+    row = json.loads(text)
+    url = row.get("url")
+    if not isinstance(url, str) or public_url(url) == url:
+        return text
+    return json.dumps({**row, "url": public_url(url)}, ensure_ascii=False, separators=(",", ":"))
+
+
 def put(path: Path, *, store: StoreLayout, data: DataLayout, mime: str, license_class: str,
         url: str | None = None, derived_from: str | None = None) -> StoreIndexLine:
     """Copy a file or ``.tlspec`` directory into the store, append its index line, return it.
@@ -250,7 +300,7 @@ def put(path: Path, *, store: StoreLayout, data: DataLayout, mime: str, license_
     kept; its name and index ``bytes`` are those of the tree, and ``get`` reads it back. A view
     file (``gzips_on_write``) is written gzipped at ``<sha>.gz`` the same way."""
 
-    path = Path(path)
+    path, url = Path(path), public_url(url)
     if not path.exists():
         raise FileNotFoundError(path)
     sha = tree_sha256(path)
@@ -499,6 +549,50 @@ def _evict(root: Path, cap: int, incoming: int) -> None:
             path.unlink(missing_ok=True)
 
 
+def trim_unpack_cache(root: Path | None = None, *, now: float | None = None) -> dict[str, int]:
+    """Remove every unpack cache entry not used within the lease, and the temporary folders of
+    unpacks that died; return counts and bytes freed.
+
+    The cache evicts only when a new entry arrives, and only down to its cap, so a bulk reader
+    (a site export's stage step read 20,749 blobs on 2 Nov 2026) leaves up to the cap, plus every
+    leased entry, that nothing reads again. Every entry is regenerable: ``_unpacked`` and
+    ``_gunzipped`` rebuild and hash-check it on next use. Entries used within
+    ``UNPACK_LEASE_SECONDS`` (use touches the mtime) stay, as ``_evict`` keeps them.
+    """
+
+    base = Path(root) if root else _cache_root()[0]
+    now = time.time() if now is None else now
+    report = {"entries": 0, "removed": 0, "freed_bytes": 0}
+    if not base.is_dir():
+        return report
+    for path in list(base.iterdir()):
+        report["entries"] += 1
+        try:
+            if now - path.stat().st_mtime < UNPACK_LEASE_SECONDS:
+                continue
+            size = _bytes(path)
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except FileNotFoundError:  # a reader replaced or another trim removed it meanwhile
+            continue
+        report["removed"] += 1
+        report["freed_bytes"] += size
+    return report
+
+
+def _restore_empty_blobs(tree: Path) -> None:
+    """Put back the empty ``blobs/`` folder of a TorchLens bundle that saved no tensors.
+
+    A packed tree keeps files only, so a bundle whose ``blobs/`` was empty unpacks without it, and
+    TorchLens refuses to load a bundle with no ``blobs/`` folder. An empty folder holds no file, so
+    the tree's ``tree_sha256`` is the same with or without it."""
+
+    if (tree / "manifest.json").is_file() and not (tree / "blobs").exists():
+        (tree / "blobs").mkdir()
+
+
 def _unpacked(sha256: str, packed: Path) -> Path:
     """The unpacked tree of a packed blob in the cache, unpacked and checked on first use."""
 
@@ -506,12 +600,14 @@ def _unpacked(sha256: str, packed: Path) -> Path:
     path = root / sha256
     if path.is_dir():
         os.utime(path)
+        _restore_empty_blobs(path)  # trees unpacked before the fix lack it too
         return path
     root.mkdir(parents=True, exist_ok=True)
     _evict(root, cap, packed.stat().st_size * 6)
     tmp = Path(tempfile.mkdtemp(prefix=f".{sha256[:12]}.", dir=root))
     try:
         unpack_tree(packed, tmp / "tree")
+        _restore_empty_blobs(tmp / "tree")
         actual = tree_sha256(tmp / "tree")
         if actual != sha256:
             raise ValueError(f"packed blob {sha256} unpacks to {actual}")

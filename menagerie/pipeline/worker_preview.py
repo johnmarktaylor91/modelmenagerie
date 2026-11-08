@@ -30,6 +30,8 @@ has no train result.
 
 from __future__ import annotations
 
+import copy
+import functools
 import gc
 import os
 import time
@@ -39,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from menagerie import tl_compat
 from menagerie.pipeline import worker
 from menagerie.pipeline.records import Modes, RunRequest, RunResult
 
@@ -495,7 +498,12 @@ def _warm(native: Native) -> str | None:
     try:
         if switch:
             model.eval()
-        model(*native.inputs, **kwargs)
+        inputs = native.inputs
+        try:  # copies, so a model that edits its inputs in place leaves the capture's as built
+            inputs, kwargs = copy.deepcopy(inputs), copy.deepcopy(kwargs)
+        except Exception:  # noqa: BLE001 -- arbitrary input objects; warm on the originals
+            pass
+        model(*inputs, **kwargs)
     except Exception as exc:  # noqa: BLE001 -- model code raises anything; recorded on the row
         if isinstance(exc, MemoryError) or worker._MEMORY.search(str(exc)):
             raise
@@ -525,9 +533,10 @@ def _validate(request: RunRequest, train: bool, truth: Any) -> Check:
     msg = None
     if state != "passed":
         status = trace.validation_replay_status  # the counts behind a bare bool verdict
-        msg = (f"{status.message} ({status.replayed_node_count} replayed, "
-               f"{status.failed_node_count} failed, {status.effect_region_node_count} effect "
-               f"regions, {status.pure_unverified_node_count} pure unverified)")
+        count = functools.partial(tl_compat.status_count, status)
+        msg = (f"{status.message} ({count('replayed')} replayed, {count('failed')} failed, "
+               f"{count('effect_region')} effect regions, {count('pure_unverified')} pure "
+               "unverified)")
         failure = tl.validation.last_validation_failure() if state == "failed" else None
         if failure is not None:
             msg = failure.summary() if hasattr(failure, "summary") else str(failure)
@@ -540,7 +549,6 @@ def _ready_capture(request: RunRequest, train: bool, check: Check) -> tuple[Any,
     preview accepts it, else the validated capture (with a note when the preview refuses)."""
 
     import torchlens as tl
-    from torchlens.options import CaptureOptions
 
     backend = request.recipe.backend
     if not request.intervention_ready:
@@ -550,7 +558,7 @@ def _ready_capture(request: RunRequest, train: bool, check: Check) -> tuple[Any,
     if not ready and backend not in SAVE_FRESH:
         return check.trace, check.secs, note
     native = build(request, train=train)
-    options = {"capture": CaptureOptions(intervention_ready=True)} if ready else {}
+    options = {"capture": tl_compat.capture_options(intervention_ready=True)} if ready else {}
     with _capture():
         _warm(native)  # a raise is recorded from the validation's warm-up of the same build
         started = time.perf_counter()
@@ -576,7 +584,7 @@ def _summarize(request: RunRequest, trace: Any) -> tuple[dict[str, Any], Any, st
     except Exception as exc:  # noqa: BLE001 -- as above
         notes.append(f"summary: {worker._first_line(exc)}")
         summary = {"id": request.id, "recipe_rev": request.recipe.rev,
-                   "n_ops": int(trace.num_ops), "graph_hash": trace.graph_shape_hash or None,
+                   "n_ops": tl_compat.num_ops(trace), "graph_hash": tl_compat.graph_hash(trace),
                    **({"hashes": hashes} if hashes else {})}
     return summary, hashes, "; ".join(notes) or None
 
@@ -594,7 +602,7 @@ def _save(trace: Any, attempt_dir: Path) -> tuple[worker.Saved, str | None]:
     path = attempt_dir / worker.TRACE_FILE
     shutil.rmtree(path, ignore_errors=True)
     try:
-        tl.save(trace, path, level="runnable")
+        tl_compat.save(trace, path, level="runnable")
         runnable, level = "ready", "runnable"
     except Exception as exc:  # noqa: BLE001 -- the refusal is recorded, never raised
         state = "persistent-buffer state" in str(exc)
@@ -604,7 +612,7 @@ def _save(trace: Any, attempt_dir: Path) -> tuple[worker.Saved, str | None]:
             return worker.Saved(runnable, None), f"no save: {why}"
         level = "portable"
     try:
-        same = tl.hash.trace(tl.load(path)) == tl.hash.trace(trace)
+        same = tl_compat.skeleton(tl.load(path)) == tl_compat.skeleton(trace)
     except Exception:  # noqa: BLE001 -- a save that does not load is not usable
         return worker.Saved("refused:round_trip_load", level), None
     return worker.Saved(runnable if same else "refused:round_trip_hash", level), None
@@ -615,11 +623,10 @@ def _portable(trace: Any, path: Path) -> str | None:
 
     import shutil
 
-    import torchlens as tl
 
     shutil.rmtree(path, ignore_errors=True)
     try:
-        tl.save(trace, path, level="portable", include_outs=False)
+        tl_compat.save(trace, path, level="portable", include_outs=False)
         return None
     except Exception as exc:  # noqa: BLE001 -- recorded on the row
         shutil.rmtree(path, ignore_errors=True)
@@ -654,7 +661,8 @@ def trace_mode(request: RunRequest, attempt_dir: Path) -> RunResult:
     shutil.rmtree(attempt_dir / worker.RENDER_FILE, ignore_errors=True)  # a retry's twin goes too
     if saved.level != "portable":  # a refused trace.tlspec is already the portable save
         _portable(ready, attempt_dir / worker.RENDER_FILE)
-    module_mode = str(trace.module_identity_mode)
+    mode = tl_compat.trace_field(trace, "module_identity_mode")  # trace.options from 2.38
+    module_mode = None if mode is None else str(mode)
     timings = {"forward_secs": round(forward_secs, 3), "capture_secs": round(check.secs, 3),
                "forward_peak_rss_mb": forward_peak}
     summary = {**summary, **timings, "save_capture_secs": round(save_secs, 3),
@@ -669,9 +677,9 @@ def trace_mode(request: RunRequest, attempt_dir: Path) -> RunResult:
     msg = "; ".join(m for m in (check.msg, note, summary_note, save_note, warm_note) if m) or None
     row = worker._base_row(
         request, stage="trace", outcome="pass" if passed else "fail", cls=cls,
-        mode=request.model_mode, capture="full", n_ops=int(trace.num_ops),
+        mode=request.model_mode, capture="full", n_ops=tl_compat.num_ops(trace),
         hashes=trace_summary.ledger_hashes(hashes) if hashes else None,
-        graph_hash=trace.graph_shape_hash or None, params=params,
+        graph_hash=tl_compat.graph_hash(trace), params=params,
         params_source="counted" if params is not None else None, peak_rss_mb=worker._rss_mb(),
         input_boundary=boundary, validation=VALIDATION, validation_state=check.state,
         module_mode=module_mode, runnable=runnable, warmed=check.warm is None,

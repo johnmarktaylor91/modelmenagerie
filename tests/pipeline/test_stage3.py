@@ -249,13 +249,13 @@ def test_a_failed_forward_goes_to_structure_only_or_stops(
 
 
 def _measured(data: DataLayout, sid: str, *, forward_mb: int, trace_mb: int,
-              trace_cls: str | None = None, at: str = AT) -> None:
+              trace_cls: str | None = None, at: str = AT, tl: str | None = None) -> None:
     from menagerie.pipeline import ledger
 
     record = read_json(ModelRecord, data.model(sid))
     assert record.recipe is not None
     base = {"id": sid, "at": at, "host": "worker", "env": "torch-main@00000000",
-            "recipe_rev": "0" * 12, "mode": "eval"}  # an older revision still counts
+            "recipe_rev": "0" * 12, "mode": "eval", "tl": tl}  # an older revision still counts
     ledger.append([
         LedgerRow(stage="forward", outcome="pass", forward_peak_rss_mb=forward_mb, **base),
         LedgerRow(stage="trace", capture="full", outcome="fail" if trace_cls else "pass",
@@ -310,6 +310,49 @@ def test_an_older_memory_cap_leaves_a_later_passing_peak_in_charge(data: DataLay
     sized = stage3.sizing(read_json(ModelRecord, data.model("m8839")), stage3.Peaks.read(data),
                           stage3._families(data))
     assert sized.measured_gib == 5.0 and sized.at_least_gib is None
+
+
+def test_an_older_pin_peak_sizes_at_its_factor_and_a_current_pin_peak_replaces_it(
+        data: DataLayout) -> None:
+    from menagerie.pipeline import runner
+    from menagerie.pipeline.publish import torchlens_pin
+
+    pin = torchlens_pin()
+    # m314 on 2026-11-07: 98 GiB at 2.36; at the pin about 0.55x, so older peaks size at 0.6x
+    _measured(data, "m8839", forward_mb=4096, trace_mb=100 * 1024, tl="2.36.0")
+    _measured(data, "m8839", forward_mb=4096, trace_mb=120 * 1024, tl="2.35.3",
+              at="2026-10-01T00:00:00Z")
+    record, families = read_json(ModelRecord, data.model("m8839")), stage3._families(data)
+    peaks = stage3.Peaks.read(data, pin=pin)
+    assert peaks.passed["m8839"] == 120 * 1024 * stage3.OLDER_PIN_FACTOR  # the largest, scaled
+    assert "m8839" in peaks.older and not peaks.measured_at_pin("m8839")
+    sized = stage3.sizing(record, peaks, families)
+    assert sized.measured_gib == round(72.0 * runner.PEAK_HEADROOM, 2)
+    assert "older TorchLens pin" in sized.basis
+    # one trace at the pin replaces every older peak, larger or smaller
+    _measured(data, "m8839", forward_mb=4096, trace_mb=50 * 1024, tl=pin,
+              at="2026-11-07T00:00:00Z")
+    peaks = stage3.Peaks.read(data, pin=pin)
+    assert peaks.passed["m8839"] == 50 * 1024 and peaks.measured_at_pin("m8839")
+    assert stage3.sizing(record, peaks, families).measured_gib == round(
+        50 * runner.PEAK_HEADROOM, 2)
+    assert peaks.forward["m8839"] == 4096  # forward peaks do not depend on the pin
+
+
+def test_an_older_pin_memory_cap_is_scaled_and_a_current_pin_cap_is_not(data: DataLayout) -> None:
+    from menagerie.pipeline.publish import torchlens_pin
+
+    pin = torchlens_pin()
+    _measured(data, "m9001", forward_mb=2048, trace_mb=40 * 1024, trace_cls="memory_cap",
+              tl="2.36.0")
+    families = stage3._families(data)
+    record = read_json(ModelRecord, data.model("m9001"))
+    older = stage3.sizing(record, stage3.Peaks.read(data, pin=pin), families)
+    assert older.at_least_gib == round(40 * stage3.OLDER_PIN_FACTOR * flow.MEMORY_CAP_STEP, 2)
+    _measured(data, "m9001", forward_mb=2048, trace_mb=30 * 1024, trace_cls="memory_cap", tl=pin,
+              at="2026-11-07T00:00:00Z")
+    current = stage3.sizing(record, stage3.Peaks.read(data, pin=pin), families)
+    assert current.at_least_gib == round(30 * flow.MEMORY_CAP_STEP, 2)
 
 
 def test_a_measured_peak_that_fits_brings_a_cluster_placement_back_to_the_worker(
@@ -457,7 +500,7 @@ def test_a_drained_spool_claims_no_new_job_until_the_drain_ends(
     path = tmp_path / "spool"
     _queue_both(data, path, monkeypatch)
     monkeypatch.setattr(runner, "serving", lambda spool: True)
-    monkeypatch.setattr(disk_guard, "claim_ok", lambda root: True)
+    monkeypatch.setattr(disk_guard, "claim_ok", lambda root, **kw: True)
     monkeypatch.setattr(stage3, "_serve_one", lambda *args: None)
     dirs, seen, running = stage3._dirs(path), {}, {}
     store = SimpleNamespace(root=tmp_path / "store")
@@ -670,16 +713,67 @@ def test_tick_reserves_big_rows_without_touching_g_when_off(data: DataLayout, tm
     monkeypatch.setattr(tick_full, "_waiting", lambda spool: seen.append(spool) or 0)
     _measured(data, "m8839", forward_mb=1024, trace_mb=32 * 1024)
     off = tick_full.stage3_queue(data, cfg, dry_run=True)
-    assert off["would_queue"] == ["m8839"] and seen == ["spool-B"]
+    assert not off["would_queue"] and off["big"]["reserved"] == ["m8839"] and seen == ["spool-B"]
+    assert "big_runner off" in off["big"]["held"]  # held: the tick keeps its last big_work count
+    cfg["reserve_big"] = False  # the old behaviour: B takes big rows while G is off
+    assert tick_full.stage3_queue(data, cfg, dry_run=True)["would_queue"] == ["m8839"]
+    seen.clear()
     cfg["big_runner"] = True
     monkeypatch.setattr(runner_job, "night_open", lambda: False)
     day = tick_full.stage3_queue(data, cfg, dry_run=True)
     assert not day["would_queue"] and day["big"]["reserved"] == ["m8839"]
     assert day["big"]["waiting"] == 0  # by day too, so last night's unclaimed jobs keep G on
-    assert seen == ["spool-B", "spool-B", "scratch/menagerie/spool-G"]
+    assert seen == ["spool-B", "scratch/menagerie/spool-G"]
     monkeypatch.setattr(runner_job, "night_open", lambda: True)
     night = tick_full.stage3_queue(data, cfg, dry_run=True)
     assert night["big"]["would_queue"] == ["m8839"] and not night["would_queue"]
+
+
+def test_by_day_b_takes_one_big_row_while_its_queue_is_short(data: DataLayout, tmp_path: Path,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rung 4 push (3 Nov 2026): 217 big rows waited for G's night window while B had room."""
+    from menagerie.pipeline import drive, runner_job, tick_full
+
+    path = tmp_path / "worklist.txt"
+    path.write_text("m8839\n")
+    cfg = {"worklist": str(path), "queue_spool": "spool-B", "queue_depth": 40, "big_runner": True,
+           "big_on_b": {"rows": 1, "max_gib": 28}}
+    monkeypatch.setattr(drive, "next_steps", lambda ids, data: [{"id": sid, "step": "trace"} for sid in ids])
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: list(ids))
+    waiting = {"spool-B": 0}
+    monkeypatch.setattr(tick_full, "_waiting", lambda spool: waiting.get(spool, 0))
+    on_b: list[str] = []
+    monkeypatch.setattr(tick_full, "_big_in_b", lambda reserved: list(on_b))
+    monkeypatch.setattr(runner_job, "night_open", lambda now=None: False)
+    _measured(data, "m8839", forward_mb=1024, trace_mb=20 * 1024)  # projected 25 GiB
+    day = tick_full.stage3_queue(data, cfg, dry_run=True)
+    assert day["would_queue"] == ["m8839"] and day["big_on_b"] == {"in_b": [], "lend": ["m8839"]}
+    assert day["big"]["reserved"] == ["m8839"]
+    waiting["spool-B"] = 3  # normal trace work queues: B keeps its room for it
+    assert tick_full.stage3_queue(data, cfg, dry_run=True)["would_queue"] == []
+    waiting["spool-B"], on_b[:] = 0, ["m8839"]  # one big row already on B
+    assert tick_full.stage3_queue(data, cfg, dry_run=True)["would_queue"] == []
+    on_b.clear()
+    small = {**cfg, "big_on_b": {"max_gib": 24}}  # past the projection limit
+    assert tick_full.stage3_queue(data, small, dry_run=True)["would_queue"] == []
+    assert tick_full.stage3_queue(data, {**cfg, "big_on_b": None}, dry_run=True)["would_queue"] == []
+    monkeypatch.setattr(runner_job, "night_open", lambda now=None: True)  # G's window: G's rows
+    night = tick_full.stage3_queue(data, cfg, dry_run=True)
+    assert night["would_queue"] == [] and night["big"]["would_queue"] == ["m8839"]
+    assert "night window" in night["big_on_b"]["held"]
+
+
+def test_big_rows_on_b_are_open_jobs_sent_without_g_sizing(tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    from menagerie.pipeline import tick_full
+
+    monkeypatch.setattr(stage3, "_local", lambda part: tmp_path / part)
+    (tmp_path / "sent").mkdir()
+    (tmp_path / "collected").mkdir()
+    for name, sizing in (("m1-r-1", {}), ("m2-r-1", {"big_runner": True}), ("m3-r-1", {}), ("m4-r-1", {})):
+        (tmp_path / "sent" / f"{name}.json").write_text(json.dumps({"sizing": sizing}))
+    (tmp_path / "collected" / "m3-r-1.json").write_text("{}")
+    assert tick_full._big_in_b(["m1", "m2", "m3"]) == ["m1"]
 
 
 def test_default_queue_payload_is_compatible_with_live_old_runners(data: DataLayout, tmp_path: Path,

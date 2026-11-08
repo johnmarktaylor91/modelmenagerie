@@ -42,6 +42,7 @@ from menagerie.pipeline import (
     describe_text,
     describe_workers,
     ledger,
+    paper_check,
     read_json,
     review,
     roster,
@@ -393,16 +394,17 @@ def _trial() -> set[str]:
 
 def due(families: Sequence[str] | None, *, data: DataLayout, tl: str) -> list[str]:
     """The families to describe: the given ones, else every validated family with a packet and no
-    describe record (or one a stronger text has reached since, ``_undescribed``): an abstract
-    trial's families first, then those validated at ``tl`` before those validated only at an
-    earlier pin, each oldest packet first."""
+    describe record (or one a stronger text has reached since, ``_undescribed``): records that read
+    a text retired since first (they stopped publishing), then an abstract trial's families, then
+    those validated at ``tl`` before those validated only at an earlier pin, each oldest packet
+    first."""
 
     valid = _pins(data, tl)
     if families:
         return list(dict.fromkeys(f for f in families if f in valid))
     todo = [f for f in valid if data.packet(f).is_file() and _undescribed(f, data)]
-    trial = _trial()
-    return sorted(todo, key=lambda f: (f not in trial, valid[f] != tl,
+    trial, redo = _trial(), {f for f in todo if _read_retired(f, data)}
+    return sorted(todo, key=lambda f: (f not in redo, f not in trial, valid[f] != tl,
                                        _json(data.packet(f)).get("written") or "", f))
 
 
@@ -420,18 +422,31 @@ def _basis(record: Mapping[str, Any]) -> str | None:
 def _undescribed(family: str, data: DataLayout) -> bool:
     """No record yet, or the packet now offers a kind of text stronger than the record's basis
     that the record did not read (the paper pass lands full texts after an abstract-grounded or
-    textless record; ``describe_text.RANK``). An old textless record re-opens on any candidate."""
+    textless record; ``describe_text.RANK``). An old textless record re-opens on any candidate, and
+    a record that read a text retired since (``paper_check``) re-opens."""
 
     path = data.describe(family)
     if not path.exists():
         return True
-    record = _json(path)
-    found = describe_text.candidates(_json(data.packet(family)), abstracts=abstracts_for(family))
+    if _read_retired(family, data):
+        return True  # It read a text since retired: written again without it.
+    record, packet = _json(path), _json(data.packet(family))
+    found = describe_text.candidates(packet, abstracts=abstracts_for(family))
     basis = _basis(record)
     if basis is None:
         return bool(found)
     read, rank = set(record.get("inputs") or ()), describe_text.RANK[basis]
     return any(describe_text.RANK[kind] > rank and sid not in read for sid, kind in found.items())
+
+
+def _read_retired(family: str, data: DataLayout) -> bool:
+    """The family's record read a text retired since (``paper_check``)."""
+
+    path = data.describe(family)
+    if not path.exists():
+        return False
+    inputs = set(_json(path).get("inputs") or ())
+    return bool(inputs & paper_check.retired_raw(_json(data.packet(family))))
 
 
 def _extend(folder: Path, todo: Sequence[str], count: int, *, data: DataLayout) -> list[str]:
@@ -629,9 +644,10 @@ def _batch_rows(folder: Path, batch: Sequence[str], *, role: str, data: DataLayo
     status = review._fleet_run(lane["run"])
     if status.get("state") != "TERMINAL" or not describe_workers.landed(lane):
         return [{"family": f, "verdict": "running", "run": lane["run"]} for f in lane["families"]]
-    if status.get("admission_state") not in (None, "admitted") and write:
-        # The hub's queue ended the lane before it ever ran: it did no work, so it starts again
-        # rather than spending the families' one return.
+    if (status.get("admission_state") not in (None, "admitted") or describe_workers.never_ran(lane)) \
+            and write:
+        # The hub's queue ended the lane before it ever ran, or a worker lane's agent never
+        # started: it did no work, so it starts again rather than spending the families' one return.
         run = _launch(folder, lane["families"], lane["role"], data=data,
                       returned=bool(lane.get("returned")))
         return [{"family": f, "verdict": "relaunched", "run": run} for f in lane["families"]]

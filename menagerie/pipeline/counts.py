@@ -270,7 +270,9 @@ def submit(*, data: DataLayout, wait_s: float = WAIT_S) -> dict[str, Any]:
     repo = Path(_git(Path(data.root).resolve(), "rev-parse", "--show-toplevel").strip())
     sha = _git(repo, "rev-parse", "HEAD").strip()
     job = f"menagerie-counts-{datetime.now(timezone.utc).strftime('%Y%m%dt%H%M%Sz')}"
-    argv = ["run-on", "submit", "--project", "menagerie", "--os", "linux", "--no-fallback",
+    # --full: data_status and drive read the roster, sweeps, catalogs and site manifest the
+    # registry's sparse_exclude leaves out of a default checkout
+    argv = ["run-on", "submit", "--project", "menagerie", "--os", "linux", "--no-fallback", "--full",
             "--mode", "batch", "--ref", sha, "--cpus", str(WORKER_CPUS), "--memory-gib",
             str(WORKER_GIB), "--pull", "outputs/counts/*.json", "--admit-wait", str(ADMIT_WAIT_S),
             "--job", job, "--", "env", f"MENAGERIE_CPUS={WORKER_CPUS}", f"MENAGERIE_MEMORY_GB={WORKER_GIB}",

@@ -175,7 +175,7 @@ def _cluster_capped(data: DataLayout) -> set[str]:
 
 def _copy_inputs(records: Sequence[ModelRecord], data: DataLayout, batch: Path) -> list[str]:
     """Copy records and adapters into the batch's data root; return the store shas needed (each
-    recipe's vendor snapshot and extra code trees)."""
+    recipe's vendor snapshot, extra code trees and weights file)."""
 
     target = DataLayout(batch / "data")
     vendors = []
@@ -186,10 +186,8 @@ def _copy_inputs(records: Sequence[ModelRecord], data: DataLayout, batch: Path) 
             dest = target.root / recipe.adapter
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(data.root / recipe.adapter, dest)
-        if recipe is not None and recipe.vendor:
-            vendors.append(recipe.vendor)
-        if recipe is not None and recipe.code:
-            vendors.extend(recipe.code)
+        if recipe is not None:
+            vendors.extend(s for s in (recipe.vendor, *(recipe.code or ()), recipe.weights) if s)
     return sorted(set(vendors))
 
 

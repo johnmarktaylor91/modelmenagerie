@@ -5,7 +5,7 @@
 
 import { CONTACT_EMAIL } from "@/lib/contact";
 
-export const SITE_NAME = "TorchLens Model Menagerie";
+export const SITE_NAME = "Model Menagerie";
 export const SITE_URL = "https://modelmenagerie.ai";
 
 export const TORCHLENS = {
@@ -13,6 +13,7 @@ export const TORCHLENS = {
   issues: "https://github.com/johnmarktaylor91/torchlens/issues",
   pypi: "https://pypi.org/project/torchlens/",
   readme: "https://github.com/johnmarktaylor91/torchlens#readme",
+  docs: "https://johnmarktaylor91.github.io/torchlens/",
   backends: "https://github.com/johnmarktaylor91/torchlens/blob/main/docs/backends.md",
   paper: "https://www.nature.com/articles/s41598-023-40807-0",
   doi: "https://doi.org/10.1038/s41598-023-40807-0",
@@ -20,6 +21,7 @@ export const TORCHLENS = {
 } as const;
 
 export const GRAPHVIZ_URL = "https://graphviz.org/";
+export const GRAPHVIZ_DOWNLOAD_URL = "https://graphviz.org/download/";
 
 /** Licence of the site's own text, diagrams and dataset (decisions.md, 2026-10-03, item 9). */
 export const CONTENT_LICENCE = {
@@ -31,9 +33,18 @@ export const CONTENT_LICENCE = {
 
 export const CREATOR = { name: "JohnMark Taylor", url: "https://github.com/johnmarktaylor91" } as const;
 
-/** Where corrections go (public), and where requests that should not be public go. */
+/** The site's public code repository; its issues are where corrections go. */
+export const SITE_REPO = {
+  url: "https://github.com/johnmarktaylor91/modelmenagerie",
+  issues: "https://github.com/johnmarktaylor91/modelmenagerie/issues",
+  newIssue: "https://github.com/johnmarktaylor91/modelmenagerie/issues/new",
+} as const;
+
+/** Where corrections and removal requests go: the site repository's issues. `email` is empty unless a
+ * non-personal project address is set at build time (contact.ts). */
 export const CONTACT = {
-  issues: TORCHLENS.issues,
+  issues: SITE_REPO.issues,
+  newIssue: SITE_REPO.newIssue,
   email: CONTACT_EMAIL,
 } as const;
 
@@ -53,14 +64,14 @@ export const TORCHLENS_BIBTEX = `@article{taylor2023torchlens,
 /** Citation for the site and its dataset; `year` and `version` come from the release being cited. */
 export function siteCitation(year: number, version: string | null): string {
   const release = version ? `, release ${version}` : "";
-  return `Taylor, J. TorchLens Model Menagerie${release} (${year}). ${SITE_URL}/`;
+  return `Taylor, J. Model Menagerie${release} (${year}). ${SITE_URL}/`;
 }
 
 export function siteBibtex(year: number, version: string | null): string {
   const lines = [
     `@misc{menagerie${year},`,
     `  author       = {Taylor, JohnMark},`,
-    `  title        = {{TorchLens Model Menagerie}: computational graphs of neural networks},`,
+    `  title        = {{Model Menagerie}: computational graphs of neural networks},`,
     `  year         = {${year}},`,
     ...(version ? [`  version      = {${version}},`] : []),
     `  howpublished = {\\url{${SITE_URL}/}},`,
@@ -77,3 +88,6 @@ export function releaseVersion(exportVersion: string | null | undefined): string
   }
   return exportVersion.startsWith("v") ? exportVersion : `v${exportVersion}`;
 }
+
+/** The one example every search box shows, cased like the display names. */
+export const SEARCH_PLACEHOLDER = "e.g. ResNet-50";

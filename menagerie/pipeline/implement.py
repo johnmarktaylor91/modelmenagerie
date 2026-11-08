@@ -43,6 +43,7 @@ from menagerie.pipeline import (
     envs,
     now,
     read_json,
+    read_json_cached,
     recipe_revision,
     runner,
     write_json,
@@ -773,12 +774,11 @@ def _unrun(family: str, ran: Sequence[str], data: DataLayout) -> list[ModelRecor
 
 
 def settled(members: Sequence[str], data: DataLayout) -> dict[str, str]:
-    """The members a 2b lane must leave alone, each with why: the latest full trace at its
-    current recipe revision passed (at any TorchLens pin; re-validation at a new pin is stage
-    3's work) and no review calls that recipe a fabrication (a repair may rebuild those). A new
-    recipe would retire a validated row until it traced again, so ``try``, ``giveup`` and
-    ``done`` refuse to touch these members. A recipe typed a substitute (``standin``,
-    ``june_code``) is not settled however it traced: drive owes that row a real attempt.
+    """The members a 2b lane must leave alone, each with why: validated by
+    ``ledger.validated_record`` at any TorchLens pin (re-validation at a new pin is stage 3's
+    work). A new recipe would retire a validated row until it traced again, so ``try``,
+    ``giveup`` and ``done`` refuse to touch these members. A record with a give-up (a substitute
+    one included) is not settled however it traced: its give-up is its outcome.
     """
 
     from menagerie.pipeline import drive, ledger
@@ -789,16 +789,10 @@ def settled(members: Sequence[str], data: DataLayout) -> dict[str, str]:
     out = {}
     for member in members:
         record = files.record(member)
-        if record is None or record.recipe is None or (
-                record.give_up and drive._head(record.give_up.cls) in drive.SUBSTITUTE):
-            continue
-        rev, rows = record.recipe.rev, files.rows.get(member, [])
-        traces = [r for r in rows if isinstance(r, LedgerRow) and r.stage == "trace"
-                  and r.recipe_rev == rev and r.outcome != "infra"
-                  and r.capture in (None, "full") and r.mode in (None, "eval")]
-        last = ledger._latest(traces)
-        if last is not None and last.outcome == "pass" and not ledger._fabricated(member, rows, rev):
-            out[member] = f"its trace passed at recipe {rev} ({last.at}, TorchLens {last.tl})"
+        last = ledger.validated_record(record, files.rows.get(member, []))
+        if record is not None and record.recipe is not None and last is not None:
+            out[member] = (f"its trace passed at recipe {record.recipe.rev} ({last.at}, "
+                           f"TorchLens {last.tl})")
     return out
 
 
@@ -870,7 +864,9 @@ def brief(family: str, *, data: DataLayout) -> Path:
     without network (or after the bridge drained a staged blob) still gets them from ``src``.
     """
 
+    from menagerie.pipeline import drive
     from menagerie.pipeline import store as stored
+    from menagerie.pipeline.review import needs_second_review  # review imports implement
 
     packet = read_json(Packet, data.packet(family))
     work = work_dir("2b") / family
@@ -904,8 +900,10 @@ def brief(family: str, *, data: DataLayout) -> Path:
         PROMPT.read_text(encoding="utf-8").split("\n## Batch\n", 1)[0],
     ])
     path = work / "BRIEF.md"
-    path.write_text(text + repair_section(fabrications(packet, data), layout)
+    found = fabrications(packet, data)
+    path.write_text(text + repair_section(found, layout)
                     + repair_request_section(packet, data), encoding="utf-8")
+    drive.mark_briefed(family, [r for r in found if needs_second_review(r)])
     return path
 
 
@@ -930,24 +928,45 @@ def _members_line(members: Sequence[str], work: Path, data: DataLayout) -> str:
 
 
 REPAIR_FINDINGS = ("missing", "invented", "unclear")
+DISPUTED_NOTE = ("A provisionally calibrated seat made this call and no second seat has "
+                 "confirmed it (decisions.md 2026-11-03). Check each finding against the source "
+                 "yourself: repair what the source shows is missing or invented, and keep what "
+                 "the source allows.\n\n")
 
 
-def fabrications(packet: Packet, data: DataLayout) -> list[LedgerRow]:
+def fabrications(packet: Packet, data: DataLayout,
+                 rows: Sequence[Any] | None = None) -> list[LedgerRow]:
     """The members' review rows that call their current recipe ``fabrication`` (the last
-    non-``infra`` review at each member's recipe revision)."""
+    non-``infra`` review at each member's recipe revision), and a disputed member's provisional
+    fabrication while its repair round is owed (``drive.dispute``). ``rows`` are ledger rows
+    already read (at least every review row), for a caller checking many packets."""
 
     from menagerie.pipeline import ledger
 
-    rows = ledger.read_all(data=data) if (data.root / "ledger").is_dir() else []
-    found = []
-    for member in packet.members:
-        path = data.model(member.id)
-        record = read_json(ModelRecord, path) if path.exists() else None
-        last = _last_review(rows, member.id, record.recipe.rev) \
-            if record is not None and record.recipe is not None else None
-        if last is not None and last.verdict == "fabrication":
-            found.append(last)
-    return found
+    if rows is None:
+        rows = ledger.read_all(data=data) if (data.root / "ledger").is_dir() else []
+    found = (_member_fabrication(m.id, packet, data, rows) for m in packet.members)
+    return [row for row in found if row is not None]
+
+
+def _member_fabrication(model_id: str, packet: Packet, data: DataLayout,
+                        rows: Sequence[Any]) -> LedgerRow | None:
+    """One member's row for ``fabrications``: its last review when that says ``fabrication``,
+    else its provisional fabrication while a disputed repair round is owed."""
+
+    from menagerie.pipeline import drive
+
+    path = data.model(model_id)
+    record = read_json_cached(ModelRecord, path) if path.exists() else None
+    if record is None or record.recipe is None:
+        return None
+    last = _last_review(rows, model_id, record.recipe.rev)
+    if last is None or last.verdict == "fabrication":
+        return last
+    if record.give_up is not None:
+        return None
+    disputed = drive.dispute(model_id, record, rows, packet, data)
+    return disputed[0] if disputed is not None and disputed[1] else None
 
 
 def _last_review(rows: Sequence[Any], model_id: str, rev: str) -> LedgerRow | None:
@@ -970,6 +989,8 @@ def repair_section(reviews: Sequence[LedgerRow], store: StoreLayout) -> str:
     """The brief's repair-round section after a ``fabrication`` review (fix 4): each review's
     summary and every ``missing``, ``invented`` or ``unclear`` component; ``""`` without one."""
 
+    from menagerie.pipeline.review import needs_second_review  # review imports implement
+
     if not reviews:
         return ""
     parts = ["\n\n## Repair round (one): the fidelity review found a fabrication\n\n",
@@ -983,6 +1004,8 @@ def repair_section(reviews: Sequence[LedgerRow], store: StoreLayout) -> str:
         review = _findings(row, store)
         parts.append(f"\n### `{row.id}` ({row.reviewer or row.env}): {row.verdict}\n\n"
                      f"{review.get('summary', '')}\n\n")
+        if needs_second_review(row):
+            parts.append(DISPUTED_NOTE)
         parts += [f"- {c.get('name')} [{c.get('finding')}]: source: {c.get('source', '')}; "
                   f"ours: {c.get('ours', '')}; {c.get('note', '')}\n"
                   for c in review.get("components", []) if c.get("finding") in REPAIR_FINDINGS]

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import shutil
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -29,6 +30,16 @@ def test_a_full_pass_at_the_pin_or_a_typed_cluster_failure_settles_a_row() -> No
     assert not axon_feed._settled([trace(host="cluster", cls="memory_cap")], "r1", "2.36.0")
     assert not axon_feed._settled([trace(cls="oversized:projected")], "r1", "2.36.0")
     assert axon_feed._settled([trace(host="cluster", cls=axon_feed.OVER_CLASS)], "r1", "2.36.0")
+
+
+def test_a_typed_oversized_row_at_the_pin_from_older_pin_peaks_alone_does_not_settle() -> None:
+    over = [trace(host="cluster", cls=axon_feed.OVER_CLASS, tl="3.0.2")]
+    # m9075 on 2026-11-07: typed at 3.0.2 from its 2.36 peak without a run; it gets one real try
+    assert not axon_feed._settled(over, "r1", "3.0.2", older_only=True)
+    assert axon_feed._settled(over, "r1", "3.0.2", older_only=False)
+    # a row typed at an older pin stays settled as before
+    old = [trace(host="cluster", cls=axon_feed.OVER_CLASS, tl="2.36.0")]
+    assert axon_feed._settled(old, "r1", "3.0.2", older_only=True)
 
 
 def test_a_row_past_the_largest_allocation_gets_one_typed_cluster_row(
@@ -101,7 +112,8 @@ def test_rows_band_by_need_and_order_named_and_untraced_first(
                                                                placement=None))}
         monkeypatch.setitem(_RECORDS, path.name, records[sid])
     monkeypatch.setattr(axon_feed, "read_json", lambda cls, path: _RECORDS[Path(path).name])
-    monkeypatch.setattr(stage3.Peaks, "read", classmethod(lambda cls, data: None))
+    peaks = stage3.Peaks({}, {}, {})
+    monkeypatch.setattr(stage3.Peaks, "read", classmethod(lambda cls, data: peaks))
     monkeypatch.setattr(stage3, "_families", lambda data: {})
     monkeypatch.setattr(stage3, "projected_peak", lambda r, peaks, fam: needs[r.id])
     monkeypatch.setattr(publish, "torchlens_pin", lambda: "2.36.0")
@@ -111,6 +123,23 @@ def test_rows_band_by_need_and_order_named_and_untraced_first(
     # m6 came back from an unfinished batch: first; then named m1 before anonymous m2
     assert [r.id for r in bands["cpu"]] == ["m6", "m1", "m2"]
     assert [r.id for r in bands["reviewed"]] == ["m3"] and [r.id for r in bands["over"]] == ["m4"]
+    # sized from older-pin peaks alone, m4 gets one real try at the largest allocation instead
+    peaks.older.add("m4")
+    bands = axon_feed.rows(data, axon_feed.config({}), back=["m6"])
+    assert [r.id for r in bands["reviewed"]] == ["m3", "m4"] and bands["over"] == []
+    peaks.older.clear()
+    # G's row m5 (30 GiB) handed over joins the cpu band at its own need, after the returned row
+    bands = axon_feed.rows(data, axon_feed.config({}), back=["m6"], big=["m5"])
+    assert [r.id for r in bands["cpu"]] == ["m6", "m5", "m1", "m2"]
+
+
+def test_only_g_rows_handed_over_band_at_or_below_g() -> None:
+    cfg = axon_feed.config({})
+    assert axon_feed._band(30.0, cfg) is None and axon_feed._band(30.0, cfg, big=True) == "cpu"
+    assert axon_feed._band(40.0, cfg, big=True) == "cpu" and axon_feed._band(45.0, cfg) == "cpu"
+    assert axon_feed._band(10.0, cfg, big=True) is None  # a worker row is never G's
+    assert axon_feed._band(None, cfg, big=True) is None
+    assert axon_feed._band(130.0, cfg) == "over" and axon_feed._band(130.0, cfg, tried=False) == "reviewed"
 
 
 _RECORDS: dict[str, Any] = {}
@@ -157,6 +186,14 @@ class FakeOps:
     def tidy(self, batch: Path, meta: dict[str, Any]) -> None:
         self.tidied.append(batch.name)
 
+    def queue_holders(self) -> str:
+        return axon_feed.holders(["fleet:torchlens|RUNNING", "fleet:torchlens|PENDING",
+                                  "fleet:euler|RUNNING", "fleet:torchlens|RUNNING"])
+
+    def discard(self, batch: Path) -> None:
+        self.tidied.append(f"discard {batch.name}")
+        shutil.rmtree(batch)
+
     def render_submit(self, batch: Path, ids: list[str], cfg: dict[str, Any]) -> str:
         self.render_jobs[f"render-{batch.name}"] = "RUNNING"
         return f"render-{batch.name}"
@@ -177,7 +214,7 @@ def feed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Feed:
     ops = FakeOps(tmp_path / "work" / "axon")
     bands = {"cpu": [row("m1", 45), row("m2", 50), row("m3", 55)], "reviewed": [row("m9", 80)],
              "over": [row("m10", 150)]}
-    monkeypatch.setattr(axon_feed, "rows", lambda data, cfg, back=(): {
+    monkeypatch.setattr(axon_feed, "rows", lambda data, cfg, back=(), big=(): {
         k: sorted(v, key=lambda r: (r.id not in set(back), r.key)) for k, v in bands.items()})
     typed: list[str] = []
     monkeypatch.setattr(axon_feed, "_type_unfinished", lambda ids, data, batch: typed.extend(ids))
@@ -219,6 +256,38 @@ def test_one_batch_in_flight_collected_rendered_and_unfinished_rows_back_once(fe
     ops.tables[feed.state["active"]["batch"]] = [{"stable_id": "m1", "trace": "trace:pass"}]
     third = axon_feed.step(feed)
     assert third["collected"]["unfinished"]["typed"] == ["m3"] and feed.typed == ["m3"]  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("refusal", [
+    "axon-submit refused: Fleet Axon queue cap reached (4 active or pending tasks)",
+    "axon-submit refused: Project Axon queue cap reached (1 active or pending task(s))"])
+def test_a_queue_cap_refusal_is_held_not_an_error(feed: Feed, monkeypatch: pytest.MonkeyPatch,
+                                                  refusal: str) -> None:
+    ops: FakeOps = feed.ops
+
+    def refuse(batch: Path) -> str:
+        raise RuntimeError(refusal)
+
+    monkeypatch.setattr(ops, "submit", refuse)
+    out = axon_feed.step(feed)
+    assert out["held"] == (f"axon queue cap: {refusal.removeprefix('axon-submit refused: ')}; "
+                           "held by torchlens 3, euler 1")
+    assert "submitted" not in out and feed.state.get("active") is None
+    assert ops.tidied == ["discard cpu-0"] and list(ops.root.iterdir()) == []
+
+
+def test_other_submit_failures_still_raise(feed: Feed, monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(batch: Path) -> str:
+        raise RuntimeError("axon-submit refused: Unlabelled existing jobs: classify them")
+
+    monkeypatch.setattr(feed.ops, "submit", refuse)
+    with pytest.raises(RuntimeError, match="Unlabelled"):
+        axon_feed.step(feed)
+
+
+def test_holders_counts_the_queue_by_project() -> None:
+    assert axon_feed.holders(["fleet:a|RUNNING", "fleet:b|PENDING", "fleet:b|RUNNING", ""]) == "b 2, a 1"
+    assert axon_feed.holders([]) == ""
 
 
 def test_a_finished_render_job_appends_its_lines_once(feed: Feed) -> None:
@@ -277,3 +346,22 @@ def test_a_failed_render_job_is_started_again_then_given_up(feed: Feed) -> None:
         if attempt < axon_feed.RENDER_TRIES - 1:
             assert "given_up" not in out and axon_feed.step(feed)["renders"][0]["render_job"]
     assert "given_up" in out and feed.state["renders"] == []
+
+
+def test_a_g_row_the_cluster_twice_does_not_finish_goes_back_to_g_untyped(
+        feed: Feed, monkeypatch: pytest.MonkeyPatch) -> None:
+    ops: FakeOps = feed.ops
+    monkeypatch.setattr(axon_feed, "rows", lambda data, cfg, back=(), big=(): {
+        "cpu": [row(sid, 30) for sid in big] + [row("m1", 45)], "reviewed": [], "over": []})
+    feed.big = ["m7"]
+    axon_feed.step(feed)
+    assert feed.state["active"]["ids"] == ["m7", "m1"] and feed.state["active"]["g_rows"] == ["m7"]
+    for _ in range(2):
+        batch = feed.state["active"]["batch"]
+        ops.jobs.clear()
+        ops.tables[batch] = [{"stable_id": "m7", "trace": "not_reached"},
+                             {"stable_id": "m1", "trace": "trace:pass"}]
+        out = axon_feed.step(feed)
+    assert out["collected"]["unfinished"] == {"back": [], "typed": []}
+    assert feed.state["to_g"] == ["m7"] and feed.typed == []  # type: ignore[attr-defined]
+    assert "m7" not in feed.state["active"]["ids"]  # the next batch leaves it to G

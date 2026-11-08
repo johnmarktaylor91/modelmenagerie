@@ -9,6 +9,11 @@ collects ended seats (grounded records, one return lane, ``describe:ungrounded``
 reserves and starts new seats of ten families on disjoint leases. The automated checks are
 ``describe_write``'s own; no human step. The tick's ``lanes`` step commits the records.
 
+The run yields the hub like the tick's own unit (desk ``menagerie-tick.service.d``): CPU and IO
+weight 20, nice 10, and the hub CPU-pressure gate (``GATE``) asked before each start, which holds
+a run while pressure is high unless the last successful run is ``GATE_MAX_SKIP_S`` old; a
+successful run stamps the gate.
+
 Config (``describes`` in the tick's config.json), each passed to the run's environment:
 
 - ``lanes``: seats at once (default and ceiling ``admission.lane_cap("describe")``, 4).
@@ -45,6 +50,14 @@ REPO = Path(__file__).resolve().parents[2]
 DEFAULTS = {"hub_reserve": 6, "max_week_pct": 60, "earlier_pins": True, "abstracts": False,
             "workers": False}
 PASS_ENV = ("PATH", "PYTHONPATH")  # with every MENAGERIE_ variable
+GATE = Path.home() / "desk/bin/hub-psi-gate"
+GATE_MAX_SKIP_S = 1200
+# The gate skips only timer-triggered starts (TRIGGER_UNIT set), which a transient unit started by
+# the tick never is, so the stage asks it as the tick: an ExecCondition on the unit would never skip.
+GATE_TRIGGER = "menagerie-tick.service"
+# ExecStartPost of a simple service fires at launch; the stamp must mean a successful run.
+STAMP = ("ExecStopPost=-/bin/sh -c 'test \"$$SERVICE_RESULT\" = success"
+         f" && exec {GATE} --ran {UNIT}'")
 
 Run = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -91,6 +104,20 @@ def _active(run: Run) -> bool:
     return done.returncode == 0
 
 
+def _gate_hold(run: Run) -> str | None:
+    """The CPU-pressure gate's reason to hold this run (it exits 1), else None: a missing gate or
+    any other exit runs."""
+
+    try:
+        done = run([str(GATE), UNIT, str(GATE_MAX_SKIP_S)], capture_output=True, text=True,
+                   timeout=30, check=False, env={**os.environ, "TRIGGER_UNIT": GATE_TRIGGER})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 1:
+        return None
+    return done.stdout.strip() or "hub-psi-gate held the run"
+
+
 def _idle(words: Mapping[str, str], slots: Callable[[], int]) -> bool:
     """Whether a run could do nothing: every seat is reserved and staged, none has a lane to
     start or collect, the hub has no slot past the reserve and, with workers on, no worker has
@@ -108,8 +135,8 @@ def _idle(words: Mapping[str, str], slots: Callable[[], int]) -> bool:
 
 def stage(given: Mapping[str, Any], *, dry_run: bool, run: Run = subprocess.run,
           slots: Callable[[], int] | None = None) -> dict[str, Any]:
-    """Start one detached describe run unless one is active or it could do nothing (``_idle``);
-    report the last run's outcome."""
+    """Start one detached describe run unless one is active, it could do nothing (``_idle``) or
+    the hub CPU-pressure gate holds it; report the last run's outcome."""
 
     from menagerie.pipeline import tick_full
 
@@ -122,11 +149,15 @@ def stage(given: Mapping[str, Any], *, dry_run: bool, run: Run = subprocess.run,
                 "last": last}
     if dry_run:
         return {"would_start": words, "last": last}
+    held = _gate_hold(run)
+    if held:
+        return {"held": held, "last": last}
     env = {**{k: v for k, v in os.environ.items() if k.startswith("MENAGERIE_")},
            **{k: os.environ[k] for k in PASS_ENV if k in os.environ}, **words}
     argv = ["systemd-run", "--user", f"--unit={UNIT}", "--collect", "--quiet",
             f"--property=RuntimeMaxSec={RUNTIME_S}", "--property=CPUWeight=20",
-            "--property=IOWeight=20", f"--working-directory={REPO}",
+            "--property=IOWeight=20", "--property=Nice=10", f"--property={STAMP}",
+            f"--working-directory={REPO}",
             *(f"--setenv={k}={v}" for k, v in sorted(env.items())),
             "/bin/bash", "-lc", "exec python3 -m menagerie.pipeline.describe_stage"]
     done = run(argv, capture_output=True, text=True, timeout=60, check=False)

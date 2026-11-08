@@ -25,7 +25,7 @@ classifiers = [
 # TorchLens is the upstream tracing library; pin a released PyPI version.
 # Bump the pin deliberately (see docs/torchlens-boundary.md for the private calls to recheck).
 dependencies = [
-    "torchlens==2.36.0",
+    "torchlens==3.0.2",
     "torch>=2.1",
     "numpy",
     "packaging",

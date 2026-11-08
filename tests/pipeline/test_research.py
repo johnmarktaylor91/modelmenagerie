@@ -379,6 +379,8 @@ def test_launch_writes_one_brief_per_batch_and_leases_its_families(
     [lane] = launched
     assert (lane["kind"], lane["role"], lane["keys"], lane["parent"], lane["web"]) == (
         "2a", "model-default", ["f-schedulenet", "f-snr"], "p-1", True)
+    assert research.lane_rows(lane["brief"]) == [env["ids"]["ScheduleNet"], env["ids"]["SNR-Net"]]
+    assert research.lane_rows(env["tmp"] / "elsewhere" / "BRIEF.md") == []
     text = lane["brief"].read_text()
     assert "{PIPE}" not in text and "python3 -m menagerie.pipeline packet write" in text
     assert "cand_05531 | ScheduleNet | SOURCE_AVAILABLE" in text and "AGIF" not in text
@@ -509,3 +511,67 @@ def test_bib_fill_completes_a_pending_packet_and_by_names_what_ran(
     assert read_json(Packet, env["data"].packet("f-snr")) == filled
     with pytest.raises(RecordError, match="has no 'bib: pending'"):
         packets.bib_fill("f-snr", store=env["store"], data=env["data"])
+
+
+def test_a_batch_tries_a_free_worker_slot_first_then_the_hub(env: dict,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the tick's ``mini_2a`` on, ``hosts`` are worker slots: each takes one batch's lane."""
+
+    from menagerie.pipeline import admission, mini_placement, tick  # noqa: PLC0415
+
+    hub: list[str] = []
+    starts: list[dict[str, Any]] = []
+    monkeypatch.setattr(drive, "launch", lambda kind, role, brief, **kw: hub.append(kw.get("label")) or "hub-run")
+    monkeypatch.setattr(tick, "config", lambda: {"mini_workers": {"worker-a": {"cap": 1}}})
+
+    def start(families: list[str], brief: Path, **kw: Any) -> str:
+        starts.append({"families": list(families), "brief": brief, **kw})
+        return "started"
+
+    monkeypatch.setattr(mini_placement, "start_2a", start)
+    monkeypatch.setattr(mini_placement, "finish", lambda started: "worker-run")
+    spec = env["tmp"] / "batch.json"
+    spec.write_text(json.dumps({"parent": None, "batches": [
+        {"label": "2a-tick-w", "tier": "github", "families": [{"ids": [env["ids"]["ScheduleNet"]]}]},
+        {"label": "2a-tick-h", "families": [{"ids": [env["ids"]["SNR-Net"]], "family": "f-snr"}]}]}))
+    hosts = ["worker-a"]
+    assert research.launch(spec, data=env["data"], hosts=hosts) == ["worker-run", "hub-run"]
+    assert hosts == [] and hub == ["2a-tick-h"]
+    [start_kw] = starts
+    assert start_kw["families"] == ["f-schedulenet"] and start_kw["host"] == "worker-a"
+    assert start_kw["role"] == "model-default" and start_kw["brief"].name == "BRIEF.md"
+    assert start_kw["brief"].parent.name == "2a-tick-w"
+    assert start_kw["pipe"].endswith("python3 -m menagerie.pipeline")
+    assert f"MENAGERIE_DRAFTS={start_kw['brief'].parent / 'drafts'}" in start_kw["pipe"]
+    assert ("f-schedulenet", "tier", "github") in [(e["family"], e["verb"], e.get("tier"))
+                                                  for e in env["events"]]
+
+    monkeypatch.setattr(mini_placement, "start_2a", lambda *a, **kw: (_ for _ in ()).throw(
+        admission.Refused("no_admission", "worker full")))
+    hosts = ["worker-a", "worker-a"]
+    assert research.launch(spec, data=env["data"], hosts=hosts) == ["hub-run", "hub-run"]
+    assert hosts == []  # a refusing worker takes no more 2a lanes this pass
+
+    monkeypatch.setattr(mini_placement, "start_2a", lambda *a, **kw: (_ for _ in ()).throw(
+        OSError("start not proven")))
+    with pytest.raises(admission.Refused, match="start not proven"):
+        research.launch(spec, data=env["data"], hosts=["worker-a"])
+
+
+def test_a_fetched_paper_keeps_the_pdf_text_not_the_abstract_page(tmp_path, monkeypatch):
+    from menagerie.pipeline.records import Packet, Source, StoreIndexLine
+
+    def line(sha: str, mime: str, url: str | None = None, of: str | None = None) -> StoreIndexLine:
+        return StoreIndexLine(sha256=sha * 64, bytes=1, mime=mime, fetched="2026-10-29T00:00:00Z",
+                              license_class="third-party", url=url, derived_from=of)
+
+    lines = [line("a", "text/html", "https://arxiv.org/abs/1810.01367"), line("b", "text/plain", of="a" * 64),
+             line("c", "application/pdf", "https://arxiv.org/pdf/1810.01367"), line("d", "text/plain", of="c" * 64)]
+    monkeypatch.setattr(fetch, "fetch_paper", lambda url, *, store, data: lines)
+    packet = read_json(Packet, FIXTURES / "f-resnet.packet.json")
+    paper = Source(sid="s1", role="paper", url="https://arxiv.org/abs/1810.01367")
+    packet = replace(packet, sources=(paper, *(s for s in packet.sources if s.role != "paper")))
+    sources, changed = research._paper(packet, "", store=None, data=None, report={})
+    filled = next(s for s in sources if s.sid == "s1")
+    assert (filled.blob, filled.text, filled.url) == ("c" * 64, "d" * 64, "https://arxiv.org/pdf/1810.01367")
+    assert changed == ["sources.s1"]

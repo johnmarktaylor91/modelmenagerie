@@ -33,8 +33,7 @@ def _r3_line(row: dict[str, str], files: Any) -> str | None:
     if not re.fullmatch(STABLE_ID, model_id):
         raise ValueError(f"invalid frozen id: {model_id!r}")
     record = files.record(model_id)
-    if record and record.recipe and ledger.validated(ledger.deciding_trace(
-            model_id, files.rows.get(model_id, []), recipe_rev=record.recipe.rev, tl=files.tl)):
+    if ledger.validated_record(record, files.rows.get(model_id, []), tl=files.tl) is not None:
         return None
     settled = drive._step(model_id, files)[0] == "done"
     if settled and (record and record.give_up or row.get("list") in ("c2_tail", "repin")):

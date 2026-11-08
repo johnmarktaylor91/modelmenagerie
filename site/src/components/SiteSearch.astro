@@ -4,6 +4,8 @@
  * 404 page's. Typing lists the first matches from the compact index; Enter on a match opens
  * it, Enter otherwise opens the listing with `?q=`. Works without JavaScript as a plain form.
  */
+import { SEARCH_PLACEHOLDER } from "@/lib/site";
+
 interface Props {
   /** Unique per page: element ids derive from it. */
   id: string;
@@ -13,7 +15,7 @@ interface Props {
   variant?: "header" | "page";
 }
 
-const { id, label = "Search models", placeholder = "Search", variant = "header" } = Astro.props;
+const { id, label = "Search models", placeholder = SEARCH_PLACEHOLDER, variant = "header" } = Astro.props;
 const inputId = `${id}-input`;
 const listId = `${id}-list`;
 const messageId = `${id}-message`;

@@ -70,6 +70,20 @@ def test_half_built_leftovers_go_but_a_build_in_progress_stays(tmp_path: Path) -
     assert not (building / envs.OVERLAY_COST).exists()
 
 
+def test_an_overlay_being_built_or_already_removed_is_skipped(tmp_path: Path) -> None:
+    import fcntl
+
+    building = _overlay(tmp_path, "building", used=NOW - 3 * 3600, built=False)
+    gone = _overlay(tmp_path, "gone", used=NOW - 4 * DAY)
+    with open(building.parent / ".building.build-lock", "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)  # a run is building it
+        shutil.rmtree(gone)  # another prune got there first, after this one listed it
+        assert envs._remove_overlay(gone) is None
+        report = envs.prune_overlays(tmp_path, keep_days=3, cap_gib=100, now=NOW)
+    assert building.exists() and report["removed_halfbuilt"] == 0
+    assert envs._remove_overlay(building) is not None and not building.exists()
+
+
 def _cached_extra(root: Path, overlay: Path, archive: str, size: int) -> Path:
     """An extra installed the way uv does it: the overlay's file is a hardlink of a cache copy,
     and uv's entry for the package (named like the archive here) is a symlink to the archive."""

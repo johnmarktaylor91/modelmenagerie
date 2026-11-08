@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from menagerie.paths import work_dir
-from menagerie.pipeline import DataLayout, read_json
+from menagerie.pipeline import DataLayout, read_json, read_json_cached
 from menagerie.pipeline.records import ModelRecord
 
 RUN_STEPS = ("forward", "trace")
@@ -91,9 +91,33 @@ def _spent_2b(steps: Mapping[str, str], family: Mapping[str, Any], data: DataLay
         started = brief.stat().st_mtime
         changed = [data.packet(own), *(data.model(m) for m in members)]
         if result.stat().st_mtime >= started and all(
-                not p.exists() or p.stat().st_mtime < started for p in changed):
+                not p.exists() or p.stat().st_mtime < started for p in changed) \
+                and not _unbriefed_dispute(members, data):
             spent.append(own)
     return sorted(spent)
+
+
+def _unbriefed_dispute(members: Sequence[str], data: DataLayout) -> bool:
+    """Whether a member waits for a disputed repair round no brief has carried yet
+    (``drive.dispute``, ``drive.briefed``): its next lane differs from the last one."""
+
+    from menagerie.pipeline import drive
+    from menagerie.pipeline.records import RecordError
+
+    files = drive._load(data, ids=members)
+    for model_id in members:
+        try:
+            record = files.record(model_id)
+        except RecordError:  # unreadable: no dispute can be judged, the spent check stands
+            continue
+        if record is None or record.recipe is None or record.give_up is not None:
+            continue
+        found = drive.dispute(model_id, record, files.rows.get(model_id, []),
+                              files.packet(record.family), data)
+        if found is not None and found[1] and \
+                drive.briefed(record.family, model_id, record.recipe.rev) is None:
+            return True
+    return False
 
 
 def _hold_spent(steps: Mapping[str, str], family: Mapping[str, Any], data: DataLayout
@@ -105,6 +129,85 @@ def _hold_spent(steps: Mapping[str, str], family: Mapping[str, Any], data: DataL
     return {**steps, **held}, spent
 
 
+# The role the tick launches 2b lanes on; a repair round stays on it (``implement.launch``).
+REPAIR_ROLE = "model-implementation"
+
+
+def _hold_repairs(steps: Mapping[str, str], family: Mapping[str, Any], data: DataLayout,
+                  cfg: Mapping[str, Any]) -> tuple[dict[str, str], list[str]]:
+    """Unless 2b may take every hub slot (``2b_on_hub`` true), the steps with a repair family's
+    ``2b`` rows read ``2b:repair-seat``, and those families. A repair round stays on the role it
+    is launched with (``implement.launch``; the tick launches ``model-implementation``), and the
+    worker runtime serves Claude alone (``mini_placement._runtime``). While that role resolves to
+    another harness, placing the family only spends a worker slot on the same refusal every pass,
+    ahead of the families behind it. They start on the hub instead (``_repair_hub``). A capped
+    ``{"lanes": N}`` holds them too: its 2b placements fill the workers first, so the 7 repair
+    families of r3 took both Macs' slots and 3 of the trace host's every pass (3 Nov 2026)."""
+
+    from menagerie.pipeline import admission, mini_placement
+
+    if mini_placement.hub_2b_lanes(cfg) is None:
+        return dict(steps), []
+    repairs = _repair_families(sorted({family[i] for i, s in steps.items()
+                                       if s == "2b" and family.get(i)}), data)
+    if not repairs or admission._resolve(
+            REPAIR_ROLE, harness="claude").get("harness") == "claude":
+        return dict(steps), []
+    held = {i: "2b:repair-seat" for i, s in steps.items() if s == "2b" and family.get(i) in repairs}
+    return {**steps, **held}, repairs
+
+
+def _repair_hub(repairs: Sequence[str], held: set[str], room: int) -> tuple[list[str], str | None]:
+    """The repair families that start on the hub this pass, and why none can: not held by a live
+    or queued lane, at most ``room`` (the hub slots 2a leaves and the 2b cap's room), and only
+    while the Codex gate admits, so a pass without headroom keeps their 2b cap slots for the
+    worker lanes."""
+
+    from menagerie.pipeline import admission
+
+    waiting = [f for f in repairs if f not in held]
+    chosen = waiting[:max(0, room)]
+    if not chosen:
+        return [], ("no hub slot or 2b cap room for a repair lane" if waiting else None)
+    try:
+        if admission._resolve(REPAIR_ROLE).get("harness") == "codex":
+            admission._codex_gate(REPAIR_ROLE, "2b")
+    except admission.Refused as refused:
+        return [], str(refused.result.get("why"))
+    return chosen, None
+
+
+def _launch_repairs(families: Sequence[str], data: DataLayout) -> list[str]:
+    """Repair rounds on the hub, on ``REPAIR_ROLE`` alone and never queued: a refusal (that seat
+    has no headroom) is held, and the next pass asks again. A different lab from the recipe's
+    author is the point of the repair, so it never falls back to the Claude seat (Crawler,
+    2026-10-30)."""
+
+    from menagerie.pipeline import admission, implement
+
+    runs = []
+    for family in families:
+        if not _launch_open():
+            runs.append(LAUNCH_SPENT)
+            continue
+        try:
+            runs.append(implement.launch(family, role=REPAIR_ROLE, data=data, queue=False))
+        except admission.Refused as refused:
+            runs.append(f"held: {refused.result.get('why')}")
+    return runs
+
+
+def _repair_families(families: Sequence[str], data: DataLayout) -> list[str]:
+    """The families whose packet has a member a review called a fabrication (a repair round)."""
+
+    from menagerie.pipeline import implement, ledger
+    from menagerie.pipeline.records import Packet
+
+    rows = ledger.read_containing('"review"', data=data)
+    return [f for f in families if data.packet(f).is_file()
+            and implement.fabrications(read_json_cached(Packet, data.packet(f)), data, rows=rows)]
+
+
 def _not_pending(ids: Sequence[str], data: DataLayout) -> list[str]:
     """The ids ``stage3.queue`` would take: a recipe, no job sent at its revision, and no eval
     trace at its revision and the TorchLens pin. Filtering the traced ones here keeps them from
@@ -112,14 +215,14 @@ def _not_pending(ids: Sequence[str], data: DataLayout) -> list[str]:
 
     from menagerie.pipeline import stage3
 
-    traced = stage3._traced(data)
+    traced, open_ = stage3._traced(data), stage3.open_jobs()
     out = []
     for model_id in ids:
         path = data.model(model_id)
         record = read_json(ModelRecord, path) if path.exists() else None
         if record is None or record.recipe is None or (model_id, record.recipe.rev) in traced:
             continue
-        if not stage3._pending(model_id, record.recipe.rev):  # same package
+        if not stage3._pending(model_id, record.recipe.rev, open_):  # same package
             out.append(model_id)
     return out
 
@@ -143,26 +246,92 @@ def stage3_queue(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> 
     ids = [i for i in ids if cohorts[i] not in stopped]
     if not ids and not cfg.get("big_runner", False):
         return {"skipped": "no worklist"}
-    want = [i for i, step in _steps(ids, data, cfg).items() if step in RUN_STEPS]
-    big = _big_reservations(data, cfg, want) if cfg.get("big_runner", False) else None
+    want = _without_holds([i for i, step in _steps(ids, data, cfg).items() if step in RUN_STEPS], cfg)
+    on = cfg.get("big_runner", False)
+    big = _big_reservations(data, cfg, want) if on or cfg.get("reserve_big", True) else None
     if big is not None:
+        big = {**big, "reserved": _without_holds(big["reserved"], cfg)}
         want = [sid for sid in want if sid not in big["reserved"]]
     spool = cfg["queue_spool"]
     waiting = _waiting(spool)
+    lent = _big_on_b(data, cfg, big["reserved"], waiting) if big is not None and on else {}
+    want = [*want, *lent.get("lend", ())]  # after the normal rows
     room = max(0, int(cfg["queue_depth"]) - waiting)
     candidates = _not_pending(want, data)
     # A row a live lane still holds (a mini lane waiting for its relay ingest) would make
     # stage3.queue refuse the whole batch; it waits for a later pass instead.
     held = stage3.lane_holds(candidates, data) if candidates else {}
     chosen = [i for i in candidates if i not in held][:room]
-    result = {"eligible": len(want), "waiting": waiting, **({"held_by_lane": held} if held else {})}
+    result = {"eligible": len(want), "waiting": waiting, **({"held_by_lane": held} if held else {}),
+              **({"big_on_b": lent} if lent else {})}
     if dry_run or not chosen:
         result = {**result, "would_queue": chosen}
     else:
         result = {**result, "queued": stage3.queue(None, data=data, ids=chosen, spool=spool)}
     if big is None:
         return result
+    if not on:  # reserved for G, which the tick starts only with big_runner on
+        return {**result, "big": {**big, "held": big.get("held") or "big_runner off: reserved rows wait for G"}}
     return {**result, "big": _big_dispatch(data, cfg, big, dry_run=dry_run)}
+
+
+def _without_holds(ids: Sequence[str], cfg: Mapping[str, Any]) -> list[str]:
+    """``ids`` less the rows of the axon batch in flight (``axon_holds``, set by the tick for
+    ``axon_feed`` ``big_cohorts``): no spool takes them while the cluster has them."""
+
+    holds = set(cfg.get("axon_holds") or ())
+    return [sid for sid in ids if sid not in holds]
+
+
+def _big_on_b(data: DataLayout, cfg: Mapping[str, Any], reserved: Sequence[str],
+              waiting: int) -> dict[str, Any]:
+    """Push only (``big_on_b``, rung 4, 3 Nov 2026): by day, outside G's window and its lead-in,
+    B takes big rows into its own 36 GiB declaration, at most ``rows`` at a time (default 1), each
+    projected at most ``max_gib`` (default 28), and only while spool-B has at most
+    ``max_waiting`` (default 2) unclaimed jobs, so normal trace work always goes first. B's
+    runner fits each attempt's cap inside its declaration (``runner.serve`` backfill), so no new
+    admission, lane or owner-first claim is involved. ``lend``: the rows to add to B's queue."""
+
+    from menagerie.pipeline import runner_job, stage3
+
+    given = cfg.get("big_on_b")
+    if not given:
+        return {}
+    if not isinstance(given, Mapping):
+        raise ValueError("big_on_b must be an object: rows, max_gib, max_waiting")
+    rows, max_gib = int(given.get("rows", 1)), float(given.get("max_gib", 28))
+    if runner_job.big_hold_open():
+        return {"held": "G's night window: big rows are G's"}
+    if waiting > int(given.get("max_waiting", 2)):
+        return {"held": f"spool-B has {waiting} jobs waiting: normal trace work first"}
+    in_b = _big_in_b(reserved)
+    room = rows - len(in_b)
+    if room <= 0:
+        return {"in_b": in_b}
+    peaks, families = stage3.Peaks.read(data), stage3._families(data)
+    lend = []
+    for sid in reversed(_not_pending(reserved, data)):  # smallest projection first
+        projected = stage3.projected_peak(read_json(ModelRecord, data.model(sid)), peaks, families)
+        if projected and projected <= max_gib:
+            lend.append(sid)
+        if len(lend) >= room:
+            break
+    return {"in_b": in_b, "lend": lend}
+
+
+def _big_in_b(reserved: Sequence[str]) -> list[str]:
+    """Reserved big rows with an open job on B (sent without G's ``big_runner`` sizing)."""
+
+    from menagerie.pipeline import stage3
+
+    wanted, out = set(reserved), []
+    for name in stage3.open_jobs():
+        sid = name.split("-", 1)[0]
+        if sid in wanted:
+            job = json.loads((stage3._local("sent") / f"{name}.json").read_text(encoding="utf-8"))
+            if not (job.get("sizing") or {}).get("big_runner"):
+                out.append(sid)
+    return out
 
 
 def _big_reservations(data: DataLayout, cfg: Mapping[str, Any], want: Sequence[str]) -> dict[str, Any]:
@@ -250,12 +419,21 @@ def _big_queue(data: DataLayout, cfg: Mapping[str, Any], want: Sequence[str], *,
 
 
 def _busy() -> tuple[Counter[str], set[str]]:
-    """Live and queued lanes by kind, and the family keys they hold."""
+    """Live and queued lanes by kind, and the family keys they hold, with the rows of each 2a lane
+    (``research.lane_rows``): a row with no record or packet yet has no family to hold it by.
+    ``2b-hub`` counts the 2b lanes on the hub (no worker ``placement``) again, for the hub 2b cap;
+    ``2a-worker`` the 2a lanes on a worker, for ``2a_worker_reserve``."""
 
-    from menagerie.pipeline import admission
+    from menagerie.pipeline import admission, research
 
     lanes = [*admission.lanes(data=DataLayout.from_env()), *admission.queued()]
-    return Counter(x["kind"] for x in lanes), {k for x in lanes for k in x.get("keys", ())}
+    held = {k for x in lanes for k in x.get("keys", ())}
+    held.update(i for x in lanes if x["kind"] == "2a" and x.get("brief")
+                for i in research.lane_rows(x["brief"]))
+    count = Counter(x["kind"] for x in lanes)
+    count.update("2b-hub" for x in lanes if x["kind"] == "2b" and not x.get("placement"))
+    count.update("2a-worker" for x in lanes if x["kind"] == "2a" and x.get("placement"))
+    return count, held
 
 
 LAUNCH_SPENT = "held: this pass's launch time is spent; the next pass starts it"
@@ -299,11 +477,29 @@ def _launch_2b(families: Sequence[str] | Sequence[Sequence[str]], data: DataLayo
         run, used = _placed_2b(family, data, placements[n] if placements else None, cfg, hub_room)
         runs.append(run)
         hub_room = _spend(hub_room, used)
+    read = _read_admissions([run for run in runs if not isinstance(run, str)])
     for n, run in enumerate(runs):
         if not isinstance(run, str):
-            runs[n], used = _admitted_2b(families[n], data, run, cfg, hub_room)
+            runs[n], used = _admitted_2b(families[n], data, run, cfg, hub_room,
+                                         read.get(run.lease["label"], _NOT_READ))
             hub_room = _spend(hub_room, used)
     return runs
+
+
+_NOT_READ = object()  # a started lane whose admission ``_read_admissions`` did not read
+
+
+def _read_admissions(started: Sequence[Any]) -> dict[str, Any]:
+    """The started lanes' admissions in one ``run-on state`` call a round
+    (``mini_placement.admissions``); an unreadable round leaves each lane to read its own."""
+    from menagerie.pipeline import mini_placement
+
+    if len(started) < 2:
+        return {}
+    try:
+        return dict(mini_placement.admissions([run.lease["label"] for run in started]))
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
 
 
 def _spend(hub_room: int | None, used: bool) -> int | None:
@@ -335,13 +531,16 @@ def _placed_2b(family: str | Sequence[str], data: DataLayout, host: str | None,
 
 
 def _admitted_2b(family: str | Sequence[str], data: DataLayout, started: Any,
-                 cfg: Mapping[str, Any], hub_room: int | None) -> tuple[str, bool]:
-    """A started worker lane's admission (``mini_placement.finish``), with ``_placed_2b``'s
-    fallback when the worker proved a refusal."""
+                 cfg: Mapping[str, Any], hub_room: int | None,
+                 admitted: Any = _NOT_READ) -> tuple[str, bool]:
+    """A started worker lane's admission (``mini_placement.finish``, given ``admitted`` when
+    read together), with ``_placed_2b``'s fallback when the worker proved a refusal."""
     from menagerie.pipeline import admission, mini_placement
 
     try:
-        return mini_placement.finish(started), False
+        if admitted is _NOT_READ:
+            return mini_placement.finish(started), False
+        return mini_placement.finish(started, admitted), False
     except admission.Refused as refused:
         return _refused_2b(family, data, started.host, cfg, hub_room, refused)
     except (OSError, subprocess.TimeoutExpired):
@@ -355,7 +554,10 @@ def _refused_2b(family: str | Sequence[str], data: DataLayout, host: str | None,
     return f"held: {refused.result.get('why')}", False
 
 
-def _launch_2a(chunks: Sequence[Sequence[str]], data: DataLayout) -> list[str]:
+def _launch_2a(chunks: Sequence[Sequence[str]], data: DataLayout,
+               hosts: list[str] | None = None) -> list[str]:
+    """One 2a lane per chunk; ``hosts`` (free worker slots, ``mini_2a`` on) are tried first."""
+
     from menagerie.pipeline import admission, research
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%S")
@@ -370,7 +572,7 @@ def _launch_2a(chunks: Sequence[Sequence[str]], data: DataLayout) -> list[str]:
         path.write_text(json.dumps({"parent": None, "batches": [
             {"label": label, "families": [{"ids": [i]} for i in chunk]}]}), encoding="utf-8")
         try:
-            runs += research.launch(path, data=data)
+            runs += research.launch(path, data=data, hosts=hosts)
         except admission.Refused as refused:
             runs.append(f"held: {refused.result.get('why')}")
     return runs
@@ -445,7 +647,7 @@ def _cohort_waiting(ids: Sequence[str], steps: Mapping[str, str], family: Mappin
     seen = set()
     for model_id in ids:
         cohort, own = cohorts[model_id], family.get(model_id)
-        if cohort not in groups or own in held:
+        if cohort not in groups or own in held or model_id in held:
             continue
         step = steps.get(model_id)
         if step == "2a":
@@ -503,10 +705,43 @@ def _overlap_research(group: Mapping[str, list[str]], ready: int, share: int,
                     int(cfg["families_per_2a_lane"]))[:max(0, min(slots, caps["2a"] - capacity_busy))]
 
 
+def _research_room(slots: int, mini_slots: int, batches: int, worker_2a: bool,
+                   reserved: int = 0) -> int:
+    """Seats for 2a: the hub slots 2b lanes past the workers leave, plus, with ``mini_2a`` on,
+    the worker slots the 2b lanes leave (``hub_slots`` does not bound those) and the worker
+    slots held back from 2b for 2a (``reserved``, see ``_worker_reserve``)."""
+
+    hub = slots - max(0, batches - mini_slots)
+    return hub + ((max(0, mini_slots - batches) + reserved) if worker_2a else 0)
+
+
+def _worker_reserve(cfg: Mapping[str, Any], mini_slots: Sequence[str], count: Mapping[str, int],
+                    caps: Mapping[str, int], waiting_2a: int) -> tuple[list[str], list[str]]:
+    """Split this pass's free worker slots into (2b's, 2a's): ``2a_worker_reserve`` keeps that many
+    worker slots for 2a lanes, counting 2a lanes already on workers, while rows wait for 2a.
+
+    2b otherwise takes every free worker slot first, so with 2b's queue deep, 2a got none
+    (rung 4 push, 3 Nov 2026). The reserve never exceeds the 2a cap's room or the lanes the
+    waiting rows fill (``families_per_2a_lane`` each). It comes off the first configured workers
+    (the Macs): 2a needs no runner store, and the trace host's owner-first refusals then hit 2b only.
+    """
+
+    given = cfg.get("2a_worker_reserve") or 0
+    if isinstance(given, bool) or not isinstance(given, int) or given < 0:
+        raise ValueError("2a_worker_reserve must be a whole number of worker slots, 0 or more")
+    per = int(cfg["families_per_2a_lane"])
+    keep = min(given - count.get("2a-worker", 0), caps["2a"] - count.get("2a", 0),
+               -(-waiting_2a // per), len(mini_slots))
+    if keep <= 0:
+        return list(mini_slots), []
+    return list(mini_slots[keep:]), list(mini_slots[:keep])
+
+
 def _cohort_batches(ids: Sequence[str], steps: Mapping[str, str], family: Mapping[str, Any],
                     held: set[str], cfg: Mapping[str, Any], caps: Mapping[str, int],
                     available: int, slots: int, count: Mapping[str, int],
-                    data: DataLayout, mini_slots: int = 0) -> tuple[list[list[str]], list[str], list[list[str]]]:
+                    data: DataLayout, mini_slots: int = 0, worker_2a: bool = False,
+                    reserved: int = 0) -> tuple[list[list[str]], list[str], list[list[str]]]:
     """Reserve earlier research and recipes first, then use spare slots for later cohorts."""
     from menagerie.pipeline import implement
 
@@ -526,22 +761,27 @@ def _cohort_batches(ids: Sequence[str], steps: Mapping[str, str], family: Mappin
     batches = implement.batch_groups(primary["2b"], batch_size, data=data)[
         :_cap_room(first, cfg, available, slots_busy[first] + slots_busy["unknown"])]
     ready = len(primary["2b"]) - sum(map(len, batches))
+    seats = min(_research_room(slots, mini_slots, len(batches), worker_2a, reserved),
+                caps["2a"] - count["2a"])
     chunks = _plan_2a(primary["2a"], ready, first_busy, _buffer_target(cfg, caps),
-                      caps["2a"], per)[:max(0, min(slots - max(0, len(batches) - mini_slots), caps["2a"] - count["2a"]))]
+                      caps["2a"], per)[:max(0, seats)]
+    # Earlier rows that still want a seat: a row a live lane holds is not in ``primary``.
+    unseated = set(primary["2a"]).difference(*chunks)
     for cohort in later:
         busy = slots_busy[cohort] + slots_busy["unknown"]
         room = _cap_room(cohort, cfg, _share_room(cohort, cfg, caps, busy), busy)
         limit = min(available - len(batches), slots + mini_slots - len(batches) - len(chunks), room)
         extra = implement.batch_groups(pending[cohort]["2b"], batch_size, data=data)[:max(0, limit)]
         batches.extend(extra)
-        # Later research cannot occupy a seat while earlier research still waits.
-        if any(cohorts[i] == first and steps.get(i) == "2a" for i in ids):
+        # Later research cannot occupy a seat while earlier research still waits for one.
+        if unseated:
             continue
         share = _share_room(cohort, cfg, caps, 0)
         chunks.extend(_overlap_research(
             pending[cohort], len(pending[cohort]["2b"]) - sum(map(len, extra)), share,
             cfg, caps, research_busy[cohort] + research_busy["unknown"],
-            count["2a"] + len(chunks), slots - max(0, len(batches) - mini_slots) - len(chunks)))
+            count["2a"] + len(chunks),
+            _research_room(slots, mini_slots, len(batches), worker_2a, reserved) - len(chunks)))
     return batches, need_2b, chunks
 
 
@@ -574,16 +814,22 @@ def top_up(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> dict[s
     (``agent-capacity``), and admission is read before each one. Review lanes start in ``reviews``,
     describe lanes in ``describes``.
     With ``describes.workers`` on, the worker slots the plan leaves free are recorded as the
-    describe stage's room on the workers (``describe_workers.record_room``).
+    describe stage's room on the workers (``describe_workers.record_room``). With ``mini_2a`` on,
+    2a also gets the worker slots 2b leaves, outside the hub's free slots, and its lanes try those
+    workers first (``research.launch``'s ``hosts``); describe gets what 2a leaves.
     2b launches wait for a fresh bridge heartbeat and, in the tick, runner A's live declaration
     (``cfg["runner_declaration"]``); the 2a plan is unchanged by either hold. 2b lanes run model
     code, so they take only worker slots (``mini_workers``) and every hub slot is left for 2a,
-    unless ``cfg["2b_on_hub"]`` is true (the old placement: hub slots and hub fallback too).
+    unless ``cfg["2b_on_hub"]`` is true (the old placement: hub slots and hub fallback too) or
+    ``{"lanes": N}`` (the same, with at most N 2b lanes on the hub at once, each bounded at launch to
+    its share of the hub 2b budget, ``admission.HUB_2B_PROPERTIES``; 2a keeps the other hub slots).
+    ``2a_worker_reserve`` (N) keeps N free worker slots for 2a while rows wait for it, counting 2a
+    lanes already on workers (``_worker_reserve``); 2b takes the rest first, as before.
     With every slot of both kinds taken it returns at once, before any planning (the tick's
     refill pass caps 2a at zero through ``lane_limits``, so there that means every 2b slot).
     """
 
-    from menagerie.pipeline import drive, mini_placement
+    from menagerie.pipeline import drive, mini_2a, mini_placement
 
     ids = worklist(cfg)
     if not ids:
@@ -596,37 +842,60 @@ def top_up(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> dict[s
     steps = _steps(ids, data, cfg)
     family = drive.families_of(ids, data=data)
     steps, spent = _hold_spent(steps, family, data)
+    steps, repairs = _hold_repairs(steps, family, data, cfg)
     from menagerie.pipeline import tick
 
     cfg = {**cfg, "stopped_cohorts": cfg.get("stopped_cohorts", [
         c for c, v in tick.load_state().get("cohort_states", {}).items() if v.get("stopped")])}
     slots = hub_slots()
-    mini_slots = mini_placement.slots(cfg)
-    hub_2b = _hub_2b_slots(cfg, slots)
+    worker_2a = mini_2a.enabled(cfg) and bool(cfg.get("mini_workers"))
+    groups = _cohort_waiting(ids, steps, family, held, cfg)
+    need_2a = [i for group in groups.values() for i in group["2a"]]
+    mini_slots, reserved_2a = _worker_reserve(cfg, mini_placement.slots(cfg), count, caps,
+                                              len(need_2a)) if worker_2a else (
+        mini_placement.slots(cfg), [])
+    hub_2b = _hub_2b_slots(cfg, slots, count["2b-hub"])
     batch_size = int(cfg.get("families_per_2b_lane", 1))
     available = max(0, min(caps["2b"] - count["2b"], hub_2b + len(mini_slots)))
     batches, need_2b, chunks = _cohort_batches(
-        ids, steps, family, held, cfg, caps, available, slots, count, data, len(mini_slots))
+        ids, steps, family, held, cfg, caps, available, slots, count, data, len(mini_slots),
+        worker_2a, len(reserved_2a))
     held_2b = _held_2b(cfg)
-    if held_2b:
-        batches = []
+    # Repair rounds are the earliest rows waiting: their hub lanes come out of the 2b cap first,
+    # and under a capped hub ({"lanes": N}) out of its N, since they are hub 2b lanes too.
+    capped = bool(mini_placement.hub_2b_lanes(cfg))
+    repair_hub, repair_why = ([], None) if held_2b else _repair_hub(
+        repairs, held, min(slots - len(chunks), caps["2b"] - count["2b"],
+                           hub_2b if capped else caps["2b"]))
+    hub_2b -= len(repair_hub) if capped else 0
+    batches = [] if held_2b else batches[:max(0, min(caps["2b"] - count["2b"] - len(repair_hub),
+                                                     len(mini_slots) + hub_2b))]
     placements = [*mini_slots, *([None] * hub_2b)][:len(batches)]
-    groups = _cohort_waiting(ids, steps, family, held, cfg)
-    need_2a = [i for group in groups.values() for i in group["2a"]]
+    hosts_2a = [*reserved_2a, *_left_over(mini_slots, placements)] if worker_2a else []
     launch_2b = [f for batch in batches for f in batch]
     plan = {"2b_where": _2b_where(cfg, placements), "busy": dict(count), "caps": caps,
             "hub_slots": slots, "2b": launch_2b, "2a": chunks,
             "waiting_2b": len(need_2b), "waiting_2a": len(need_2a), "2b_spent": spent}
+    if worker_2a:
+        plan["2a_worker_slots"] = len(hosts_2a)
+        if cfg.get("2a_worker_reserve"):
+            plan["2a_worker_reserved"] = len(reserved_2a)
     if cfg.get("mini_workers"):
         plan["2b_placements"] = placements
         plan["2b_minis"] = mini_placement.status(cfg)
     if held_2b:
         plan["2b_held"] = held_2b
+    if repairs:
+        plan["2b_repair_seat"] = repairs
+        plan["2b_repair_hub"] = repair_hub if repair_why is None else f"held: {repair_why}"
     if not dry_run and cfg.get("mini_workers") and (cfg.get("describes") or {}).get("workers"):
-        from menagerie.pipeline import describe_workers
+        from menagerie.pipeline import describe_workers, pause
 
-        # 2b first: describe seats get only the worker slots this plan leaves free.
-        plan["describe_room"] = describe_workers.record_room(mini_slots, placements, held=bool(held_2b))
+        # 2b first: describe seats get only the worker slots this plan leaves free. A 2b hold keeps
+        # them free for 2b's return, except under a worker pause, which lasts hours.
+        plan["describe_room"] = describe_workers.record_room(
+            mini_slots, [*placements, *hosts_2a[:len(chunks)]],
+            held=bool(held_2b) and not pause.active(cfg))
     plan["cohorts"] = _cohort_plan(ids, steps, family, cfg, batches, chunks)
     if batch_size > 1:
         plan["2b_batches"] = batches
@@ -634,18 +903,21 @@ def top_up(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> dict[s
         return plan
     chosen = launch_2b if batch_size == 1 else batches
     placed = {"placements": placements, "cfg": cfg,
-              "hub_room": max(0, hub_2b - len(chunks))} if cfg.get("mini_workers") else {}
+              "hub_room": max(0, min(hub_2b, slots - len(chunks)))} if cfg.get("mini_workers") else {}
     with _launch_window(cfg.get("launch_by")):
         with _declared(None if held_2b else cfg.get("runner_declaration")):
-            runs = _launch_2b(chosen, data, **placed)
-        return {**plan, "runs": runs + _launch_2a(chunks, data)}
+            runs = _launch_2b(chosen, data, **placed) + _launch_repairs(repair_hub, data)
+        runs_2a = (_launch_2a(chunks, data, hosts=hosts_2a) if worker_2a
+                   else _launch_2a(chunks, data))
+        return {**plan, "runs": runs + runs_2a}
 
 
 def reviews(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> dict[str, Any]:
     """The review stage (``review.stage``) over the worklist rows at ``review``, when
     ``config.json``'s ``reviews.enabled`` is true: calibration at the prompt in force, recording
     what ended lanes left, and new review lanes while fewer than ``reviews.lanes`` run (default
-    ``admission.lane_cap("review")``, never over its maximum; calibration lanes count)."""
+    ``admission.lane_cap("review")``, never over its maximum; calibration lanes count).
+    ``reviews.cohort_first`` names a cohort whose rows are planned first (worklist order else)."""
 
     from menagerie.pipeline import admission, review
 
@@ -655,9 +927,27 @@ def reviews(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> dict[
     ids = worklist(cfg)
     steps = _steps(ids, data, cfg) if ids else {}
     at = [i for i in ids if steps.get(i) == "review"]
+    first = given.get("cohort_first")
+    if first is not None:  # a push: that cohort's rows get the review seats first
+        if not isinstance(first, str):
+            raise ValueError("reviews.cohort_first must name one cohort")
+        cohorts = _cohorts(cfg)
+        at.sort(key=lambda i: cohorts.get(i) != first)
     count, held = _busy()
     cap = min(int(given.get("lanes", admission.lane_cap("review"))), admission.LANE_CAP_MAX["review"])
     return review.stage(at, data=data, room=cap - count["review"], held=held, dry_run=dry_run)
+
+
+def disputed(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    """While reviews are enabled, take ``review_disputed`` back from each row a fully passed main
+    seat has not reviewed at its recipe (``review_disputed.reopen``; decisions.md 2026-11-03).
+    Typing rows ``review_disputed`` is never a tick step: ``review disputed --apply`` does it."""
+
+    from menagerie.pipeline import review_disputed
+
+    if not (cfg.get("reviews") or {}).get("enabled"):
+        return {"skipped": "reviews are not enabled in config.json"}
+    return review_disputed.reopen(data=data, apply=not dry_run)
 
 
 def describes(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> dict[str, Any]:
@@ -676,33 +966,59 @@ def describes(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> dic
 
 
 def _2b_on_hub(cfg: Mapping[str, Any]) -> bool:
-    """Whether 2b lanes may use hub slots (``config.json`` ``2b_on_hub``, default false)."""
-    value = cfg.get("2b_on_hub", False)
-    if not isinstance(value, bool):
-        raise ValueError("2b_on_hub must be true or false")
-    return value
+    """Whether 2b lanes may use hub slots (``config.json`` ``2b_on_hub``, default false; capped
+    with ``{"lanes": N}``, ``mini_placement.hub_2b_lanes``)."""
+    from menagerie.pipeline import mini_placement
+
+    return mini_placement.hub_2b_lanes(cfg) != 0
 
 
-def _hub_2b_slots(cfg: Mapping[str, Any], slots: int) -> int:
-    """Hub slots 2b lanes may take: none unless ``2b_on_hub``, so 2a keeps every hub slot."""
-    return slots if _2b_on_hub(cfg) else 0
+def _left_over(mini_slots: Sequence[str], placements: Sequence[str | None]) -> list[str]:
+    """The free worker slots, one host name each, that this pass's 2b placements leave."""
+
+    left = list(mini_slots)
+    for host in placements:
+        if host in left:
+            left.remove(host)
+    return left
+
+
+def _hub_2b_slots(cfg: Mapping[str, Any], slots: int, on_hub: int = 0) -> int:
+    """Hub slots 2b lanes may take: none unless ``2b_on_hub``, so 2a keeps every hub slot; every
+    free one when it is true; with ``{"lanes": N}`` what N leaves after the ``on_hub`` 2b lanes
+    already there, so 2a keeps the rest."""
+    from menagerie.pipeline import mini_placement
+
+    lanes = mini_placement.hub_2b_lanes(cfg)
+    return slots if lanes is None else min(slots, max(0, lanes - on_hub))
 
 
 def _2b_where(cfg: Mapping[str, Any], placements: Sequence[str | None]) -> str:
     """Where this pass's 2b lanes go and why, for ``status.md``."""
-    where = ("workers and hub (2b_on_hub true)" if _2b_on_hub(cfg) else
-             "workers only (2b_on_hub false: 2b runs model code; hub slots are kept for 2a)")
+    from menagerie.pipeline import admission, mini_placement
+
+    lanes = mini_placement.hub_2b_lanes(cfg)
+    if lanes is None:
+        where = "workers and hub (2b_on_hub true)"
+    elif lanes:
+        where = (f"workers and hub (2b_on_hub: at most {lanes} hub lanes, each bounded to "
+                 f"{admission.HUB_2B_LANE_CPUS} CPU and {admission.HUB_2B_LANE_GIB} GiB, niced)")
+    else:
+        where = "workers only (2b_on_hub false: 2b runs model code; hub slots are kept for 2a)"
     placed = Counter("hub" if host is None else host for host in placements)
     return f"{where}; this pass: " + (", ".join(f"{n} on {h}" for h, n in placed.items()) or "none")
 
 
 def _held_2b(cfg: Mapping[str, Any]) -> str | None:
-    """Why 2b lanes cannot start this pass: the bridge is not serving, or the tick found no
+    """Why 2b lanes cannot start this pass: the bridge is not serving, the tick found no
     declaration for them (``cfg["runner_declaration"]``; absent outside the tick, where the
-    caller's environment applies and ``implement._wrapper`` checks it)."""
+    caller's environment applies and ``implement._wrapper`` checks it), or a worker pause stops
+    the runner their tries need (``pause``)."""
 
-    from menagerie.pipeline import runner
+    from menagerie.pipeline import pause, runner
 
+    if pause.active(cfg):
+        return pause.note(cfg)
     if not runner.serving(Path(os.environ.get("MENAGERIE_BRIDGE_SPOOL") or work_dir("hubspool"))):
         return "bridge not serving"
     return (cfg.get("runner_declaration") or {}).get("held")
@@ -731,7 +1047,9 @@ def trickle(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> Any:
     documentation as a describe text source (``library_docs.docs``), starting no family after
     ``library_docs_seconds``; then, when ``paper_texts`` is positive, that many packets get the
     open-access text of a paper never fetched (``paper_texts.texts``), starting none after
-    ``paper_texts_seconds``.
+    ``paper_texts_seconds``; then, when ``paper_find`` is positive, that many families describe found
+    no text for look for their paper by exact title or identifier (``paper_texts.identify``), starting
+    none after ``paper_find_seconds``; a paper found there gets its text on a later pass.
 
     The tick commits what it writes (``tick._step_trickle``); a dry run lists the packets due and
     fetches and writes nothing."""
@@ -751,6 +1069,11 @@ def trickle(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> Any:
         rows = [*rows, *paper_texts.texts(
             None, data=data, store=store, limit=limit, write=not dry_run,
             seconds=float(cfg.get("paper_texts_seconds") or 90))]
+    limit = int(cfg.get("paper_find") or 0)
+    if limit > 0:
+        rows = [*rows, *paper_texts.identify(
+            None, data=data, store=store, limit=limit, write=not dry_run,
+            seconds=float(cfg.get("paper_find_seconds") or 60))]
     return rows
 
 
@@ -772,7 +1095,7 @@ def _cohort_counts(data: DataLayout, cfg: Mapping[str, Any]) -> dict[str, dict[s
     counts: dict[str, dict[str, Any]] = {}
     for model_id, cohort in _cohorts(cfg).items():
         own = counts.setdefault(cohort, {"rows": 0, "settled": 0, "validated": 0, "retired": 0,
-                                         "completed_2a": 0, "research_gap": 0})
+                                         "completed_2a": 0, "research_gap": 0, "awaiting_pin": 0})
         for key, n in _row_counts(model_id, files).items():
             own[key] += n
     return counts
@@ -787,12 +1110,12 @@ def _row_counts(model_id: str, files: Any) -> dict[str, int]:
     packet = files.packet(family) if family else None
     giveup = record.give_up if record else None
     rows = files.rows.get(model_id, [])
-    trace = ledger.deciding_trace(model_id, rows, recipe_rev=record.recipe.rev, tl=files.tl
-                                  ) if record and record.recipe else None
-    valid = ledger.validated(trace)
+    valid = ledger.validated_record(record, rows, tl=files.tl) is not None
+    # Validated at an earlier pin and not yet re-traced at this one: a pin move, not a failure.
+    carried = not valid and ledger.validated_record(record, rows) is not None
     typed = giveup is not None and drive._head(giveup.cls) != "infra" and not valid
     step, why = (None, "") if valid or typed else drive._step(model_id, files)
-    return {"rows": 1, "validated": int(valid),
+    return {"rows": 1, "validated": int(valid), "awaiting_pin": int(carried),
             "completed_2a": int(packet is not None or record is not None),
             "research_gap": int(typed and giveup.cls.startswith("research_gap")),
             "settled": int(valid or typed or step == "done"),
@@ -802,18 +1125,23 @@ def _row_counts(model_id: str, files: Any) -> dict[str, int]:
 
 def _trip_reason(cohort: str, counts: Mapping[str, int]) -> str | None:
     """Yield is validated over settled models (retired rows are not models), judged once
-    ``MIN_ATTEMPTED`` settled models got past research; research gaps over completed 2a rows."""
-    if counts["settled"] < MIN_SETTLED:
+    ``MIN_ATTEMPTED`` settled models got past research; research gaps over completed 2a rows.
+    A model validated at an earlier TorchLens pin and waiting for its re-trace (``awaiting_pin``)
+    counts as settled and validated, so a pin move does not trip the yield; a re-trace that fails
+    at the new pin leaves that count and lowers the yield as any failure does."""
+    carried = counts.get("awaiting_pin", 0)
+    if counts["settled"] + carried < MIN_SETTLED:
         return None
     reference = next((v for k, v in COHORT_REFERENCE.items() if cohort.endswith(k)), None)
     if reference is None:
         return None
     # Integer percentages keep equality at the boundary exact.
     threshold = round((reference - YIELD_DROP) * 100)
-    models = counts["settled"] - counts.get("retired", 0)
+    models = counts["settled"] + carried - counts.get("retired", 0)
+    validated = counts["validated"] + carried
     attempted = models - counts["research_gap"]
-    if attempted >= MIN_ATTEMPTED and counts["validated"] * 100 < models * threshold:
-        return (f"{counts['validated']} of {models} settled models validated; "
+    if attempted >= MIN_ATTEMPTED and validated * 100 < models * threshold:
+        return (f"{validated} of {models} settled models validated; "
                 f"yield is below {threshold} percent")
     if counts["research_gap"] * 100 > counts["completed_2a"] * round(GAP_LIMIT * 100):
         return (f"{counts['research_gap']} of {counts['completed_2a']} completed research rows "

@@ -20,7 +20,7 @@ const families = [fixtureFamily(), emptyFamily()];
     <h1>Fixture pages</h1>
     <ul>
       {records.map((record) => <li><a class="textlink" href={`/models/${record.slug}/`}>{record.display_name}</a></li>)}
-      {families.map((family) => <li><a class="textlink" href={`/families/${family.slug}/`}>{family.name} (family page)</a></li>)}
+      {families.map((family) => <li><a class="textlink" href={`/families/${family.slug}/`}>{family.displayName} (family page)</a></li>)}
     </ul>
     <h2>Cards</h2>
     <div class="fixture-cards">

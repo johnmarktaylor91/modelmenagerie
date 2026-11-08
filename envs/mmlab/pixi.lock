@@ -182,7 +182,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/02/c7/c2d91161c9b3e1c237ea00e9cefb7f4bfe2854769f56025db415b734aedb/mmdet-3.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/09/7d/af933f0f6e0767995b4e2d705a0665e454d1c19402aa7e895de3951ebb04/scipy-1.17.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/0b/a7/71ac2cff56fec219ed242bb11b8efb69fcc4bec75db06fb7bfe35de520e6/certifi-2026.7.22-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/0e/4c/7610d3b55a8d55a5b433665e0c78852d7be6f94795ad74742421d436ee8e/torchlens-2.36.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/28/50/f203ff3a3ddfe19308efc83c5a3a29ed02bf786732ec35e68bf9162f3365/safetensors-0.8.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/2c/58/ca301544e1fa93ed4f80d724bf5b194f6e4b945841c5bfd555878eea9fcb/referencing-0.37.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/2c/8b/90eb44a40476fa0e71e05a0283947cfd74a5d36121a11d926ad6f3193cc4/opencv_python-4.11.0.86-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
@@ -213,6 +212,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/81/a5/a513b76c139a3915b43404324e55c0b7979ae4f0d39eb6f075b0282e90a8/markupsafe-3.0.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/89/00/05c2d0369ac322d22d5c05f84b5c4a6856fa6207fbae42869108a28f0383/kiwisolver-1.5.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/8c/6c/b368485b08104c2c20f39fb59db4c40f768b2edf7a0fff2c0858a7439440/torchlens-3.0.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/91/4c/e0ce1ef95d4000ebc1c11801f9b944fa5910ecc15b5e351865763d8657f8/graphviz-0.21-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/97/4e/dbdf6444c243b5262257f5b9ded22eb4758aa9b8430e453badda4dc58ac4/pyvips_binary-8.18.7-cp37-abi3-manylinux_2_28_x86_64.whl
@@ -3098,116 +3098,6 @@ packages:
   version: 2026.7.22
   sha256: 62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
   requires_python: '>=3.7'
-- pypi: https://files.pythonhosted.org/packages/0e/4c/7610d3b55a8d55a5b433665e0c78852d7be6f94795ad74742421d436ee8e/torchlens-2.36.0-py3-none-any.whl
-  name: torchlens
-  version: 2.36.0
-  sha256: 11217356d15309c8befb8687f8a74b424c584d1de626a81f20ac08e934ae5d2c
-  requires_dist:
-  - numpy>=1.26.4
-  - packaging>=23.2
-  - torch>=2.1 ; python_full_version < '3.12'
-  - torch>=2.2 ; python_full_version == '3.12.*'
-  - torch>=2.6 ; python_full_version >= '3.13'
-  - safetensors>=0.4
-  - tqdm>=4.66
-  - graphviz>=0.20.1
-  - typing-extensions>=4.0
-  - pillow>=9
-  - ipython>=8.0 ; extra == 'notebook'
-  - jupyter-client>=8.0 ; extra == 'notebook'
-  - rsatoolbox>=0.1.5,<0.4 ; extra == 'neuro'
-  - brainscore-vision~=2.3 ; python_full_version >= '3.11' and extra == 'brainscore'
-  - netron>=9.2,<10 ; extra == 'netron'
-  - treescope>=0.1.10 ; extra == 'treescope'
-  - h5py>=3.10 ; extra == 'extraction-export'
-  - scipy>=1.10 ; extra == 'extraction-export'
-  - accelerate>=1.0 ; extra == 'deploy'
-  - peft>=0.17 ; extra == 'deploy'
-  - bitsandbytes>=0.48 ; extra == 'deploy'
-  - transformer-lens==3.8.0 ; extra == 'tlens-oracle'
-  - wandb==0.30.0 ; extra == 'trackers-relay-test'
-  - clearml==2.1.12 ; extra == 'trackers-relay-test'
-  - tensorboard>=2.21 ; extra == 'trackers-relay-test'
-  - torchshow~=0.5 ; extra == 'viz'
-  - lovely-tensors~=0.1.18 ; extra == 'viz'
-  - matplotlib>=3.8,<4 ; extra == 'viz'
-  - pandas>=2.0 ; extra == 'tabular'
-  - pyarrow>=14 ; extra == 'tabular'
-  - captum>=0.7,<1.0 ; extra == 'captum'
-  - mcp>=2.0 ; extra == 'mcp'
-  - sae-lens~=6.45 ; python_full_version >= '3.10' and extra == 'sae'
-  - lightning~=2.4 ; extra == 'lightning'
-  - wandb>=0.16 ; extra == 'wandb'
-  - mlx>=0.26,!=0.26.5,<0.27 ; extra == 'mlx'
-  - jax[cpu] ; extra == 'jax'
-  - equinox ; extra == 'jax'
-  - flax ; extra == 'jax'
-  - tinygrad>=0.13,<0.14 ; python_full_version >= '3.11' and extra == 'tinygrad'
-  - paddlepaddle>=3.3,<3.4 ; extra == 'paddle'
-  - tensorflow>=2.16 ; extra == 'tf'
-  - torchlens[tf] ; extra == 'tensorflow'
-  - tensorboard>=2.15,<3 ; extra == 'tensorboard'
-  - transformers>=4.45,<6 ; extra == 'hf'
-  - timm~=1.0 ; extra == 'hf'
-  - grad-cam~=1.5 ; extra == 'gradcam'
-  - shap>=0.45.1,<1 ; extra == 'shap'
-  - inseq~=0.6 ; extra == 'inseq'
-  - steering-vectors~=0.12 ; extra == 'steering'
-  - repeng~=0.4 ; extra == 'repeng'
-  - dialz>=0.2,<2 ; python_full_version < '3.13' and extra == 'dialz'
-  - ipython>=8.0 ; python_full_version < '3.13' and extra == 'dialz'
-  - nnsight~=0.4 ; extra == 'nnsight'
-  - lit-nlp>=1.3,<1.4 ; extra == 'lit'
-  - depyf~=0.18 ; extra == 'depyf'
-  - torchextractor>=0.3,<2 ; extra == 'compat-shims'
-  - sentence-transformers>=2.5,<5 ; extra == 'compat-shims'
-  - torchvision>=0.18,<1 ; extra == 'vision-shims'
-  - torchlens[all-stretch] ; extra == 'all'
-  - grad-cam~=1.5 ; extra == 'all-stretch'
-  - shap>=0.45.1,<1 ; extra == 'all-stretch'
-  - inseq~=0.6 ; extra == 'all-stretch'
-  - steering-vectors~=0.12 ; extra == 'all-stretch'
-  - repeng~=0.4 ; extra == 'all-stretch'
-  - dialz>=0.2,<2 ; python_full_version < '3.13' and extra == 'all-stretch'
-  - ipython>=8.0 ; python_full_version < '3.13' and extra == 'all-stretch'
-  - depyf~=0.18 ; extra == 'all-stretch'
-  - torchextractor>=0.3,<2 ; extra == 'all-stretch'
-  - sentence-transformers>=2.5,<5 ; extra == 'all-stretch'
-  - torchvision>=0.18,<1 ; extra == 'all-stretch'
-  - torchshow~=0.5 ; extra == 'all-stretch'
-  - lovely-tensors~=0.1.18 ; extra == 'all-stretch'
-  - ruff==0.15.4 ; extra == 'dev'
-  - pytest>=8,<10 ; extra == 'dev'
-  - pytest-cov>=5,<8 ; extra == 'dev'
-  - pytest-xdist>=3.6,<4 ; extra == 'dev'
-  - mypy==2.1.0 ; extra == 'dev'
-  - pip-audit==2.10.1 ; extra == 'dev'
-  - pre-commit>=4,<5 ; extra == 'dev'
-  - build>=1.2 ; extra == 'dev'
-  - jsonschema>=4.18,<5 ; extra == 'dev'
-  - lightning~=2.4 ; extra == 'test'
-  - cairosvg>=2.7,<3 ; extra == 'test'
-  - pymupdf>=1.24,<2 ; extra == 'test'
-  - matplotlib>=3.8,<4 ; extra == 'test'
-  - torchlens[tabular] ; extra == 'test'
-  - pydot==4.0.1 ; extra == 'test'
-  - pillow ; extra == 'test'
-  - pytest ; extra == 'test'
-  - pytest-randomly ; extra == 'test'
-  - pytest-timeout ; extra == 'test'
-  - requests ; extra == 'test'
-  - soxr ; extra == 'test'
-  - timm~=1.0 ; extra == 'test'
-  - torch-geometric ; extra == 'test'
-  - torchvision>=0.18,<1 ; extra == 'test'
-  - pyyaml>=6.0 ; extra == 'test'
-  - psutil>=5.9 ; extra == 'test'
-  - transformers>=4.45,<6 ; extra == 'test'
-  - visualpriors ; extra == 'test'
-  - onnx>=1.22 ; extra == 'test'
-  - protobuf ; extra == 'test'
-  - accelerate>=1.0 ; extra == 'test'
-  requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/28/50/f203ff3a3ddfe19308efc83c5a3a29ed02bf786732ec35e68bf9162f3365/safetensors-0.8.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
   name: safetensors
   version: 0.8.0
@@ -3707,6 +3597,120 @@ packages:
   name: kiwisolver
   version: 1.5.1
   sha256: 95a02752aa032eef4aed01cda6d9b687c669bd0396bf4519eef8bba22a286720
+  requires_python: '>=3.10'
+- pypi: https://files.pythonhosted.org/packages/8c/6c/b368485b08104c2c20f39fb59db4c40f768b2edf7a0fff2c0858a7439440/torchlens-3.0.2-py3-none-any.whl
+  name: torchlens
+  version: 3.0.2
+  sha256: 891fa9cf1e456f8b1ae653b56c0e760acef4de6a48de11004c8ab1751ede984d
+  requires_dist:
+  - numpy>=1.26.4
+  - packaging>=23.2
+  - torch>=2.1 ; python_full_version < '3.12'
+  - torch>=2.2 ; python_full_version == '3.12.*'
+  - torch>=2.6 ; python_full_version >= '3.13'
+  - safetensors>=0.4
+  - tqdm>=4.66
+  - graphviz>=0.20.1
+  - typing-extensions>=4.0
+  - pillow>=9
+  - ipython>=8.0 ; extra == 'notebook'
+  - jupyter-client>=8.0 ; extra == 'notebook'
+  - rsatoolbox>=0.1.5,<0.4 ; extra == 'neuro'
+  - xarray>=2023.1 ; extra == 'neuro'
+  - brainscore-vision~=2.3 ; python_full_version >= '3.11' and extra == 'brainscore'
+  - netron>=9.2,<10 ; extra == 'netron'
+  - ai-edge-model-explorer>=0.1.33,<0.2 ; extra == 'model-explorer'
+  - treescope>=0.1.10 ; extra == 'treescope'
+  - h5py>=3.10 ; extra == 'extraction-export'
+  - scipy>=1.10 ; extra == 'extraction-export'
+  - accelerate>=1.0 ; extra == 'deploy'
+  - peft>=0.17 ; extra == 'deploy'
+  - bitsandbytes>=0.48 ; extra == 'deploy'
+  - transformer-lens==3.8.0 ; extra == 'tlens-oracle'
+  - wandb==0.30.0 ; extra == 'trackers-relay-test'
+  - clearml==2.1.12 ; extra == 'trackers-relay-test'
+  - tensorboard>=2.21 ; extra == 'trackers-relay-test'
+  - torchshow~=0.5 ; extra == 'viz'
+  - lovely-tensors~=0.1.18 ; extra == 'viz'
+  - matplotlib>=3.8,<4 ; extra == 'viz'
+  - pandas>=2.0 ; extra == 'tabular'
+  - pyarrow>=14 ; extra == 'tabular'
+  - captum>=0.7,<1.0 ; extra == 'captum'
+  - mcp>=2.0 ; extra == 'mcp'
+  - sae-lens~=6.45 ; python_full_version >= '3.10' and extra == 'sae'
+  - lightning~=2.4 ; extra == 'lightning'
+  - wandb>=0.16 ; extra == 'wandb'
+  - mlx>=0.26,!=0.26.5,<0.27 ; extra == 'mlx'
+  - jax[cpu]>=0.4.30 ; extra == 'jax'
+  - equinox ; extra == 'jax'
+  - flax ; extra == 'jax'
+  - tinygrad>=0.13,<0.14 ; python_full_version >= '3.11' and extra == 'tinygrad'
+  - paddlepaddle>=3.3,<3.4 ; extra == 'paddle'
+  - tensorflow>=2.16 ; extra == 'tf'
+  - torchlens[tf] ; extra == 'tensorflow'
+  - tensorboard>=2.15,<3 ; extra == 'tensorboard'
+  - transformers>=4.45,<6 ; extra == 'hf'
+  - timm~=1.0 ; extra == 'hf'
+  - grad-cam~=1.5 ; extra == 'gradcam'
+  - shap>=0.45.1,<1 ; extra == 'shap'
+  - inseq~=0.6 ; extra == 'inseq'
+  - steering-vectors~=0.12 ; extra == 'steering'
+  - repeng~=0.4 ; extra == 'repeng'
+  - dialz>=1.1,<2 ; python_full_version < '3.13' and extra == 'dialz'
+  - ipython>=8.0 ; python_full_version < '3.13' and extra == 'dialz'
+  - lit-nlp>=1.3,<1.4 ; extra == 'lit'
+  - depyf~=0.18 ; extra == 'depyf'
+  - torchextractor>=0.3,<2 ; extra == 'compat-shims'
+  - sentence-transformers>=2.5,<5 ; extra == 'compat-shims'
+  - torchvision>=0.18,<1 ; extra == 'vision-shims'
+  - torchlens[all-stretch] ; extra == 'all'
+  - grad-cam~=1.5 ; extra == 'all-stretch'
+  - shap>=0.45.1,<1 ; extra == 'all-stretch'
+  - inseq~=0.6 ; extra == 'all-stretch'
+  - steering-vectors~=0.12 ; extra == 'all-stretch'
+  - repeng~=0.4 ; extra == 'all-stretch'
+  - dialz>=1.1,<2 ; python_full_version < '3.13' and extra == 'all-stretch'
+  - ipython>=8.0 ; python_full_version < '3.13' and extra == 'all-stretch'
+  - depyf~=0.18 ; extra == 'all-stretch'
+  - torchextractor>=0.3,<2 ; extra == 'all-stretch'
+  - sentence-transformers>=2.5,<5 ; extra == 'all-stretch'
+  - torchvision>=0.18,<1 ; extra == 'all-stretch'
+  - torchshow~=0.5 ; extra == 'all-stretch'
+  - lovely-tensors~=0.1.18 ; extra == 'all-stretch'
+  - ruff==0.15.4 ; extra == 'dev'
+  - pytest>=8,<10 ; extra == 'dev'
+  - pytest-cov>=5,<8 ; extra == 'dev'
+  - pytest-xdist>=3.6,<4 ; extra == 'dev'
+  - mypy==2.1.0 ; extra == 'dev'
+  - pip-audit==2.10.1 ; extra == 'dev'
+  - pre-commit>=4,<5 ; extra == 'dev'
+  - build>=1.2 ; extra == 'dev'
+  - jsonschema>=4.18,<5 ; extra == 'dev'
+  - import-linter>=2.0,<3 ; extra == 'dev'
+  - lightning~=2.4 ; extra == 'test'
+  - cairosvg>=2.7,<3 ; extra == 'test'
+  - pymupdf>=1.24,<2 ; extra == 'test'
+  - matplotlib>=3.8,<4 ; extra == 'test'
+  - torchlens[tabular] ; extra == 'test'
+  - pydot==4.0.1 ; extra == 'test'
+  - pillow ; extra == 'test'
+  - pytest ; extra == 'test'
+  - pytest-randomly ; extra == 'test'
+  - pytest-timeout ; extra == 'test'
+  - requests ; extra == 'test'
+  - soxr ; extra == 'test'
+  - timm~=1.0 ; extra == 'test'
+  - torch-geometric ; extra == 'test'
+  - torchvision>=0.18,<1 ; extra == 'test'
+  - pyyaml>=6.0 ; extra == 'test'
+  - psutil>=5.9 ; extra == 'test'
+  - transformers>=4.45,<6 ; extra == 'test'
+  - visualpriors ; extra == 'test'
+  - onnx>=1.22 ; extra == 'test'
+  - protobuf ; extra == 'test'
+  - accelerate>=1.0 ; extra == 'test'
+  - nbclient>=0.10,<1 ; extra == 'test'
+  - ipykernel>=6.29,<8 ; extra == 'test'
   requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/91/4c/e0ce1ef95d4000ebc1c11801f9b944fa5910ecc15b5e351865763d8657f8/graphviz-0.21-py3-none-any.whl
   name: graphviz

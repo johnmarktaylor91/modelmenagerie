@@ -14,8 +14,8 @@ def test_private_probe_snapshots_status_before_trace_cleanup(monkeypatch: pytest
     from types import SimpleNamespace
 
     pytest.importorskip("torch")
-    from torchlens import user_funcs
-
+    pytest.importorskip("torchlens")
+    from menagerie import tl_validation
     from menagerie.pipeline import repin_checks
 
     def validate(*args: object, **kwargs: object) -> bool:
@@ -24,7 +24,7 @@ def test_private_probe_snapshots_status_before_trace_cleanup(monkeypatch: pytest
         trace.validation_replay_status.state = "available"
         return True
 
-    monkeypatch.setattr(user_funcs, "_validate_forward_pass_torch", validate)
+    monkeypatch.setattr(tl_validation, "_legacy_validator", lambda: validate)
     result = repin_checks.private_calls()
     assert result["passed"] and result["observer_states"] == ["passed"]
 

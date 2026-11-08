@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from menagerie import tl_compat
 from menagerie.pipeline import DataLayout, now, read_json
 
 GELU_IDS = ("m3638", "m10919", "m4246")
@@ -17,12 +18,13 @@ CHILD_TIMEOUT_S = 1800
 
 
 def private_calls() -> dict[str, Any]:
-    """Exercise the validator and observer, diagnostics and legacy wrapper path."""
+    """Exercise the validator door and its observer, the diagnostics reader and the legacy
+    wrapper path."""
 
     import torch
     from torchlens.backends.torch.wrappers import wrap_torch
-    from torchlens.user_funcs import _validate_forward_pass_torch
-    from torchlens.validation.diagnostics import get_validation_failure
+
+    from menagerie import tl_validation
 
     states = []
 
@@ -33,10 +35,10 @@ def private_calls() -> dict[str, Any]:
     old_threads = torch.get_num_threads()
     try:
         torch.manual_seed(0)
-        passed = _validate_forward_pass_torch(
-            torch.nn.Linear(3, 2).eval(), [torch.ones(1, 3)], {}, random_seed=0,
-            validate_metadata=True, num_threads=1, _trace_observer=observe)
-        diagnostic = get_validation_failure(None)
+        passed = tl_validation.validate_forward(
+            torch.nn.Linear(3, 2).eval(), [torch.ones(1, 3)], {}, seed=0, num_threads=1,
+            observer=observe)
+        diagnostic = tl_validation.failure_for(None)
     finally:
         torch.set_num_threads(old_threads)
     return {"passed": bool(passed) and states == ["passed"] and callable(wrap_torch),
@@ -68,10 +70,10 @@ def gelu_probe(sid: str, data: DataLayout) -> dict[str, Any]:
         subject = worker._build(recipe, device="meta" if sid == "m4246" else "cpu")
         trace = worker._hash_capture(subject, structure_only=sid == "m4246")
         captures.append({"hashes": trace_summary.hash_family(trace),
-                         "n_ops": trace.num_ops,
-                         "gelu": sum(op.layer_type == "gelu" for op in trace.layer_list),
-                         "internalsource": sum(op.layer_type == "internalsource"
-                                               for op in trace.layer_list)})
+                         "n_ops": tl_compat.num_ops(trace),
+                         "gelu": sum(tl_compat.op_type(op) == "gelu" for op in tl_compat.layer_list(trace)),
+                         "internalsource": sum(tl_compat.op_type(op) == "internalsource"
+                                               for op in tl_compat.layer_list(trace))})
         del trace, subject
         gc.collect()
     return {"id": sid, "torchlens": tl.__version__, "captures": captures,

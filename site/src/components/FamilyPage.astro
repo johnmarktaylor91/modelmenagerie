@@ -1,34 +1,49 @@
 ---
 /**
  * A family's grouping page: its summary when the export has one, the paper its members share,
- * and every member as a card, smallest first. Used by /families/<slug>/ and the fixture pages.
+ * and every member as a card, fewest parameters first. Used by /families/<slug>/ and the fixture pages.
  */
+import { renderSummaryMarkdown } from "@/lib/markdown";
+import { summaryLabel } from "@/lib/summary";
 import ModelCard from "@/components/ModelCard.astro";
 import type { Family } from "@/lib/families";
-import { categoryLabel, formatNumber } from "@/lib/labels";
+import { formatNumber, taskLabel } from "@/lib/labels";
 
 interface Props {
   family: Family;
 }
 
 const { family } = Astro.props;
-const tasks = [...new Set(family.members.map((member) => categoryLabel(member.category)))];
+const tasks = [...new Set(family.members.map((member) => taskLabel(member.category)))];
 const count = family.members.length;
-const lede = `${formatNumber(count)} ${count === 1 ? "model" : "models"}${tasks.length === 1 ? `, ${tasks[0].toLowerCase()}` : ""}. Smallest first.`;
+const lede = `${formatNumber(count)} ${count === 1 ? "model" : "models"}${tasks.length === 1 && tasks[0] ? `, ${tasks[0].toLowerCase()}` : ""}. Fewest parameters first.`;
+// The summary's first paragraph shows; the rest waits behind "Read more", so the cards start on the first phone screen.
+const summaryBlocks = (family.summary ?? "").split(/\n\s*\n/).map((block) => block.trim()).filter(Boolean);
+const summaryFirst = renderSummaryMarkdown(summaryBlocks[0]);
+const summaryRest = renderSummaryMarkdown(summaryBlocks.slice(1).join("\n\n"));
 ---
 
 <section class="shell family-page py-8">
   <header class="family-head">
     <a class="family-back" href="/families/">All families</a>
-    <h1 class="family-title">{family.name}</h1>
+    <h1 class="family-title">{family.displayName}</h1>
     <p class="family-lede">{lede}</p>
-    {family.summary && <p class="family-summary">{family.summary}</p>}
+    {summaryFirst && <div class="family-summary" data-quoted set:html={summaryFirst} />}
+    {
+      summaryRest && (
+        <details class="family-more">
+          <summary>Read more</summary>
+          <div class="family-summary" data-quoted set:html={summaryRest} />
+        </details>
+      )
+    }
+    {family.summary && <p class="family-ai-label">{summaryLabel(null, false)}</p>}
     {
       family.paper && (
         <p class="family-paper">
           Paper:{" "}
           <a class="textlink" href={family.paper.url} rel="noopener">
-            {family.paper.title ?? "read the paper"}
+            {family.paper.title ? <span data-quoted>{family.paper.title}</span> : "read the paper"}
           </a>
         </p>
       )
@@ -79,8 +94,32 @@ const lede = `${formatNumber(count)} ${count === 1 ? "model" : "models"}${tasks.
     margin: 0.5rem 0 0;
   }
 
+  .family-ai-label {
+    margin: 0.35rem 0 0;
+    color: var(--secondary);
+    font-size: 0.875rem;
+  }
+
   .family-summary {
     line-height: 1.6;
+  }
+
+  .family-summary :global(p),
+  .family-summary :global(ul) {
+    margin: 0 0 0.5rem;
+  }
+
+  .family-more {
+    margin-top: 0.25rem;
+  }
+
+  .family-more > summary {
+    cursor: pointer;
+    width: fit-content;
+    padding-block: 0.25rem;
+    color: var(--secondary);
+    text-decoration: underline;
+    text-underline-offset: 0.2em;
   }
 
   .family-grid {

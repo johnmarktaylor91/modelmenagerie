@@ -298,6 +298,37 @@ def test_a_gzipped_blob_that_unzips_wrong_is_refused(
         store.get(line.sha256, store=st)
 
 
+def test_trim_unpack_cache_removes_only_entries_past_the_lease(
+        layout: tuple, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    st, data = layout
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("MENAGERIE_UNPACK_CACHE", str(cache))
+    monkeypatch.setenv("MENAGERIE_STORE_PACK_FILES", "1")
+    src = tmp_path / "view.json"
+    src.write_bytes(VIEW)
+    line = store.put(src, store=st, data=data, mime="application/json", license_class="derived")
+    assert store.get(line.sha256, store=st).read_bytes() == VIEW  # gunzipped into the cache
+    old_tree = cache / ("e" * 64)
+    (old_tree / "sub").mkdir(parents=True)
+    (old_tree / "sub" / "f").write_bytes(b"x" * 10)
+    dead = cache / ".abcdef123456.tmp"  # an unpack that died
+    dead.mkdir()
+    now = (cache / line.sha256).stat().st_mtime + 60
+    past = now - store.UNPACK_LEASE_SECONDS - 1
+    for path in (old_tree, dead):
+        os.utime(path, (past, past))
+    report = store.trim_unpack_cache(now=now)
+    assert report == {"entries": 3, "removed": 2, "freed_bytes": 10}
+    assert sorted(p.name for p in cache.iterdir()) == [line.sha256]
+    later = now + store.UNPACK_LEASE_SECONDS + 1
+    assert store.trim_unpack_cache(now=later)["removed"] == 1
+    assert store.get(line.sha256, store=st).read_bytes() == VIEW  # rebuilt on next use
+    assert store.trim_unpack_cache(tmp_path / "absent") == {"entries": 0, "removed": 0,
+                                                            "freed_bytes": 0}
+
+
 def test_trace_metrics_reads_a_gzipped_summary(
         layout: tuple, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from menagerie.pipeline import trace_metrics
@@ -314,3 +345,79 @@ def test_trace_metrics_reads_a_gzipped_summary(
                     tl="2.35.3", trace="b" * 64, summary=sha)
     assert trace_metrics.summary(row, st) == {"n_layers": 7}
     assert trace_metrics.summary(dataclasses.replace(row, summary="c" * 64), st) is None
+
+
+def test_a_signed_url_is_recorded_without_its_query(tmp_path):
+    data, layout = DataLayout(tmp_path / "data"), StoreLayout(tmp_path / "store")
+    doc = tmp_path / "paper.pdf"
+    doc.write_bytes(b"%PDF-1.4 signed")
+    signed = ("https://bucket.r2.example.com/pdfs/a/b.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+              "&X-Amz-Credential=KEYID%2F20261028%2Fauto%2Fs3%2Faws4_request&X-Amz-Signature=ab12")
+    line = store.put(doc, store=layout, data=data, mime="application/pdf",
+                         license_class="third-party", url=signed)
+    assert line.url == "https://bucket.r2.example.com/pdfs/a/b.pdf"
+    assert "X-Amz" not in data.store_index(line.fetched[:7]).read_text()
+    plain = "https://arxiv.org/abs/1810.01367?context=cs"
+    assert store.public_url(plain) == plain
+
+
+def test_public_url_drops_each_signing_family_and_keeps_the_rest():
+    base = "https://cdn.example.com/f.bin"
+    cases = {
+        "?X-Amz-Date=1&X-Amz-Signature=ab&X-Amz-Expires=60": "",  # S3 and R2 presigning
+        "?X-Goog-Signature=ab&X-Goog-Date=1&alt=media": "?alt=media",  # Google signed URL
+        "?xip=1&response-content-disposition=x&X-Xet-Cas-Uid=u&user_id=u&Expires=9&Policy=p&Signature=s"
+        "&Key-Pair-Id=k": "?xip=1&response-content-disposition=x",  # CloudFront, with the HF account ids
+        "?sv=1&st=2&se=3&sr=b&sp=r&sig=ab&rscd=x": "?rscd=x",  # Azure SAS
+        "?token=ab&page=2": "?page=2",
+        "?page=2": "?page=2",
+        "?kid=ab12&meta=eyJhbGciOiJ.eyJzdWIiOiJ.c2lnbmF0dXJl&redirect_url=%2F": "?kid=ab12&redirect_url=%2F",
+    }
+    for query, kept in cases.items():
+        assert store.public_url(base + query) == base + kept
+    assert store.public_url(base + "?sig=ab#part") == base + "#part"
+
+
+def test_public_line_rewrites_only_a_signed_url():
+    signed = '{"schema":"store-index/1","sha256":"aa","url":"https://e.com/x.pdf?a=1&X-Amz-Signature=ab"}'
+    assert store.public_line(signed) == '{"schema":"store-index/1","sha256":"aa","url":"https://e.com/x.pdf?a=1"}'
+    plain = '{"sha256": "aa", "url": "https://e.com/x.pdf?a=1"}'
+    assert store.public_line(plain) is plain
+    assert store.public_line('{"old": 1}') == '{"old": 1}'
+
+
+def test_a_packed_bundle_with_no_tensors_unpacks_with_its_empty_blobs_folder(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MENAGERIE_UNPACK_CACHE", str(tmp_path / "cache"))
+    bundle = tmp_path / "bundle"
+    (bundle / "blobs").mkdir(parents=True)
+    (bundle / "manifest.json").write_text('{"tensors": []}')
+    (bundle / "metadata.pkl").write_bytes(b"meta")
+    sha = tree_sha256(bundle)
+    packed = tmp_path / "bundle.tar.gz"
+    store.pack_tree(bundle, packed)
+    path = store._unpacked(sha, packed)
+    assert (path / "blobs").is_dir() and tree_sha256(path) == sha
+    shutil.rmtree(path / "blobs")  # a tree unpacked before the fix, found in the cache
+    assert (store._unpacked(sha, packed) / "blobs").is_dir()
+
+
+def test_tree_sha256_streams_files_without_reading_them_whole(tmp_path: Path,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    """A big row's save holds single files of about 2 GiB; hashing one whole killed the trim."""
+
+    tree = tmp_path / "save"
+    (tree / "blobs").mkdir(parents=True)
+    big = (b"0123456789abcdef" * 200_000)  # over two 1 MiB chunks
+    (tree / "blobs" / "0000000005.safetensors").write_bytes(big)
+    (tree / "manifest.json").write_bytes(b"{}")
+    lines = [f"{rel}\0{hashlib.sha256(body).hexdigest()}\n" for rel, body in
+             (("blobs/0000000005.safetensors", big), ("manifest.json", b"{}"))]
+    expected = hashlib.sha256("".join(lines).encode()).hexdigest()
+
+    def refuse(self: Path) -> bytes:
+        raise AssertionError(f"read whole: {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    assert tree_sha256(tree) == expected
+    assert tree_sha256(tree / "manifest.json") == hashlib.sha256(b"{}").hexdigest()

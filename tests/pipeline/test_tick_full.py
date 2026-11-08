@@ -8,6 +8,7 @@ import os
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -135,6 +136,17 @@ def test_yield_waits_for_a_hundred_attempted_models() -> None:
     assert tick_full._trip_reason("r4-github", gaps) is None
 
 
+def test_pin_move_does_not_trip_yield() -> None:
+    # TorchLens 3.0.2 pin, 6 Nov: validated rows wait for their re-trace, only give-ups stay settled
+    moved = {"settled": 1099, "retired": 225, "validated": 0, "completed_2a": 3925,
+             "research_gap": 25, "awaiting_pin": 1707}
+    assert tick_full._trip_reason("r4-github", moved) is None
+    # re-traces that fail at the new pin leave awaiting_pin without becoming validated
+    failing = {**moved, "awaiting_pin": 200}
+    assert tick_full._trip_reason("r4-github", failing) == (
+        "200 of 1074 settled models validated; yield is below 37 percent")
+
+
 @pytest.mark.parametrize("gaps,stops", [(10, False), (11, True)])
 def test_gap_denominator_is_completed_research(tmp_path: Path, work: Path,
                                               monkeypatch: pytest.MonkeyPatch,
@@ -238,7 +250,9 @@ def test_rows_traced_at_their_revision_never_take_the_queue_s_room(
     monkeypatch.setattr(tick_full, "read_json", lambda cls, path: SimpleNamespace(
         recipe=None if path.stem == "m4" else SimpleNamespace(rev="r1")))
     monkeypatch.setattr(stage3, "_traced", lambda data: {("m1", "r1"), ("m2", "r0")})
-    monkeypatch.setattr(stage3, "_pending", lambda model_id, rev: "sent" if model_id == "m3" else None)
+    monkeypatch.setattr(stage3, "open_jobs", lambda: ["m3-r1-1"])
+    monkeypatch.setattr(stage3, "_pending", lambda model_id, rev, open_: (
+        "sent" if model_id == "m3" and open_ == ["m3-r1-1"] else None))
     assert tick_full._not_pending(["m1", "m2", "m3", "m4"], data) == ["m2"]
 
 
@@ -388,11 +402,33 @@ def test_hub_slots_go_to_2a_while_2b_is_off_the_hub(work: Path, monkeypatch: pyt
         assert out["2b_where"].startswith("workers only (2b_on_hub false") and out["2b_where"].endswith("none")
 
 
-def test_2b_on_hub_defaults_false_and_must_be_a_boolean(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("bad", ["false", {"lanes": 5}, {"lanes": True}, {"lanes": 2, "cpus": 4}, {}])
+def test_2b_on_hub_defaults_false_and_must_be_a_boolean_or_a_lane_cap(
+        work: Path, monkeypatch: pytest.MonkeyPatch, bad: Any) -> None:
     assert tick.DEFAULTS["2b_on_hub"] is False
     cfg = _scheduler(work, monkeypatch)
-    with pytest.raises(ValueError, match="2b_on_hub must be true or false"):
-        tick_full.top_up(DataLayout(work / "data"), {**cfg, "2b_on_hub": "false"}, dry_run=True)
+    with pytest.raises(ValueError, match="2b_on_hub must be true, false or"):
+        tick_full.top_up(DataLayout(work / "data"), {**cfg, "2b_on_hub": bad}, dry_run=True)
+
+
+@pytest.mark.parametrize("on_hub", [0, 1, 2])
+def test_a_hub_2b_cap_counts_the_hub_lanes_running_and_leaves_2a_the_rest(
+        work: Path, monkeypatch: pytest.MonkeyPatch, on_hub: int) -> None:
+    cfg = {**_scheduler(work, monkeypatch, early=0), "2b_on_hub": {"lanes": 2}}
+    (work / "worklist.txt").write_text("m0 r3\nm1 r3\nm2 r3\nm3 r3\nm4 r3\n")
+    monkeypatch.setattr(drive, "next_steps", lambda ids, data: [
+        {"id": i, "step": "2b" if i in ("m0", "m1", "m2") else "2a"} for i in ids])
+    # A worker-placed 2b lane is not a hub lane; ``on_hub`` of the running ones are.
+    monkeypatch.setattr(tick_full, "_busy", lambda: (
+        Counter({"2b": on_hub + 1, "2b-hub": on_hub}), set()))
+    out = tick_full.top_up(DataLayout(work / "data"), cfg, dry_run=True)
+    assert len(out["2b"]) == 2 - on_hub and out["waiting_2b"] == 3
+    assert out["2a"] == [["m3", "m4"]]  # 2a keeps the hub slots the cap leaves
+    assert out["2b_where"].startswith("workers and hub (2b_on_hub: at most 2 hub lanes, each "
+                                      "bounded to 1 CPU and 4 GiB, niced)")
+    assert tick_full._hub_2b_slots({"2b_on_hub": True}, 7, 3) == 7  # true: every free slot
+    assert tick_full._hub_2b_slots({"2b_on_hub": {"lanes": 3}}, 1, 0) == 1  # never past the free ones
+    assert tick_full._hub_2b_slots({}, 7) == 0
 
 
 def test_cohort_share_counts_batches_and_never_mixes_cohorts(work: Path,
@@ -459,7 +495,8 @@ def test_later_busy_research_does_not_reduce_primary_demand(work: Path, monkeypa
     monkeypatch.setattr(tick_full, "_busy", lambda: (Counter({"2a": 1}), {"f-m20"}))
     monkeypatch.setattr(tick_full, "_lane_busy", lambda cfg, family, kind: Counter({"r4-github": 1}))
     out = tick_full.top_up(DataLayout(work / "data"), cfg, dry_run=True)
-    assert out["cohorts"]["r3"]["2a"] == 2 and out["cohorts"]["r4-github"]["2a"] == 0
+    # r3's two lanes seat every r3 row, so the one seat left goes to r4-github
+    assert out["cohorts"]["r3"]["2a"] == 2 and out["cohorts"]["r4-github"]["2a"] == 1
 
 
 def test_later_research_can_use_spare_capacity_while_primary_2a_is_live(
@@ -471,6 +508,49 @@ def test_later_research_can_use_spare_capacity_while_primary_2a_is_live(
     monkeypatch.setattr(tick_full, "_lane_busy", lambda cfg, family, kind: Counter({"r3": 1}))
     out = tick_full.top_up(DataLayout(work / "data"), cfg, dry_run=True)
     assert out["cohorts"]["r4-github"]["2a"] == 2
+
+
+def test_an_earlier_row_a_live_lane_holds_does_not_block_later_research(
+        work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A repair row in a running 2a lane needs no seat, so the 2a seats go to the later cohort.
+    cfg = _scheduler(work, monkeypatch, early=1, held={"f-m0"})
+    monkeypatch.setattr(drive, "next_steps", lambda ids, data: [{"id": i, "step": "2a"} for i in ids])
+    monkeypatch.setattr(tick_full, "_busy", lambda: (Counter({"2a": 1}), {"f-m0"}))
+    out = tick_full.top_up(DataLayout(work / "data"), cfg, dry_run=True)
+    assert out["cohorts"]["r3"] == {**out["cohorts"]["r3"], "waiting_2a": 1, "2a": 0}
+    assert out["2a"] == [[f"m{n}" for n in range(10, 18)], ["m18", "m19"]]
+
+
+def test_earlier_rows_without_a_seat_still_hold_later_research_back(
+        work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _scheduler(work, monkeypatch, early=10)
+    monkeypatch.setattr(drive, "next_steps", lambda ids, data: [{"id": i, "step": "2a"} for i in ids])
+    monkeypatch.setattr(tick_full, "_caps", lambda cfg: {"2a": 1, "2b": 5})
+    out = tick_full.top_up(DataLayout(work / "data"), cfg, dry_run=True)
+    assert out["2a"] == [[f"m{n}" for n in range(8)]] and out["cohorts"]["r4-github"]["2a"] == 0
+
+
+def test_rows_a_live_2a_lane_lists_are_held_though_they_have_no_family_yet(
+        work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from menagerie.pipeline import admission, research
+
+    lane_dir = work / "briefs" / "2a-tick-x-0"
+    lane_dir.mkdir(parents=True)
+    (lane_dir / research.ROWS_FILE).write_text('["m10", "m11"]\n')
+    monkeypatch.setattr(admission, "lanes", lambda data: [
+        {"kind": "2a", "keys": ["f-a"], "brief": str(lane_dir / "BRIEF.md")},
+        {"kind": "2b", "keys": ["f-b"], "brief": str(lane_dir / "BRIEF.md")},
+        {"kind": "2b", "keys": ["f-c"], "placement": "worker-a"}])
+    monkeypatch.setattr(admission, "queued", list)
+    count, held = tick_full._busy()
+    assert count == Counter({"2a": 1, "2b": 2, "2b-hub": 1})  # the worker lane is not on the hub
+    assert held == {"f-a", "f-b", "f-c", "m10", "m11"}
+    cfg = _scheduler(work, monkeypatch, early=0)
+    monkeypatch.setattr(drive, "next_steps", lambda ids, data: [{"id": i, "step": "2a"} for i in ids])
+    monkeypatch.setattr(drive, "families_of", lambda ids, data: {i: None for i in ids})
+    monkeypatch.setattr(tick_full, "_busy", lambda: (Counter({"2a": 1}), held))
+    out = tick_full.top_up(DataLayout(work / "data"), cfg, dry_run=True)
+    assert out["2a"] == [[f"m{n}" for n in range(12, 20)]]
 
 
 def test_stopped_cohort_is_not_newly_queued_for_forward_or_trace(work: Path,
@@ -496,6 +576,20 @@ def test_a_row_a_live_lane_holds_waits_and_the_rest_still_queue(work: Path,
     monkeypatch.setattr(stage3, "lane_holds", lambda ids, data: {"m2": "run-1"})
     out = tick_full.stage3_queue(DataLayout(work / "data"), {**tick.DEFAULTS}, dry_run=True)
     assert out["would_queue"] == ["m1", "m3"] and out["held_by_lane"] == {"m2": "run-1"}
+
+
+def test_rows_in_the_axon_batch_in_flight_stay_out_of_every_spool(work: Path,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    (work / "worklist.txt").write_text("m1 r3\nm2 r4-github\nm3 r3\n")
+    monkeypatch.setattr(drive, "next_steps", lambda ids, data: [
+        {"id": i, "step": "trace"} for i in ids])
+    monkeypatch.setattr(tick_full, "_waiting", lambda spool: 0)
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: list(ids))
+    monkeypatch.setattr(tick_full, "_big_candidates", lambda data, want, cfg=None: ["m2", "m3"])
+    monkeypatch.setattr(tick_full, "_big_dispatch", lambda data, cfg, big, dry_run: big)
+    cfg = {**tick.DEFAULTS, "big_runner": True, "axon_holds": ["m2"]}
+    out = tick_full.stage3_queue(DataLayout(work / "data"), cfg, dry_run=True)
+    assert out["big"]["reserved"] == ["m3"] and out["would_queue"] == ["m1"]
 
 
 def test_2b_share_counts_lane_slots_not_research_keys(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:

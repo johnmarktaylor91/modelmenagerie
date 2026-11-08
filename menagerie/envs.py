@@ -1591,6 +1591,8 @@ def smoke_worker(env_key: str, stable_ids: Sequence[str]) -> int:
     import torch
     import torchlens as tl
 
+    from menagerie import tl_compat
+
     torch.set_num_threads(1)
     for row in _rows_by_stable_id(stable_ids):
         model = instantiate_model(row)
@@ -1599,7 +1601,7 @@ def smoke_worker(env_key: str, stable_ids: Sequence[str]) -> int:
         input_value = build_input_for_row(row)
         with torch.no_grad():
             trace = tl.trace(model, input_value, capture=tl.options.CaptureOptions(inference_only=True))
-        if int(getattr(trace, "num_ops", 0) or 0) <= 0:
+        if tl_compat.num_ops(trace) <= 0:
             raise RuntimeError(f"{row.stable_id} produced an empty trace in {env_key}")
         result = tl.validation.validate_forward_pass(model, input_value, validate_metadata=True)
         if not bool(result):

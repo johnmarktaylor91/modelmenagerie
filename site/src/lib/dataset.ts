@@ -6,10 +6,10 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { ASSET_BASE, assetHref } from "@/lib/assets";
 import { getExportRoot, getManifest } from "@/lib/catalog";
 import { DATASET_FILES, PAGES_MAX_FILE_BYTES, publicDatasetText } from "@/lib/dataset-files.mjs";
 
-const publicR2Base = (import.meta.env.PUBLIC_R2_BASE as string | undefined)?.replace(/\/+$/, "") ?? "";
 
 export interface DatasetFile {
   file: string;
@@ -25,42 +25,76 @@ export interface DatasetFile {
 const FILE_INFO: Record<string, Omit<DatasetFile, "file" | "href" | "bytes">> = {
   "catalog.csv": { label: "CSV", saveAs: "model-menagerie-catalog.csv", format: "text/csv", primary: true },
   "models.jsonl": { label: "JSON Lines", saveAs: "model-menagerie-models.jsonl", format: "application/jsonl", primary: false },
+  "models.jsonl.gz": { label: "JSON Lines (gzip)", saveAs: "model-menagerie-models.jsonl.gz", format: "application/gzip", primary: false },
   "export_manifest.json": { label: "Release summary (JSON)", saveAs: "model-menagerie-release.json", format: "application/json", primary: false },
 };
 
-/** A numbered release published as files under `dataset/<version>/` on the asset host (plan section 4). */
+/**
+ * The release files the export published on the asset host (``publish release``): today the full
+ * records as gzipped JSON Lines, too large for the site's own origin.
+ */
 interface PublishedRelease {
   version: string;
-  files: { name: string; bytes: number; format?: string }[];
+  files: { name: string; path?: string; bytes: number; format?: string }[];
 }
 
-/** The release block of a site-export/1 manifest, when the export carries one. */
+/** The release block of a site-export/1 manifest, when the export carries one and the build has an asset host. */
 function publishedRelease(): PublishedRelease | null {
   const release = (getManifest() as unknown as { dataset_release?: PublishedRelease }).dataset_release;
-  return release && Array.isArray(release.files) && release.files.length > 0 && publicR2Base ? release : null;
+  return release && Array.isArray(release.files) && release.files.length > 0 && ASSET_BASE ? release : null;
 }
 
 /**
- * The files to offer: a published release's files on the asset host when the export names one,
- * otherwise the catalog files the build copies to /dataset/ (see astro.config.mjs).
+ * The files to offer, one inventory for the buttons, the Python example and the structured data: the
+ * catalog files the build copies to /dataset/ (see astro.config.mjs) that fit under the hosting cap,
+ * then the release files on the asset host. A file in both places is offered once, from the site.
  */
 export function datasetFiles(): DatasetFile[] {
-  const release = publishedRelease();
-  if (release) {
-    return release.files.map((item, index) => ({
-      file: item.name,
-      label: item.name,
-      saveAs: `model-menagerie-${release.version}-${item.name}`,
-      format: item.format ?? "application/octet-stream",
-      href: `${publicR2Base}/dataset/${release.version}/${item.name}`,
-      bytes: item.bytes,
-      primary: index === 0,
-    }));
-  }
-  return DATASET_FILES.map((file) => {
-    const text = publicDatasetText(fs.readFileSync(path.join(getExportRoot(), file), "utf-8"), publicR2Base);
+  const onSite = DATASET_FILES.map((file) => {
+    const text = publicDatasetText(fs.readFileSync(path.join(getExportRoot(), file), "utf-8"), assetHref);
     return { file, ...FILE_INFO[file], href: `/dataset/${file}`, bytes: Buffer.byteLength(text) };
   }).filter((item) => item.bytes <= PAGES_MAX_FILE_BYTES);
+  const release = publishedRelease();
+  const hosted = (release?.files ?? [])
+    .filter((item) => !onSite.some((site) => site.file === item.name))
+    .map((item) => ({
+      file: item.name,
+      label: FILE_INFO[item.name]?.label ?? item.name,
+      saveAs: `model-menagerie-${release!.version}-${item.name}`,
+      format: item.format ?? FILE_INFO[item.name]?.format ?? "application/octet-stream",
+      href: assetHref(item.path ?? `dataset/${release!.version}/${item.name}`),
+      bytes: item.bytes,
+      primary: false,
+    }));
+  // The summary goes last: it describes the release rather than holding records.
+  const ordered = [...onSite.filter((item) => item.file !== "export_manifest.json"), ...hosted, ...onSite.filter((item) => item.file === "export_manifest.json")];
+  return ordered;
+}
+
+/** An absolute address for a file from `datasetFiles`. */
+function absolute(href: string, siteUrl: string): string {
+  return new URL(href, siteUrl).href;
+}
+
+/**
+ * The Dataset page's Python example, built from the same files as its buttons: the CSV, and the full
+ * records when a JSON Lines file is on offer; null when there is no CSV to load.
+ */
+export function pythonExample(files: DatasetFile[], siteUrl: string): string | null {
+  const csv = files.find((item) => item.file === "catalog.csv");
+  if (!csv) return null;
+  const lines = [
+    "import pandas as pd",
+    "",
+    `models = pd.read_csv("${absolute(csv.href, siteUrl)}")`,
+    'print(models[["display_name", "category", "n_ops"]].head())',
+  ];
+  const jsonl = files.find((item) => item.file === "models.jsonl") ?? files.find((item) => item.file === "models.jsonl.gz");
+  if (jsonl) {
+    const gzip = jsonl.file.endsWith(".gz") ? ', compression="gzip"' : "";
+    lines.push("", "# Each model's full record, with diagram file addresses and checksums:", `records = pd.read_json("${absolute(jsonl.href, siteUrl)}", lines=True${gzip})`);
+  }
+  return lines.join("\n");
 }
 
 /** Plain meaning of every column of `catalog.csv`; `models.jsonl` has the same fields plus those below. */
@@ -70,14 +104,23 @@ const CSV_COLUMNS: Record<string, string> = {
   display_name: "Model name.",
   category: "Task category, such as vision_classification-backbone. The site shows it as a plain label.",
   family_normalized: "Architecture family the model belongs to.",
-  domain: "Broad field of the model. Not filled in yet.",
-  zoo: "Collection the model was found in. Not filled in yet.",
+  domain: "Broad field of the model, such as vision/segmentation, when recorded.",
+  zoo: "Collection the model was found in, such as timm.",
   source_zoo: "Library or repository the model's code comes from, when recorded.",
-  source_license: "Licence of the model's source code as an SPDX identifier, when recorded.",
+  source_license: "License of the model's source code as an SPDX identifier, when recorded.",
+  source_url: "Address of the model's source code, when recorded.",
+  paper_url: "Address of the paper that introduced the model, when recorded.",
+  year: "Year the model was published, when recorded.",
+  year_source: "Where the year comes from: citation (the paper's citation record) or june_era (an earlier estimate).",
+  era: "Period the model belongs to as first cataloged: a year, a range of years, or blank.",
+  backend: "Framework the traced code is written in, such as torch.",
+  validation_state: "passed when the trace passed its replay check (for PyTorch, a match with the model's own forward pass); structure_only when only the graph's structure was captured.",
+  capture: "full when the whole forward pass was captured; structure_only when only the graph's structure was.",
+  torchlens_version: "TorchLens version that made the trace, when recorded.",
   render_status: "Whether a diagram was drawn. Every row in this release has one.",
   forward_validated:
-    "true when the capture was replayed operation by operation and matched the model's own forward pass.",
-  input_tier: "The input the model was traced on: real (a genuine example), wrapper (generated data of the right shape) or none recorded.",
+    "true when the trace was replayed operation by operation and passed its check.",
+  input_tier: "The input the model was traced on: real (an example input from its source), wrapper (generated data of the right shape) or blank when not recorded.",
   quarantine: "true for rows held back from the listing.",
   n_ops: "Number of operations TorchLens recorded in one forward pass.",
   graph_shape_hash: "Fingerprint of the graph's structure. Models with the same value have the same graph shape.",
@@ -122,7 +165,9 @@ export function datasetColumns(): ColumnInfo[] {
   }
   return [
     ...header.map((name) => ({ name, description: CSV_COLUMNS[name], jsonlOnly: false })),
-    ...Object.entries(JSONL_ONLY).map(([name, description]) => ({ name, description, jsonlOnly: true })),
+    ...Object.entries(JSONL_ONLY)
+      .filter(([name]) => !header.includes(name))
+      .map(([name, description]) => ({ name, description, jsonlOnly: true })),
   ];
 }
 

@@ -111,6 +111,18 @@ def test_a_fabrication_review_blocks(rows: dict) -> None:
     assert _state([rows["pass"], rows["render"], review, minor], rows["rev"]) == "publishable"
 
 
+def test_a_confirm_seat_answer_never_clears_a_fabrication(rows: dict) -> None:
+    """The confirm-only seat may only confirm; its other answers leave the row waiting."""
+
+    review = LedgerRow(id="m8839", stage="review", at="2026-10-05T00:00:00Z", host="agent",
+                       env="review", recipe_rev=rows["rev"], outcome="pass",
+                       verdict="fabrication", reviewer="model-design-review")
+    faithful = dataclasses.replace(review, at="2026-10-06T00:00:00Z", verdict="faithful",
+                                   reviewer="model-judgment")
+    assert _state([rows["pass"], rows["render"], review, faithful], rows["rev"]) == (
+        "not_publishable")
+
+
 def test_structure_only_and_train_rows_never_decide_the_verdict(rows: dict) -> None:
     meta = dataclasses.replace(rows["pass"], at="2026-10-05T00:00:00Z", capture="structure_only",
                                validation_state="structure_only", params_source="geometry")

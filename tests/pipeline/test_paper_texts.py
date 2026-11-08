@@ -1,13 +1,16 @@
 """Open-access paper texts for paper sources never fetched, with the network and pdftotext stood in."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from menagerie.pipeline import DataLayout, StoreLayout, describe_text, fetch, paper_texts
+from menagerie.pipeline import DataLayout, StoreLayout, describe_text, fetch, paper_check, paper_texts
 from menagerie.pipeline import read_json, store as store_mod, tick_full, write_json
-from menagerie.pipeline.records import Availability, Identity, Member, Packet, Search, Source
+from menagerie.pipeline.records import (
+    Availability, Citation, Identity, Member, Packet, Search, Source,
+)
 
 AT = "2026-10-08T20:00:00Z"
 ABS = ('<html><head><title>[1512.03385] Deep Residual Learning</title></head><body>'
@@ -37,6 +40,7 @@ class Web:
 def roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[DataLayout, StoreLayout]:
     monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path / "work"))
     monkeypatch.setattr(store_mod, "_pdf_text", lambda blob, out: out.write_text(FULL))
+    monkeypatch.setattr(paper_check, "matches", lambda *a, **k: True)  # test_paper_check has it
     return DataLayout(tmp_path / "data"), StoreLayout(tmp_path / "store")
 
 
@@ -174,3 +178,97 @@ def test_the_backlog_unit_commits_exactly_what_each_batch_wrote(roots, monkeypat
     assert "1 gained a text" in commits[0][1]
     runs = (tmp_path / "work" / "paper-texts" / "runs.jsonl").read_text().splitlines()
     assert len(runs) == 3 and json.loads(runs[-1])["rows"] == []
+
+
+CODE = Source(sid="s1", role="code", url="menagerie/classics/example.py")
+
+
+def _cited(family: str, **ids: str) -> Packet:
+    return replace(_packet(family, CODE), citation=Citation(title="Deep Residual Learning", **ids))
+
+
+def test_a_citation_no_source_names_gets_its_paper_as_p_cited(roots, monkeypatch):
+    data, store = roots
+    write_json(_cited("f-resnet", arxiv="1512.03385"), data.packet("f-resnet"))
+    _web(monkeypatch, {"https://arxiv.org/abs/1512.03385": (ABS.encode(), "text/html"),
+                       "https://arxiv.org/pdf/1512.03385": (PDF, "application/pdf")})
+    [row] = paper_texts.texts(None, data=data, store=store)
+    assert row == {"family": "f-resnet", "status": "text", "sids": ["p-cited", "p-cited-pdf"]}
+    by = {s.sid: s for s in read_json(Packet, data.packet("f-resnet")).sources}
+    assert by["p-cited"].url == "https://arxiv.org/abs/1512.03385" and by["p-cited"].text
+    assert (by["rights-p-cited"].of, by["rights-p-cited"].spdx) == ("p-cited", "CC-BY-NC-SA-4.0")
+    assert paper_texts.texts(None, data=data, store=store) == []
+
+
+def test_a_citation_a_paper_source_already_names_is_not_fetched_twice(roots):
+    data, _ = roots
+    packet = replace(_packet("f-resnet", ARXIV), citation=Citation(title="x", arxiv="1512.03385"))
+    assert [s.sid for s in paper_texts._wanting(packet)] == ["s1"]
+
+
+def test_citation_only_packets_come_after_the_rest(roots):
+    data, store = roots
+    write_json(_cited("f-a", doi="10.1234/abc"), data.packet("f-a"))
+    write_json(_packet("f-z", ARXIV), data.packet("f-z"))
+    rows = paper_texts.texts(None, data=data, store=store, write=False)
+    assert [r["family"] for r in rows] == ["f-z", "f-a"]
+
+
+def _describe(data: DataLayout, family: str, **record) -> None:
+    path = data.describe(family)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"family": family, **record}))
+
+
+def test_identify_tries_textless_families_without_an_id_and_rests_misses(roots, monkeypatch):
+    from menagerie.pipeline import find_paper
+
+    data, store = roots
+    for family in ("f-found", "f-miss", "f-old", "f-full", "f-known"):
+        write_json(_packet(family, CODE), data.packet(family))
+    write_json(_cited("f-known", arxiv="1512.03385"), data.packet("f-known"))
+    _describe(data, "f-found", basis="none")
+    _describe(data, "f-miss", basis="none")
+    _describe(data, "f-old", **{"class": "describe:no_text"})
+    _describe(data, "f-full", basis="full")
+    _describe(data, "f-known", basis="none")
+    asked = []
+
+    def find(families, *, data, store):
+        asked.extend(families)
+        status = {"f-found": "found", "f-old": "held"}.get(families[0], "needs_2a")
+        return [{"family": families[0], "status": status}]
+
+    monkeypatch.setattr(find_paper, "find", find)
+    assert [r["family"] for r in paper_texts.identify(None, data=data, store=store, write=False)] \
+        == ["f-found", "f-miss", "f-old"]
+    rows = paper_texts.identify(None, data=data, store=store, limit=5)
+    assert [r["status"] for r in rows] == ["found", "needs_2a", "held"] and asked == [
+        "f-found", "f-miss", "f-old"]
+    assert [r["family"] for r in paper_texts.identify(None, data=data, store=store, write=False)] \
+        == ["f-found"]
+
+
+def test_the_trickle_identifies_after_fetching_texts(roots, monkeypatch, tmp_path):
+    from menagerie.pipeline import find_paper
+
+    data, _ = roots
+    monkeypatch.setenv("MENAGERIE_STORE", str(tmp_path / "store"))
+    monkeypatch.setattr(find_paper, "harvest", lambda *a, **k: [])
+    calls = []
+    monkeypatch.setattr(paper_texts, "texts", lambda *a, **k: calls.append("texts") or [])
+    monkeypatch.setattr(paper_texts, "identify",
+                        lambda *a, **k: calls.append(("identify", k["limit"], k["seconds"])) or [])
+    tick_full.trickle(data, {"trickle_limit": 0, "paper_texts": 2, "paper_find": 4},
+                      dry_run=True)
+    assert calls == ["texts", ("identify", 4, 60.0)]
+
+
+def test_find_reads_a_module_docstring_paper_line():
+    from menagerie.pipeline import find_paper
+
+    text = ('"""Mogrifier LSTM.\n\nPaper: "Mogrifier LSTM", Melis, Dyer, and Blunsom, ICLR 2020.\n'
+            '"""\n')
+    other = '"""Arrow LM.\n\nPaper: Tarau 2026, "Arrow Language Models."\n"""\n'
+    assert find_paper._titles(None, [("s1", text)]) == ["Mogrifier LSTM"]
+    assert find_paper._titles(None, [("s1", other)]) == ["Arrow Language Models"]

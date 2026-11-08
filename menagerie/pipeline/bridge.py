@@ -219,7 +219,8 @@ def _forward(link: _Link, path: Path, local: Path, remote: str) -> None:
     except (RecordError, ValueError):
         os.replace(path, local / "rejected" / path.name)
         return
-    shas = (request.recipe.vendor, *(request.recipe.code or ()))
+    weights = (request.recipe.weights,) if request.recipe.weights else ()
+    shas = (request.recipe.vendor, *(request.recipe.code or ()), *weights)
     try:
         for sha in shas:
             _drain(sha)
@@ -234,7 +235,8 @@ def _forward(link: _Link, path: Path, local: Path, remote: str) -> None:
 
 
 def _drain(vendor: str | None) -> None:
-    """Make sure a vendor blob is in the worker store; a blob not staged here is already there."""
+    """Make sure a vendor, code or weights blob is in the worker store; a blob not staged here is
+    already there."""
 
     if vendor is None:
         return

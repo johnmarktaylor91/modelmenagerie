@@ -6,6 +6,10 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the checkout: names that differ by pin
+from menagerie import tl_compat  # noqa: E402
 
 PROMISED = (
     "torch", "torchvision", "torchlens", "timm", "transformers", "diffusers",
@@ -36,7 +40,7 @@ def main() -> int:
         name = torch.cuda.get_device_name(0) if device == "cuda" else "cpu"
         print(f"canary {device} ({name}): python {sys.version.split()[0]}, torch "
               f"{torch.__version__} cuda {torch.version.cuda}, torchlens {tl.__version__}, "
-              f"resnet18 {tuple(out.shape)}, tiny trace {trace.num_ops} ops")
+              f"resnet18 {tuple(out.shape)}, tiny trace {tl_compat.num_ops(trace)} ops")
     return 0
 
 

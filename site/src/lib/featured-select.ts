@@ -47,7 +47,8 @@ function isShowcaseable(model: ModelRecord, thumbUses: Map<string, number>): boo
     return false;
   }
   return (
-    hasUsablePreview(variant.thumb.bytes) &&
+    model.own_diagram !== false &&
+    (Boolean(variant.thumb_crop) || hasUsablePreview(variant.thumb.bytes)) &&
     cardImage(variant).bytes <= MAX_FEATURED_IMAGE_BYTES &&
     (thumbUses.get(variant.thumb.sha256) ?? 0) <= MAX_SHARED_THUMB_USES
   );
@@ -83,6 +84,16 @@ export function getFeaturedModels(models: readonly ModelRecord[], count = 6, exc
     }
   }
   return picked.slice(0, count);
+}
+
+/**
+ * The models the browse page opens on: the curated list in its order, keeping only those that can
+ * stand on the home page (their own, real, not oversized picture). No fallback picks.
+ */
+export function getListingFeatured(models: readonly ModelRecord[]): ModelRecord[] {
+  const thumbUses = thumbUseCounts(models);
+  const bySlug = new Map(models.map((model) => [model.slug, model]));
+  return FEATURED_SLUGS.map((slug) => bySlug.get(slug)).filter((model): model is ModelRecord => model !== undefined && isShowcaseable(model, thumbUses));
 }
 
 export interface HeroImage {

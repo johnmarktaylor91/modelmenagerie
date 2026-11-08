@@ -21,6 +21,8 @@ export interface ListingState {
   /** The view in the address; null leaves it to the visitor's remembered choice. */
   view: ViewKey | null;
   page: number;
+  /** True when structure-only records and catalogued models with no diagram are listed too (`untraced=1`). */
+  untraced: boolean;
 }
 
 /** A state with no query, filters or choices. */
@@ -50,15 +52,15 @@ export function parseSort(raw: string | null): SortKey | null {
   return SORT_KEYS.find((key) => key === raw) ?? null;
 }
 
-/** The sort used when the visitor has not chosen one: best match while searching, pictures first otherwise. */
+/** The sort used when the visitor has not chosen one: best match while searching, featured first otherwise. */
 export function defaultSort(state: ListingState): SortKey {
-  return state.q.trim() ? "match" : "preview";
+  return state.q.trim() ? "match" : "featured";
 }
 
 /** The sort actually applied: the visitor's choice, or the default. */
 export function effectiveSort(state: ListingState): SortKey {
-  if (state.sort === "match" && !state.q.trim()) {
-    return "preview";
+  if ((state.sort === "match" && !state.q.trim()) || (state.sort === "preview" && !state.untraced)) {
+    return "featured";
   }
   return state.sort ?? defaultSort(state);
 }
@@ -71,7 +73,14 @@ export function readListingState(params: URLSearchParams): ListingState {
   for (const key of FILTER_KEYS) {
     filters[key] = [...new Set(params.getAll(key).map((value) => value.trim()).filter(Boolean))];
   }
-  return { q, filters, sort: parseSort(params.get("sort")), view: parseView(params.get("view")), page: parsePage(params.get("page")) };
+  return {
+    q,
+    filters,
+    sort: parseSort(params.get("sort")),
+    view: parseView(params.get("view")),
+    page: parsePage(params.get("page")),
+    untraced: params.get("untraced") === "1",
+  };
 }
 
 /** Write listing state as URL search parameters, omitting defaults. */
@@ -84,6 +93,9 @@ export function writeListingState(state: ListingState): URLSearchParams {
     for (const value of state.filters[key]) {
       params.append(key, value);
     }
+  }
+  if (state.untraced) {
+    params.set("untraced", "1");
   }
   if (state.sort) {
     params.set("sort", state.sort);
@@ -104,7 +116,7 @@ export function activeFilterCount(state: ListingState): number {
 
 /** True when the listing must be computed in the browser rather than shown from a static page. */
 export function needsClientResults(state: ListingState): boolean {
-  return Boolean(state.q.trim()) || activeFilterCount(state) > 0 || state.sort !== null;
+  return Boolean(state.q.trim()) || activeFilterCount(state) > 0 || state.sort !== null || state.untraced;
 }
 
 /** Clamp a page to the range that exists for `total` results. */

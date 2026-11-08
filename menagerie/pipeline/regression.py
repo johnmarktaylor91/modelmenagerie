@@ -23,6 +23,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from menagerie import tl_compat
 from menagerie.pipeline import DataLayout, read_json
 from menagerie.pipeline.records import Caps, LedgerRow, ModelRecord, RunResult
 
@@ -272,8 +273,16 @@ def _agreement(row: Mapping[str, Any], base: Mapping[str, str],
     if june_status != new_status:
         return "no", f"verdict differs: june {june_status}, new {new_status}"
     if new_status == "validated":
-        ops_equal = str(base.get("n_ops")) == str(new.get("n_ops"))
-        hash_equal = base.get("graph_shape_hash") == new.get("graph_hash")
+        # The June manifests are written by the June validator at the pin, in the same run as the
+        # new path, and carry no version column: their values are the new row's pin's.
+        june_tl, new_tl = base.get("tl") or new.get("tl"), new.get("tl")
+        try:
+            ops_equal = tl_compat.same_value("n_ops", base.get("n_ops"), june_tl,
+                                             new.get("n_ops"), new_tl)
+            hash_equal = tl_compat.same_value("graph_hash", base.get("graph_shape_hash"), june_tl,
+                                              new.get("graph_hash"), new_tl)
+        except tl_compat.MixedPinError as exc:
+            return "no", f"validated in both; not compared: {exc}"
         if not (ops_equal and hash_equal):
             return "no", f"validated in both; n_ops equal {ops_equal}, graph hash equal {hash_equal}"
     return "yes", ""
@@ -290,7 +299,8 @@ R0_COLUMNS = (
 PIN_COLUMNS = (
     "stable_id", "name", "batch", "r0", "r1", "first_r1", "r0_n_ops", "r1_n_ops", "r0_hash",
     "r1_hash", "r1_class", "r0_structure_only", "r1_structure_only", "agree", "note", "runnable",
-    "r1_peak_mb", "r1_s", "capture_s", "ready_capture_s", "env", "tl", "rss_cap_mb", "threads",
+    "r1_peak_mb", "r1_s", "capture_s", "ready_capture_s", "env", "r0_tl", "tl", "rss_cap_mb",
+    "threads",
 )
 
 
@@ -329,7 +339,8 @@ def pincheck(r1_rows: Sequence[Mapping[str, Any]], r0_table: Sequence[Mapping[st
             "runnable": r1.get("runnable"), "r1_peak_mb": r1.get("peak_rss_mb"),
             "r1_s": r1.get("wall_s"), "capture_s": r1.get("capture_secs"),
             "ready_capture_s": r1.get("save_capture_secs"), "env": r1.get("env"),
-            "tl": r1.get("tl"), "rss_cap_mb": r1.get("rss_cap_mb"), "threads": r1.get("threads"),
+            "r0_tl": r0.get("tl"), "tl": r1.get("tl"), "rss_cap_mb": r1.get("rss_cap_mb"),
+            "threads": r1.get("threads"),
         }
         row["agree"], row["note"] = _pin_agreement(row, weights=r0["agree"] == "explained",
                                                    rerun=sid in rerun)
@@ -347,10 +358,14 @@ def _pin_differences(row: Mapping[str, Any]) -> list[str]:
     if r0_shape != r1_shape:
         differs.append(f"structure-only r0 {r0_shape}, r1 {r1_shape}")
     if row["r0"] == row["r1"] == "validated":
-        if str(row["r0_n_ops"]) != str(row["r1_n_ops"]):
-            differs.append(f"n_ops r0 {row['r0_n_ops']}, r1 {row['r1_n_ops']}")
-        if row["r0_hash"] != row["r1_hash"]:
-            differs.append("graph hash differs")
+        tl_r0, tl_r1 = row.get("r0_tl"), row.get("tl")
+        ops = tl_compat.compare_note("n_ops", row["r0_n_ops"], tl_r0, row["r1_n_ops"], tl_r1)
+        if ops:
+            differs.append(f"n_ops r0 {row['r0_n_ops']}, r1 {row['r1_n_ops']}"
+                           if ops == "n_ops differs" else ops)
+        graph = tl_compat.compare_note("graph_hash", row["r0_hash"], tl_r0, row["r1_hash"], tl_r1)
+        if graph:
+            differs.append("graph hash differs" if graph == "graph_hash differs" else graph)
     return differs
 
 

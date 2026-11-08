@@ -17,7 +17,7 @@ const families = listFamilyPages();
       {
         families.map((family) => (
           <li>
-            <a class="textlink" href={`/families/${family.slug}/`}>{family.name}</a>
+            <a class="textlink" href={`/families/${family.slug}/`}>{family.displayName}</a>
             <span class="families-count">{formatNumber(family.members.length)}</span>
           </li>
         ))
@@ -59,6 +59,8 @@ const families = listFamilyPages();
   }
 
   .families-count {
+    flex: none;
+    white-space: nowrap;
     color: var(--secondary);
     font-variant-numeric: tabular-nums;
   }

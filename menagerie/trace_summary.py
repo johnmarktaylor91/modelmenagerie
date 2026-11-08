@@ -25,6 +25,7 @@ from menagerie.op_taxonomy import (
 )
 from menagerie.recipe import build_input_for_row, instantiate_model
 from menagerie.structural_digest import DIGEST_CAPTURE_POLICY, _trace_for_digest
+from menagerie import tl_compat
 
 # 1.0.0: initial schema. 1.1.0: binds the digest capture policy (``digest_capture_policy``
 # column, fixed forward seed) into every traced row; currency requires this exact version
@@ -307,7 +308,7 @@ def _module_class_name(trace: Any, op: Any) -> str | None:
         Owning module class name when TorchLens recorded one.
     """
 
-    atomic_module = getattr(op, "atomic_module", None)
+    atomic_module = tl_compat.op_field(op, "atomic_module")
     if atomic_module is not None:
         return str(getattr(atomic_module, "class_name", "") or "") or None
     module_address = getattr(op, "module", None)
@@ -437,7 +438,7 @@ def _graph_depth_and_width(compute_ops: Sequence[Any]) -> tuple[int, int]:
     distances = [
         int(distance)
         for op in compute_ops
-        if (distance := getattr(op, "max_distance_from_input", None)) is not None
+        if (distance := tl_compat.op_field(op, "max_distance_from_input")) is not None
     ]
     if not distances:
         return 0, 0
@@ -458,7 +459,7 @@ def _module_max_depth(compute_ops: Sequence[Any]) -> int:
         Maximum module nesting depth.
     """
 
-    return max((int(getattr(op, "module_call_depth", 0) or 0) for op in compute_ops), default=0)
+    return max((int(tl_compat.op_field(op, "module_call_depth", 0) or 0) for op in compute_ops), default=0)
 
 
 def _flops_coverage(compute_ops: Sequence[Any]) -> tuple[float, int]:
@@ -475,7 +476,7 @@ def _flops_coverage(compute_ops: Sequence[Any]) -> tuple[float, int]:
         ``(coverage_pct, unknown_count)``.
     """
 
-    unknown = sum(getattr(op, "flops_forward", None) is None for op in compute_ops)
+    unknown = sum(tl_compat.op_field(op, "flops_forward") is None for op in compute_ops)
     return _percent(len(compute_ops) - unknown, len(compute_ops)), unknown
 
 
@@ -557,7 +558,7 @@ def _largest_activation_bytes(compute_ops: Sequence[Any]) -> int:
         Maximum activation-memory value.
     """
 
-    return max((int(getattr(op, "activation_memory", 0) or 0) for op in compute_ops), default=0)
+    return max((int(tl_compat.op_field(op, "activation_memory", 0) or 0) for op in compute_ops), default=0)
 
 
 def _output_summary(trace: Any) -> tuple[str, int, str]:
@@ -686,7 +687,7 @@ def _has_custom_op(compute_ops: Sequence[Any]) -> bool:
     for op in compute_ops:
         func = getattr(op, "func", None)
         module_name = str(getattr(func, "__module__", "") or "")
-        qualname = str(getattr(op, "func_qualname", "") or "")
+        qualname = str(tl_compat.op_field(op, "func_qualname", "") or "")
         if module_name and not module_name.startswith(standard_prefixes):
             return True
         if qualname and "." in qualname and not qualname.startswith(standard_prefixes):
@@ -719,12 +720,12 @@ def _has_residual(trace: Any, compute_ops: Sequence[Any]) -> bool:
         parents = [ops[label] for label in op.parents if label in ops]
         for left_index, left_parent in enumerate(parents):
             left_ancestors = set(getattr(left_parent, "input_ancestors", set()) or set())
-            left_distance = getattr(left_parent, "max_distance_from_input", None)
+            left_distance = tl_compat.op_field(left_parent, "max_distance_from_input")
             for right_parent in parents[left_index + 1 :]:
                 right_ancestors = set(getattr(right_parent, "input_ancestors", set()) or set())
                 if left_parent.label in right_ancestors or right_parent.label in left_ancestors:
                     return True
-                right_distance = getattr(right_parent, "max_distance_from_input", None)
+                right_distance = tl_compat.op_field(right_parent, "max_distance_from_input")
                 if left_distance is not None and right_distance is not None:
                     if abs(int(left_distance) - int(right_distance)) > 1:
                         return True
@@ -827,7 +828,7 @@ def _layer_order(trace: Any) -> dict[str, int]:
     """Map each layer's parent-reference label (pass-qualified when multi-pass) to its index."""
 
     order = {}
-    for index, layer in enumerate(trace.layer_list):
+    for index, layer in enumerate(tl_compat.layer_list(trace)):
         single = getattr(layer, "num_passes", 1) == 1
         label = layer.layer_label if single else getattr(layer, "label", None)
         order[label or layer.layer_label] = index
@@ -851,9 +852,9 @@ def _hash_record(layer: Any, order: Mapping[str, int], with_module: bool) -> dic
 
     func = str(getattr(layer, "func_name", None))
     sized = func in _INPUT_SIZED_OPS or classify_op(func) == "reshape"
-    is_buffer = bool(getattr(layer, "is_buffer", False))
+    is_buffer = bool(tl_compat.op_field(layer, "is_buffer", False))
     record = {
-        "type": getattr(layer, "layer_type", None),
+        "type": tl_compat.op_type(layer),
         "func": func,
         "parents": [order.get(label) for label in _seq(layer, "parents")],
         "io": [bool(getattr(layer, "is_input", False)),
@@ -862,8 +863,10 @@ def _hash_record(layer: Any, order: Mapping[str, int], with_module: bool) -> dic
         "params": [[list(shape), str(dtype)] for shape, dtype in zip(
             _seq(layer, "param_shapes"), _seq(layer, "param_dtypes"))],
         "buffer": [list(layer.shape), str(layer.dtype)] if is_buffer else None,
-        "args": None if sized else _hash_arg(_seq(layer, "non_tensor_pos_args")),
-        "kwargs": None if sized else _hash_arg(dict(getattr(layer, "non_tensor_kwargs", {}))),
+        "args": None if sized else _hash_arg(list(
+            tl_compat.op_field(layer, "non_tensor_pos_args", None) or ())),
+        "kwargs": None if sized else _hash_arg(dict(
+            tl_compat.op_field(layer, "non_tensor_kwargs", None) or {})),
     }
     if with_module:
         module = getattr(layer, "module", None)
@@ -878,7 +881,7 @@ def hash_payload(trace: Any, *, with_module: bool) -> list[dict[str, Any]]:
     """
 
     order = _layer_order(trace)
-    return [_hash_record(layer, order, with_module) for layer in trace.layer_list]
+    return [_hash_record(layer, order, with_module) for layer in tl_compat.layer_list(trace)]
 
 
 def _digest(records: list[dict[str, Any]]) -> str:
@@ -897,7 +900,7 @@ def hash_family(trace: Any) -> dict[str, Any]:
     """
 
     return {
-        "skeleton": tl.hash.trace(trace),
+        "skeleton": tl_compat.skeleton(trace),
         "architecture": _digest(hash_payload(trace, with_module=False)),
         "model": _digest(hash_payload(trace, with_module=True)),
         "schema": HASH_SCHEMA_VERSION,
@@ -1037,9 +1040,9 @@ def summarize_trace(
     primary_param_dtype, param_dtype_set = _param_dtype_summary(trace)
     output_shape, n_output_tensors, output_container_kind = _output_summary(trace)
     has_self_attention, has_cross_attention = _attention_motifs(trace, compute_ops)
-    param_memory_bytes = int(getattr(trace, "total_param_memory", 0) or 0)
-    activation_memory_bytes = int(getattr(trace, "total_activation_memory", 0) or 0)
-    forward_peak_memory_bytes = int(getattr(trace, "forward_peak_memory", 0) or 0)
+    param_memory_bytes = int(tl_compat.trace_field(trace, "total_param_memory", 0) or 0)
+    activation_memory_bytes = int(tl_compat.trace_field(trace, "total_activation_memory", 0) or 0)
+    forward_peak_memory_bytes = int(tl_compat.trace_field(trace, "forward_peak_memory", 0) or 0)
 
     row: dict[str, Any] = {
         "stable_id": stable_id,
@@ -1049,7 +1052,7 @@ def summarize_trace(
         "torchlens_version": str(getattr(tl, "__version__", "")),
         "digest_capture_policy": digest_capture_policy,
         "n_params_source": "traced",
-        "n_compute_ops": int(getattr(trace, "num_compute_ops", 0) or 0),
+        "n_compute_ops": int(tl_compat.trace_field(trace, "num_compute_ops", 0) or 0),
         "n_unique_op_types": len(op_type_histogram),
         "n_inplace_ops": sum(bool(getattr(op, "is_inplace", False)) for op in compute_ops),
         "has_custom_op": _has_custom_op(compute_ops),
@@ -1072,48 +1075,48 @@ def summarize_trace(
         },
         "graph_depth": graph_depth,
         "graph_max_width": graph_max_width,
-        "branching_factor": float(getattr(trace, "branching_factor", 0.0) or 0.0),
-        "max_fan_out": int(getattr(trace, "max_out_degree", 0) or 0),
-        "max_fan_in": int(getattr(trace, "max_in_degree", 0) or 0),
-        "is_branching": bool(getattr(trace, "is_branching", False)),
-        "is_recurrent": bool(getattr(trace, "is_recurrent", False)),
-        "max_recurrence_iters": int(getattr(trace, "max_layer_op_count", 0) or 0),
-        "n_recurrent_layers": len(getattr(trace, "recurrent_layers", []) or []),
-        "has_conditional_branching": bool(getattr(trace, "has_conditional_branching", False)),
-        "n_conditionals": int(getattr(trace, "num_conditionals", 0) or 0),
-        "is_dynamic_graph": bool(getattr(trace, "is_dynamic_graph", False)),
-        "n_modules": int(getattr(trace, "num_modules", 0) or 0),
-        "n_module_calls": int(getattr(trace, "num_module_calls", 0) or 0),
+        "branching_factor": float(tl_compat.trace_field(trace, "branching_factor", 0.0) or 0.0),
+        "max_fan_out": int(tl_compat.trace_field(trace, "max_out_degree", 0) or 0),
+        "max_fan_in": int(tl_compat.trace_field(trace, "max_in_degree", 0) or 0),
+        "is_branching": bool(tl_compat.trace_field(trace, "is_branching", False)),
+        "is_recurrent": bool(tl_compat.trace_field(trace, "is_recurrent", False)),
+        "max_recurrence_iters": int(tl_compat.trace_field(trace, "max_layer_op_count", 0) or 0),
+        "n_recurrent_layers": len(tl_compat.trace_field(trace, "recurrent_layers", []) or []),
+        "has_conditional_branching": bool(tl_compat.trace_field(trace, "has_conditional_branching", False)),
+        "n_conditionals": int(tl_compat.trace_field(trace, "num_conditionals", 0) or 0),
+        "is_dynamic_graph": bool(tl_compat.trace_field(trace, "is_dynamic_graph", False)),
+        "n_modules": int(tl_compat.trace_field(trace, "num_modules", 0) or 0),
+        "n_module_calls": int(tl_compat.trace_field(trace, "num_module_calls", 0) or 0),
         "module_max_depth": _module_max_depth(compute_ops),
         "n_top_level_modules": len(top_level_blocks),
         "n_unique_module_types": len(module_type_histogram),
         "module_type_histogram": dict(sorted(module_type_histogram.items())),
         "top_module_types_json": _top_items(module_type_histogram),
         "top_level_block_sequence_json": top_level_blocks,
-        "model_class_name": str(getattr(trace, "model_class_name", "") or ""),
-        "model_class_qualname": str(getattr(trace, "model_class_qualname", "") or ""),
-        "n_params": int(getattr(trace, "num_params", 0) or 0),
-        "n_params_trainable": int(getattr(trace, "num_params_trainable", 0) or 0),
-        "n_params_frozen": int(getattr(trace, "num_params_frozen", 0) or 0),
-        "n_param_tensors": int(getattr(trace, "num_param_tensors", 0) or 0),
+        "model_class_name": str(tl_compat.trace_field(trace, "model_class_name", "") or ""),
+        "model_class_qualname": str(tl_compat.trace_field(trace, "model_class_qualname", "") or ""),
+        "n_params": int(tl_compat.trace_field(trace, "num_params", 0) or 0),
+        "n_params_trainable": int(tl_compat.trace_field(trace, "num_params_trainable", 0) or 0),
+        "n_params_frozen": int(tl_compat.trace_field(trace, "num_params_frozen", 0) or 0),
+        "n_param_tensors": int(tl_compat.trace_field(trace, "num_param_tensors", 0) or 0),
         "param_memory_bytes": param_memory_bytes,
         "primary_param_dtype": primary_param_dtype,
         "param_dtype_set_json": param_dtype_set,
         "quantized_param_tensor_count": sum(
             bool(getattr(param, "is_quantized", False)) for param in _collection(trace, "params")
         ),
-        "has_frozen_params": bool(getattr(trace, "has_frozen_params", False)),
-        "n_buffers": len(getattr(trace, "buffers", []) or []),
+        "has_frozen_params": bool(tl_compat.trace_field(trace, "has_frozen_params", False)),
+        "n_buffers": len(tl_compat.trace_field(trace, "buffers", []) or []),
         "buffer_memory_bytes": _buffer_memory_bytes(trace),
-        "buffer_overwrite_count": int(getattr(trace, "num_buffer_write_ops", 0) or 0),
-        "total_flops_forward": int(getattr(trace, "total_flops_forward", 0) or 0),
-        "total_macs_forward": int(getattr(trace, "total_macs_forward", 0) or 0),
-        "total_flops_backward": _int_or_none(getattr(trace, "total_flops_backward", None)),
-        "total_macs_backward": _int_or_none(getattr(trace, "total_macs_backward", None)),
+        "buffer_overwrite_count": int(tl_compat.trace_field(trace, "num_buffer_write_ops", 0) or 0),
+        "total_flops_forward": int(tl_compat.trace_field(trace, "total_flops_forward", 0) or 0),
+        "total_macs_forward": int(tl_compat.trace_field(trace, "total_macs_forward", 0) or 0),
+        "total_flops_backward": _int_or_none(tl_compat.trace_field(trace, "total_flops_backward", None)),
+        "total_macs_backward": _int_or_none(tl_compat.trace_field(trace, "total_macs_backward", None)),
         "flops_coverage_pct": flops_coverage_pct,
         "n_unknown_flops_ops": n_unknown_flops_ops,
-        "flops_by_op_type": _by_op_type_forward_totals(getattr(trace, "flops_by_op_type", {})),
-        "macs_by_op_type": _by_op_type_forward_totals(getattr(trace, "macs_by_op_type", {})),
+        "flops_by_op_type": _by_op_type_forward_totals(tl_compat.trace_field(trace, "flops_by_op_type", {})),
+        "macs_by_op_type": _by_op_type_forward_totals(tl_compat.trace_field(trace, "macs_by_op_type", {})),
         "activation_memory_bytes": activation_memory_bytes,
         "forward_peak_memory_bytes": forward_peak_memory_bytes,
         "largest_activation_bytes": _largest_activation_bytes(compute_ops),
@@ -1138,7 +1141,7 @@ def summarize_trace(
     # single captured trace rather than re-tracing (kills the two extra metadata
     # re-traces). ``compute_identity_hashes`` only controls whether a genuinely
     # missing hash raises (public-entry-point parity) or records an empty string.
-    graph_shape_hash = getattr(trace, "graph_shape_hash", None)
+    graph_shape_hash = tl_compat.graph_hash(trace, missing_ok=True)
     raw_event_hash = getattr(trace, "_raw_event_shape_hash", None)
     if compute_identity_hashes:
         if not graph_shape_hash:

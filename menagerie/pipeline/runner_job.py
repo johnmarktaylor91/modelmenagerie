@@ -20,7 +20,7 @@ serve`` and ``stage3 serve`` pair on one spool). Each pass, for every configured
   serves the spool (adopted), the heartbeat is still fresh (someone serves it: never two
   ``stage3 serve`` on one spool, since a starting server re-queues every claimed job), the disk
   guard holds new runner jobs, or three restarts already happened today (then one escalation a
-  day; a resize is not a restart).
+  day; a resize, or B's return after giving way to G at night, is not a restart).
 - REFUSED (run-on's admission turned the job down for capacity; it never ran): its submission is
   not a restart, and the next pass tries again at once, each size behind ``run-on probe`` so a
   refused try starts nothing (``held-capacity``; Crawler, 28 Oct: a backoff lost every race to
@@ -46,6 +46,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -63,6 +64,15 @@ CAPACITY = ("NO_CAPACITY", "PROBE_TIMEOUT")  # run-on's reasons for deferring a 
 # ``run-on probe`` exits: would be admitted now, refused (with the submit's reason), could not tell
 PROBE_ADMIT, PROBE_REFUSED, PROBE_UNKNOWN = 0, 6, 7
 RESIZE_AFTER = 2  # passes in a row wanting another size
+# a give-way drain ends here: B is cancelled with its claimed jobs queued again (Lead, 30 Oct: one
+# row's two 30-minute renders kept the trace host idle 95 minutes, with no G and no lanes)
+GIVE_WAY_DRAIN = timedelta(minutes=15)
+# after a give-way that ended without G starting (G refused, or G's probe in B's room refused while
+# B drained), B gives way again no sooner than this (Crawler, 30 Oct: G refused all night left B
+# off with it, so neither traced)
+GIVE_WAY_RETRY = timedelta(hours=1)
+# G's actions that mean it cannot start now: a give-way waiting on them ends and B returns
+G_BLOCKED = ("held-capacity", "escalate", "held-disk", "stopped")
 # passes in a row wanting a larger size before a busy runner is drained for it: B's growth want
 # at night follows G on and off (streaks of 2 to 4 passes, 2026-10-22), its day want holds for
 # hours, so a growth drain waits an hour and a flickering want never restarts B twice
@@ -87,7 +97,10 @@ SHARE_CPUS, SHARE_GIB = 18, 112
 # (12 GiB) and ``runner serve`` starts a request only while the running caps fit the declaration,
 # so more workers pledge no more memory; they fill the room the 4 GiB per-row trace floor leaves
 # (``flow.ROW_FLOOR_GIB``; Crawler, 28 Oct: B used under one of its 6 CPUs with four workers).
-# Sizes are told apart by CPUs and memory alone (``_observed``).
+# Sizes are told apart by CPUs and memory alone (``_observed``). The night size runs three in its
+# 3 CPUs and 16 GiB the same way: B starts each morning at it while G drains, and stays there until
+# run-on admits the day size (Crawler, 29 Oct: one worker for four and a half hours while ad hoc
+# jobs held the room, and the stage 3 backlog grew by 70 rows).
 # The third is B's day boost (Lead, 28 Oct: stage 3 is the limit), off unless the tick config's
 # ``b_boost`` is true: on its first day the default worker refused 12 lane starts for RAM beside it. With
 # it on, it is wanted only while it fits the share beside A's wanted size (``_b_day_workers``)
@@ -95,7 +108,7 @@ SHARE_CPUS, SHARE_GIB = 18, 112
 # probe`` admits it (``_resize``, ``_submit``); never counted in ``lane_room``, so lanes keep their
 # room and B stays at its day size when the probe refuses. Its workers stay above the day size's, so
 # ``Runner.wanted`` never picks it for the day size's count.
-B_SIZES = ((1, 3, 16), (8, 6, 36), (10, 9, 46))
+B_SIZES = ((3, 3, 16), (8, 6, 36), (10, 9, 46))
 B_DAY = 1  # B's day size in B_SIZES, its declaration in DEFAULT_RUNNERS
 # B holds its boost only while run-on would admit this much more beside it, so new lanes and the
 # day's other jobs keep room (a 1 GiB 2b lane was refused 7 minutes after B first grew, 28 Oct)
@@ -181,8 +194,14 @@ class Record:
     resize_streak: int = 0
     refused_at: str | None = None  # the last capacity refusal, ISO: starts back off from it
     draining: bool = False  # the tick wrote the spool's DRAIN; cleared when it removes it
+    drain_since: str | None = None  # ISO: when a give-way drain began (``GIVE_WAY_DRAIN`` deadline)
     resize_to: int | None = None  # the size a resize cancel was for, until its successor starts
     hold_growth_until: str | None = None  # ISO, set by hand: no growth resize before it (gotchas.md)
+    give_way_at: str | None = None  # ISO: B's give-way to G in progress began (``_b_yields``)
+    give_way_failed_at: str | None = None  # ISO: B's last give-way ended without G starting
+    # the larger size a live runner has wanted ``RESIZE_AFTER`` passes and asked run-on for; cleared
+    # when the want ends or a job starts (the trace host's lanes wait for it: ``a_before_lanes``)
+    grow_to: int | None = None
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any] | None) -> Record:
@@ -220,6 +239,7 @@ class Ops(Protocol):
     def stopped(self, runner: Runner) -> bool: ...
     def idle(self, runner: Runner) -> bool: ...
     def drain(self, runner: Runner, on: bool) -> None: ...
+    def requeue(self, runner: Runner) -> None: ...
     def discover(self, runner: Runner) -> list[tuple[str, str | None]]: ...
     def submit(self, runner: Runner, env: Mapping[str, str]) -> str: ...
     def cancel(self, job: str) -> None: ...
@@ -310,7 +330,7 @@ def _set_drain(p: Pass, record: Record, on: bool) -> Record:
     if record.draining == on or p.dry_run:
         return record
     p.ops.drain(p.runner, on)
-    return replace(record, draining=on)
+    return replace(record, draining=on, drain_since=record.drain_since if on else None)
 
 
 def _live(p: Pass, out: Outcome, age: float | None) -> Outcome:
@@ -322,7 +342,7 @@ def _live(p: Pass, out: Outcome, age: float | None) -> Outcome:
         return _cancel(p, out, "stale", f"{record.job} RUNNING, stage3 heartbeat {stale}")
     want = p.runner.wanted(p.demand)
     if want is None or record.size is None or want == record.size:
-        out.record = _set_drain(p, replace(record, resize_streak=0), False)
+        out.record = _set_drain(p, replace(record, resize_streak=0, grow_to=None), False)
         return out
     return _resize(p, out, want)
 
@@ -337,15 +357,17 @@ def _resize(p: Pass, out: Outcome, want: int) -> Outcome:
     record = out.record
     grow = want > record.size
     if grow and record.hold_growth_until and p.now < datetime.fromisoformat(record.hold_growth_until):
-        out.record = _set_drain(p, replace(record, resize_streak=0), False)
+        out.record = _set_drain(p, replace(record, resize_streak=0, grow_to=None), False)
         out.detail = f"wants size {want} (now {record.size}); growth held until {record.hold_growth_until}"
         return out
     streak = record.resize_streak + 1
-    out.record = replace(record, resize_streak=streak)
+    out.record = replace(record, resize_streak=streak, grow_to=record.grow_to if grow else None)
     if streak < RESIZE_AFTER or (grow and p.hold_submit):
         out.record = _set_drain(p, out.record, False)
         out.detail = f"wants size {want} (now {record.size}), {streak} passes"
         return out
+    if grow:
+        out.record = replace(out.record, grow_to=want)
     # Ask run-on before draining or cancelling: a successor it would refuse leaves the spool unserved.
     code, why = _probe(p, p.runner.sized(want), record.job)
     if code != PROBE_ADMIT:
@@ -461,8 +483,10 @@ def _dead(p: Pass, out: Outcome, state: str, age: float | None) -> Outcome:
     if p.hold_submit:
         out.action, out.detail = "held-disk", f"{record.job} {state}; the disk guard holds new runner jobs"
         return out
-    resize = record.cancelled_for == "resize" and record.cancelled == record.job
-    if not resize and _restarts_today(record, p.now) >= RESTARTS_A_DAY:
+    # the tick's own planned stops: a resize, B's night give-way to G (Crawler, 29 Oct: B's
+    # morning return used one of its three restarts every day) and a worker pause
+    planned = record.cancelled_for in ("resize", "g", "pause") and record.cancelled == record.job
+    if not planned and _restarts_today(record, p.now) >= RESTARTS_A_DAY:
         return _escalate(p, out, state)
     out.action, out.detail = "restart", f"{record.job} {state}; new job from {TEMPLATE}"
     if p.dry_run:
@@ -474,11 +498,12 @@ def _dead(p: Pass, out: Outcome, state: str, age: float | None) -> Outcome:
         out.action, out.detail = "held-capacity", f"{record.job} {state}; {exc}"
         out.record = replace(record, refused_at=stamp)
         return out
-    restarts = record.restarts if resize else (*record.restarts[-9:], stamp)
+    restarts = record.restarts if planned else (*record.restarts[-9:], stamp)
     # the new job's script deletes the spool's DRAIN before it serves
     out.record = replace(record, job=new, submitted_at=stamp, cancelled=None, cancelled_for=None,
                          restarts=restarts, size=size, resize_streak=0, refused_at=None,
-                         draining=False, resize_to=None)
+                         draining=False, drain_since=None, resize_to=None, give_way_at=None,
+                         grow_to=None)
     out.detail += f": {new}" + (f" at size {size}" if size is not None else "")
     return out
 
@@ -501,11 +526,27 @@ def ensure_one(runner: Runner, record: Record, ops: Ops, *, now: datetime, hold_
     out.job_state = state
     out.heartbeat_age_s = age = ops.heartbeat_age(runner)
     if state == LIVE:
+        _publish_pause(p)
         return _live(p, out, age)
     if state not in DEAD and state != "DONE":
         out.action, out.detail = "unverified", f"{out.record.job} state {state}; nothing done"
         return out
     return _dead(p, out, state, age)
+
+
+def _publish_pause(p: Pass) -> None:
+    """Write the guard's current pause line to a live runner's spool (``disk_guard.LIVE_PAUSE``),
+    which its servers read before each claim: the line in a job's environment is the one at its
+    start (2026-11-03: lowered from 62 to 58 for the push, both runners kept 62 and claimed nothing
+    for an hour at 61 GiB free). A failed write leaves the last line and never fails the pass."""
+
+    publish = getattr(p.ops, "publish_pause", None)
+    if p.pause_gib is None or p.dry_run or publish is None:
+        return
+    try:
+        publish(p.runner, p.pause_gib)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"runner {p.runner.name}: pause line not published: {exc}"[:300], file=sys.stderr)
 
 
 def job_env(runner: Runner, *, pause_gib: float | None) -> dict[str, str]:
@@ -638,6 +679,16 @@ class RunOn:
         out = self._stat(runner, f"if [ -f {beat} ]; then echo $(( $(date +%s) - $(stat -c %Y {beat}) )); fi")
         return float(out) if out else None
 
+    def publish_pause(self, runner: Runner, gib: float) -> None:
+        """Write ``gib`` to the spool's live pause line file, atomically."""
+
+        from menagerie.pipeline import disk_guard
+
+        path = shlex.quote(f"{runner.spool}/{disk_guard.LIVE_PAUSE}")
+        tmp = shlex.quote(f"{runner.spool}/.{disk_guard.LIVE_PAUSE}.tmp")
+        self._stat(runner, f"[ -d {shlex.quote(runner.spool)} ] && printf '%s\\n' {gib:g} > {tmp} "
+                           f"&& mv -f {tmp} {path}; true")
+
     def stopped(self, runner: Runner) -> bool:
         return self._stat(runner, f"[ -f {shlex.quote(runner.spool + '/STOP')} ] && echo y || true") == "y"
 
@@ -651,6 +702,30 @@ class RunOn:
     def drain(self, runner: Runner, on: bool) -> None:
         path = shlex.quote(f"{runner.spool}/{DRAIN}")
         self._stat(runner, f"mkdir -p $(dirname {path}) && touch {path}" if on else f"rm -f {path}")
+
+    def requeue(self, runner: Runner) -> None:
+        """Put a cancelled server's claimed stage-3 jobs back in ``stage3/new`` (what its successor's
+        ``stage3 serve`` would do on start); its runner requests stay claimed, and the successor's
+        ``runner serve`` queues them again with an ``infra`` record each."""
+
+        stage3 = shlex.quote(f"{runner.spool}/stage3")
+        self._stat(runner, f"cd {stage3} && for f in claimed/*.json; do [ -e \"$f\" ] && mv -n \"$f\" new/; done; true")
+
+    def collecting(self, runner: Runner) -> bool:
+        """Whether a collect of this spool holds the tick's per-spool lock now (``tick.locked``)."""
+
+        import fcntl
+
+        path = work_dir("tick") / f"collect-{runner.spool.rstrip('/').rsplit('/', 1)[-1]}.lock"
+        if not path.is_file():
+            return False
+        with open(path, "a+", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            return False
 
     def discover(self, runner: Runner) -> list[tuple[str, str | None]]:
         """Recent mirrored menagerie jobs serving this runner's spool, with start times, newest first."""
@@ -826,7 +901,7 @@ def _ensure_all(chosen: Sequence[Runner], ops: Ops | None, saved: Mapping[str, A
 def big_work(state: Mapping[str, Any]) -> bool:
     """Whether the night big runner has rows to run: the tick's last count of reserved (18, 40]
     GiB rows plus spool-G's waiting jobs (``big_work`` in its state). An unknown count keeps G on;
-    a zero count leaves G off (or drains it), so A, B and the night boost keep the night."""
+    a zero count leaves G off (or drains it), so A and B keep the night."""
 
     count = state.get("big_work")
     return count is None or int(count) > 0
@@ -960,7 +1035,7 @@ def _small_pass(by_name: Mapping[str, Runner], observed: Mapping[str, Any], ops:
             out.append(_hold(runner, record, held[name], status))
             continue
         if name == "B" and b_gives_way:
-            out.append(_give_way(runner, record, ops, status, dry_run=dry_run))
+            out.append(_give_way(runner, record, ops, status, now=now, dry_run=dry_run))
             continue
         if status != "inactive" and (allocation is None or record.size is None):
             out.append(_hold(runner, record, "unknown admitted size; transition held", status))
@@ -1016,26 +1091,149 @@ READY_WAIT = {False: "A/B must be confirmed at 3 CPUs/20 GiB and 3 CPUs/16 GiB",
               True: "A must be confirmed at 3 CPUs/20 GiB and B stopped"}
 
 
-def _give_way(runner: Runner, record: Record, ops: Ops, status: str, *, dry_run: bool) -> dict[str, Any]:
-    """B at night while G has big rows (``g_replaces_b``; Crawler, 28 Oct): drained, never
-    interrupted, then cancelled when idle, so G starts in its room; it comes back at 6 AM or once
-    G's big rows run out (the day path)."""
+def _give_way(runner: Runner, record: Record, ops: Ops, status: str, *, now: datetime,
+              dry_run: bool) -> dict[str, Any]:
+    """B at night while G has big rows (``g_replaces_b``; Crawler, 28 Oct): drained, then
+    cancelled when idle or once the drain is ``GIVE_WAY_DRAIN`` old (never while the spool is being
+    collected), with its claimed jobs queued again, so G starts in its room; it comes back at 6 AM,
+    once G's big rows run out (the day path), or when G cannot start (``_b_yields`` decides each
+    pass whether B gives way). A give-way is no restart."""
 
     if status == "inactive":
         return _summary(Outcome(runner.name, "off", "gives way to G at night (big rows wait)",
-                                replace(record, draining=False)))
+                                replace(record, draining=False, drain_since=None)))
     if status != LIVE:
         return _hold(runner, record, "giving way to G: B unverified", status)
-    if not ops.idle(runner):
-        if not (record.draining or dry_run):
-            ops.drain(runner, True)
-            record = replace(record, draining=True)
+    if ops.idle(runner):
+        return _cancel_for_g(runner, record, ops, "B gives way to G at night", dry_run=dry_run)
+    record = record if dry_run else _drain_from(runner, record, ops, now)
+    since = datetime.fromisoformat(record.drain_since) if record.drain_since else now
+    if now - since < GIVE_WAY_DRAIN:
         return _hold(runner, record, "draining to give way to G (claims no new job)", status)
-    out = Outcome(runner.name, "resize", "B gives way to G at night", record)
+    if _collecting(ops, runner):
+        return _hold(runner, record, "drain past its deadline; waits for the spool's collect", status)
+    minutes = GIVE_WAY_DRAIN.total_seconds() / 60
+    return _cancel_for_g(runner, record, ops, f"B gives way to G at night after a {minutes:.0f}-minute "
+                         "drain; its claimed jobs are queued again", dry_run=dry_run, requeue=True)
+
+
+def _b_turn(g: Runner, observed: Mapping[str, Any], ops: Ops, now: datetime, policy: bool
+            ) -> tuple[bool, Mapping[str, Any], str]:
+    """``_b_yields`` when the night policy has B give way (``g_replaces_b``): whether it does, the
+    observations with B's record updated, and why."""
+
+    if not policy:
+        return False, observed, ""
+    yields, record, why = _b_yields(g, observed, ops, now)
+    return yields, {**observed, "B": (record, *observed["B"][1:])}, why
+
+
+def _on_b(out: Sequence[dict[str, Any]], change: Any, arg: Any) -> list[dict[str, Any]]:
+    """The pass summaries with B's passed through ``change(summary, arg)``."""
+
+    return [change(r, arg) if r["runner"] == "B" else r for r in out]
+
+
+def _b_yields(g: Runner, observed: Mapping[str, Any], ops: Ops, now: datetime) -> tuple[bool, Record, str]:
+    """Whether B gives way to G this night pass (``g_replaces_b``), with B's record and why: only
+    while G could start in B's room (Crawler, 30 Oct: G refused for capacity every try from 10 PM
+    left B off with it, so neither traced). A give-way begins when ``run-on probe`` admits G's size
+    with B's job counted as ended (``--replacing``: its declaration, budget claim and memory are
+    released), asked each pass while B runs; it ends, and B returns the next pass, when G's start
+    is blocked (``G_BLOCKED``, a refusal after it began) or the probe refuses while B drains. After
+    that the next give-way waits ``GIVE_WAY_RETRY``, while G keeps trying beside B at its night size
+    on its own path. Probing beforehand, not draining B to find out, keeps B tracing on a full host."""
+
+    b, b_status, _ = observed["B"]
+    g_record, g_status, _ = observed["G"]
+    if g_status == LIVE:  # G runs: a B that gave way stays off, a B beside it stays
+        return b_status == "inactive", b if b_status == "inactive" else replace(b, give_way_at=None), ""
+    if b.give_way_at and g_record.refused_at and _stamp(g_record.refused_at) >= _stamp(b.give_way_at):
+        return False, _failed(b, now), "G was refused after B gave way: B returns"
+    if b_status not in (LIVE, "inactive") or (b.give_way_at and b_status == "inactive"):
+        return bool(b.give_way_at), b, ""  # G's own start decides an off B; unverified holds
+    return _probe_for_g(g, b, b_status, ops, now)
+
+
+def _probe_for_g(g: Runner, b: Record, b_status: str, ops: Ops, now: datetime) -> tuple[bool, Record, str]:
+    """``_b_yields`` for a live B or an off B with no give-way in progress: wait out
+    ``GIVE_WAY_RETRY``, then ask run-on whether G fits in B's room."""
+
+    if not b.give_way_at and b.give_way_failed_at:
+        retry = _stamp(b.give_way_failed_at) + GIVE_WAY_RETRY
+        if now < retry:
+            return False, b, f"G could not start in B's room; next give-way try after {retry.isoformat()}"
+    probe = getattr(ops, "probe", None)  # ops without a probe (older fakes) admit
+    code, reason = probe(g, b.job if b_status == LIVE else None) if probe else (PROBE_ADMIT, "")
+    if code == PROBE_ADMIT:
+        return True, b if b.give_way_at else replace(b, give_way_at=now.isoformat(timespec="seconds")), \
+            "run-on admits G in B's room"
+    verdict = "refused" if code == PROBE_REFUSED else "unknown"
+    why = f"B stays: run-on probe for G in B's room {verdict}: {reason[:160]}"
+    if b.give_way_at and code == PROBE_REFUSED:
+        return False, _failed(b, now), why
+    return False, replace(b, give_way_at=None), why
+
+
+def _stamp(iso: str) -> datetime:
+    return datetime.fromisoformat(iso)
+
+
+def _failed(b: Record, now: datetime) -> Record:
+    """B's give-way ended without G starting: B returns, and the next one waits ``GIVE_WAY_RETRY``."""
+
+    return replace(b, give_way_at=None, give_way_failed_at=now.isoformat(timespec="seconds"))
+
+
+def _noted(summary: dict[str, Any], why: str) -> dict[str, Any]:
+    if not why:
+        return summary
+    return {**summary, "detail": f"{summary['detail']}; {why}" if summary["detail"] else why}
+
+
+def _after_g(out: Sequence[dict[str, Any]], action: str, now: datetime) -> list[dict[str, Any]]:
+    """The pass summaries once G's ensure acted: a G that cannot start ends B's give-way."""
+
+    return _on_b(out, _give_way_ended, now) if action in G_BLOCKED else list(out)
+
+
+def _give_way_ended(summary: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """B's pass summary once G's start was blocked this pass: its give-way ends (``_failed``)."""
+
+    record = Record.from_mapping(summary["record"])
+    if not record.give_way_at:
+        return summary
+    return _noted({**summary, "record": _failed(record, now).to_mapping()},
+                  "G could not start: B returns next pass")
+
+
+def _drain_from(runner: Runner, record: Record, ops: Ops, now: datetime) -> Record:
+    """The spool drained, with when the drain began (kept from an earlier pass)."""
+
+    if record.draining and record.drain_since:
+        return record
+    if not record.draining:
+        ops.drain(runner, True)
+    return replace(record, draining=True, drain_since=now.isoformat(timespec="seconds"))
+
+
+def _cancel_for_g(runner: Runner, record: Record, ops: Ops, detail: str, *, dry_run: bool,
+                  requeue: bool = False) -> dict[str, Any]:
+    out = Outcome(runner.name, "resize", detail, record)
     if not dry_run:
         ops.cancel(record.job)
-        out.record = replace(record, cancelled=record.job, cancelled_for="g")
+        if requeue:
+            ops.requeue(runner)
+        out.record = replace(record, cancelled=record.job, cancelled_for="g", drain_since=None)
     return _summary(out)
+
+
+def _collecting(ops: Ops, runner: Runner) -> bool:
+    """Whether a collect of ``runner``'s spool holds its lock now; ops without the check (older
+    fakes) say no."""
+
+    collecting = getattr(ops, "collecting", None)
+    return bool(collecting and collecting(runner))
 
 
 def _restart_fits(runner: Runner, observed: Mapping[str, Any]) -> bool:
@@ -1100,6 +1298,7 @@ def _big_pass(by_name: Mapping[str, Runner], records: Mapping[str, Any], ops: Op
     if not night and _share([v[2] for v in observed.values()]) is None:
         return [_hold(by_name[n], observed[n][0], "unknown declaration; restoration held", observed[n][1])
                 for n in ("B", "A", "G")]
+    b_gives_way, observed, why_b = _b_turn(by_name["G"], observed, ops, now, b_gives_way)
     room = _a_beside_g(by_name, observed, ops, night=night)
     if room:
         a_record, a_status, a_allocation = observed["A"]
@@ -1108,6 +1307,7 @@ def _big_pass(by_name: Mapping[str, Runner], records: Mapping[str, Any], ops: Op
     out = _small_pass(by_name, observed, ops, now, night=night, hold_submit=hold_submit,
                       pause_gib=pause_gib, demand=demand, dry_run=dry_run, held=held,
                       b_gives_way=b_gives_way, b_boost=b_boost)
+    out = _on_b(out, _noted, why_b)
     if not night or room is False:
         return [*out, _drain_big(by_name["G"], g_record, ops, g_status, dry_run=dry_run)]
     share = _share([v[2] for v in observed.values()])
@@ -1121,9 +1321,47 @@ def _big_pass(by_name: Mapping[str, Runner], records: Mapping[str, Any], ops: Op
         result = ensure_one(g, g_record, ops, now=now, hold_submit=hold_submit,
                             pause_gib=pause_gib, dry_run=dry_run)
         out.append(_summary(result))
+        out = _after_g(out, result.action, now)
         if result.action == "restart":
             share = {"cpus": 6 + g.cpus, "memory_gib": 36 + g.memory_gib}
     return [{**r, "planned_share": share} for r in out]
+
+
+def _pause_one(runner: Runner, record: Record, ops: Ops, why: str, *,
+               dry_run: bool) -> dict[str, Any]:
+    """One runner under a worker pause (``pause``): drained while it holds claims, cancelled once
+    its spool is idle (a planned stop, so its return is no restart), left off once inactive."""
+
+    record, status, _ = _observed(runner, record, ops)
+    if status == "inactive":
+        return _summary(Outcome(runner.name, "off", why, replace(record, draining=False),
+                                job_state="inactive"))
+    if status != LIVE:
+        return _hold(runner, record, f"{why}; job {status}, waiting", status)
+    if not ops.idle(runner):
+        if not (record.draining or dry_run):
+            ops.drain(runner, True)
+            record = replace(record, draining=True)
+        return _summary(Outcome(runner.name, "held-pause",
+                                f"{why}; draining (claims no new job, finishes its claims)", record,
+                                job_state=status))
+    out = Outcome(runner.name, "pause", f"{why}; {record.job} idle, cancelled", record,
+                  job_state=status)
+    if not dry_run:
+        ops.cancel(record.job)
+        out.record = replace(record, cancelled=record.job, cancelled_for="pause")
+    return _summary(out)
+
+
+def pause(why: str, *, ops: Ops | None = None, state: Mapping[str, Any],
+          dry_run: bool = False) -> list[dict[str, Any]]:
+    """Every configured runner, whatever the mode, under a worker pause (``_pause_one``): nothing
+    starts, each live one drains and ends. Returns one summary per runner, as ``ensure`` does."""
+
+    ops = ops or RunOn()
+    records = state.get("runners", {})
+    return [_pause_one(r, Record.from_mapping(records.get(r.name)), ops, why, dry_run=dry_run)
+            for r in runners()]
 
 
 def big(*, dry_run: bool = False) -> list[dict[str, Any]]:

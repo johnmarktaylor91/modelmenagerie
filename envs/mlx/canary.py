@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import importlib
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the checkout: names that differ by pin
+from menagerie import tl_compat  # noqa: E402
 
 PROMISED = ("mlx.core", "mlx.nn", "torch", "torchlens", "numpy", "psutil", "yaml", "pydantic",
             "jsonschema", "referencing", "PIL")
@@ -37,8 +41,8 @@ def main() -> int:
     # at 2.35.3, and no preview takes random_seed).
     verdict = state(trace.validate_forward_pass([model(x)], validate_metadata=False))
     print(f"canary: python {sys.version.split()[0]}, mlx {mx.__version__}, torch "
-          f"{torch.__version__}, torchlens {tl.__version__}, {trace.num_ops} ops, module mode "
-          f"{trace.module_identity_mode}, validation {verdict}")
+          f"{torch.__version__}, torchlens {tl.__version__}, {tl_compat.num_ops(trace)} ops, module mode "
+          f"{tl_compat.trace_field(trace, 'module_identity_mode')}, validation {verdict}")
     assert verdict == "passed", verdict
     return 0
 

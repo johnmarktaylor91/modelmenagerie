@@ -10,7 +10,7 @@ dependencies = [
     # paddle imports setuptools at import time without declaring it (3.3.1).
     "setuptools",
     "torch==2.6.*",
-    "torchlens[paddle]==2.36.0",
+    "torchlens[paddle]==3.0.2",
     # Menagerie's runtime dependencies, so the worker runs here without installing anything.
     "numpy",
     "packaging",

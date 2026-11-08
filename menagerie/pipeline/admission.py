@@ -47,6 +47,7 @@ LANE_MINUTES = {"2a": 120, "2b": 180, "review": 90, "prose-audit": 60, "describe
 SOFT_MARGIN_MIN = 15  # fleet-run's soft deadline comes this long before the hard timeout
 WEB_TOOLS = "WebFetch,WebSearch,mcp__executor"  # what a Claude lane without web loses
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+UNIT = re.compile(r"[A-Za-z0-9][A-Za-z0-9@._-]{0,127}\.service")
 HARNESSES = ("claude", "codex", "antigravity")
 # The two main labs' lab-agnostic roles, and the Google seats.
 MAIN_ROLES = {"model-default": "claude", "model-implementation": "codex"}
@@ -57,14 +58,27 @@ ANTIGRAVITY_KINDS = ("review", "2b")
 # How a read-only Google lane answers: one ``{"files": ...}`` object, or one fenced JSON block per
 # item (a review lane's cases), each written to ``out/<id>.json`` beside the brief.
 ANSWERS = ("files", "blocks")
+# A 2b lane started here runs on the hub (worker lanes start through ``mini_placement``); its tries
+# run on runner A through the bridge, so the hub holds the agent and the commands it runs. Each
+# hub 2b lane's fleet-run unit is bounded at start to one share of the hub 2b budget, and the tick
+# starts at most ``HUB_2B_MAX_LANES`` of them (``2b_on_hub: {"lanes": N}``), so together they stay
+# within 4 CPUs and 16 GiB, niced (JMT 2026-11-02 rueda-req-854cc81b, "the hub is strong now
+# too, it can do a bit of compute"; Lead's cap: 4 CPUs and 16 GiB for hub 2b lanes).
+HUB_2B_TOTAL_CPUS, HUB_2B_TOTAL_GIB = 4, 16
+HUB_2B_LANE_CPUS, HUB_2B_LANE_GIB = 1, 4  # the fleet lane guard's own MemoryMax is 4G
+HUB_2B_MAX_LANES = min(HUB_2B_TOTAL_CPUS // HUB_2B_LANE_CPUS, HUB_2B_TOTAL_GIB // HUB_2B_LANE_GIB)
+HUB_2B_NICE = 10
+HUB_2B_PROPERTIES = (f"CPUQuota={HUB_2B_LANE_CPUS * 100}%", f"MemoryMax={HUB_2B_LANE_GIB}G",
+                     "CPUWeight=20", "IOWeight=20")
 # The week-use ceiling for unattended Claude lanes (the fleet's lane admission ceiling).
 UNATTENDED_MAX_PCT = 70
 # How many lanes of a kind the tick keeps running at once. 2b runs 12 to 16 wide (JMT 2026-10-08
-# 5:06 PM PT, BUILD-PLAN r3 amendment); ``MENAGERIE_LANES_<KIND>`` overrides, never above the max
-# (``MENAGERIE_LANES_DESCRIBE`` like ``MENAGERIE_LANES_2B``). Describe is four seats on disjoint
+# 5:06 PM PT, BUILD-PLAN r3 amendment), up to 20 until rung 4 closes (decisions.md 2026-11-02:
+# trace host 12, each Mac 2, hub 4); ``MENAGERIE_LANES_<KIND>`` overrides, never above
+# the max (``MENAGERIE_LANES_DESCRIBE`` like ``MENAGERIE_LANES_2B``). Describe is four seats on disjoint
 # family leases (speed-up idea 11); the tick's describe stage runs up to its ``describes.lanes``.
 LANE_CAPS = {"2a": 4, "2b": 14, "review": 1, "describe": 4}
-LANE_CAP_MAX = {"2a": 8, "2b": 16, "review": 2, "describe": 4}
+LANE_CAP_MAX = {"2a": 8, "2b": 20, "review": 2, "describe": 4}
 
 
 def lane_cap(kind: str) -> int:
@@ -225,7 +239,8 @@ def _gemini_gate(role: str) -> None:
                       or "no fresh Gemini subscription headroom", role=role)
 
 
-def _admit(harness: str, role: str, cwd: Path, kind: str = "") -> tuple[list[str], str]:
+def _admit(harness: str, role: str, cwd: Path, kind: str = "",
+           placement: str = "") -> tuple[list[str], str]:
     """Fresh admission for the selected subscription: the lane's env words and its account.
 
     A refusal raises ``Refused("no_admission")``: never a downgrade, a model swap or a wait.
@@ -234,6 +249,8 @@ def _admit(harness: str, role: str, cwd: Path, kind: str = "") -> tuple[list[str
     Codex review lanes take the ChatGPT gate's ceiling from ``MENAGERIE_CODEX_MAX_PCT`` when it
     is set (Prime, 2026-10-05: 88 for review-only lanes until the Oct 9 reset), else its default.
     Claude describe lanes are gated at ``_claude_ceiling``.
+    ``placement`` names the worker a lane's agent runs on (``mini_placement``): the burst check then
+    skips the hub CPU gate and keeps the hub memory floor and the account checks.
     """
 
     py, tools = "/usr/bin/python3", _desk() / "tools"
@@ -262,9 +279,12 @@ def _admit(harness: str, role: str, cwd: Path, kind: str = "") -> tuple[list[str
     if known.returncode:
         raise Refused("no_admission", known.stderr.strip()[-300:]
                       or f"{account}: no known fresh quota", role=role, account=account)
-    burst =_sh([_tool("burst-admission"), "continue", "--account", account])
+    where = ["--placement", placement] if placement else []
+    burst = _sh([_tool("burst-admission"), "continue", "--account", account, *where])
     if burst.returncode:
-        raise Refused("no_admission", burst.stderr.strip() or f"burst admission: {account}",
+        # `continue` prints its reason on stdout.
+        raise Refused("no_admission", (burst.stderr or burst.stdout).strip()[-300:]
+                      or f"burst admission: {account}",
                       role=role, account=account)
     # Without CLAUDE_CONFIG_DIR the `claude` shim goes through claude-as on the picked account.
     unset = ["-u", "CLAUDE_CONFIG_DIR", "-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN"]
@@ -377,6 +397,8 @@ def _live(path: Path, lease: Mapping[str, Any]) -> str | None:
         if state == "TERMINAL" and lease.get("answer"):
             with contextlib.suppress(RecordError, OSError, ValueError):
                 unpack(lease)
+        if state == "TERMINAL" and lease.get("unit"):
+            _unbound(lease["unit"])
         path.unlink()
         return None
     return state
@@ -476,10 +498,42 @@ def _argv(kind: str, harness: str, plan: Mapping[str, Any], brief: Path, *, labe
         "--project", "menagerie", "--require-result", "--artifact", str(result),
         "--deadline", f"{minutes - SOFT_MARGIN_MIN}m", "--hard-timeout", f"{minutes}m",
         *(["--parent", parent] if parent else []), "--",
+        *(["/usr/bin/nice", "-n", str(HUB_2B_NICE)] if kind == "2b" else []),
         "/usr/bin/env", *env_words, "/usr/bin/python3", str(_desk() / "tools" / "lane_failover.py"),
         "run", "--expect", str(result), "--", _adapter(), harness, str(brief),
         *_harness_args(harness, plan, web=web, writable=(result.parent, *_writable())),
     ], None
+
+
+def _bound_hub_2b(run: str, started: str) -> str:
+    """Put a hub 2b lane's fleet-run unit under its share of the hub 2b budget
+    (``HUB_2B_PROPERTIES``, runtime properties) and return the unit; ``_unbound`` removes them when
+    the lease is released. A lane the limits cannot be set on is stopped, so no hub 2b lane runs
+    unbounded."""
+
+    named = re.search(r"unit=(\S+)", started)
+    unit = named.group(1) if named else \
+        f"{os.environ.get('FLEET_RUN_UNIT_PREFIX', 'fleet-lane')}@{run}.service"
+    done = _sh(["systemctl", "--user", "set-property", "--runtime", unit, *HUB_2B_PROPERTIES])
+    if done.returncode:
+        _sh([_fleet_run(), "stop", run])
+        raise RecordError(f"hub 2b lane {run}: could not bound {unit} "
+                          f"({(done.stderr or done.stdout).strip()[-200:]}); stopped it")
+    return unit
+
+
+def _unbound(unit: str) -> None:
+    """Remove an ended hub 2b lane's runtime property files: systemd keeps them under
+    ``$XDG_RUNTIME_DIR/systemd/user.control`` until reboot, one directory per lane."""
+
+    if not UNIT.fullmatch(unit):
+        return
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    folder = runtime / "systemd" / "user.control" / f"{unit}.d"
+    for prop in HUB_2B_PROPERTIES:
+        (folder / f"50-{prop.split('=', 1)[0]}.conf").unlink(missing_ok=True)
+    with contextlib.suppress(OSError):
+        folder.rmdir()  # only when nothing else is in it
 
 
 def _check_kind(kind: str, harness: str, role: str, network_ok: bool) -> None:
@@ -555,6 +609,7 @@ def launch(kind: str, role: str, brief: Path, *, keys: Sequence[str] = (),
         if started.returncode or not run:
             why = (started.stderr or started.stdout)[-400:]
             raise RecordError(f"fleet-run start failed: {why}")
+        unit = _bound_hub_2b(run.group(1), started.stdout) if kind == "2b" else None
         lease = {
             "label": label, "run": run.group(1), "kind": kind, "role": role, "harness": harness,
             "model": plan["model"], "effort": plan.get("effort"), "account": account,
@@ -563,7 +618,7 @@ def launch(kind: str, role: str, brief: Path, *, keys: Sequence[str] = (),
             "keys": list(keys), "parent": parent, "brief": str(brief),
             "result": str(brief.with_name(f"{brief.stem}.result.md")),
             "answer": str(found) if found else None, "answer_kind": answer,
-            "ids": list(ids), "started": now(),
+            "ids": list(ids), "started": now(), **({"unit": unit} if unit else {}),
             "expires": _stamp(datetime.now(timezone.utc) + timedelta(minutes=minutes)),
         }
         _write_atomic(leases / f"{label}.json", json.dumps(lease, indent=1) + "\n")

@@ -23,7 +23,8 @@ pauses finishes, like a running row.
 
 A describe seat (``describe_workers``, ``start_describe``) takes a worker slot through the same
 admission, runtime, identity and lease, as a ``describe`` lease the relay stages without verbs;
-every placed lease counts against its worker's slots, whatever its kind.
+every placed lease counts against its worker's slots, whatever its kind. A Claude-lab 2a lane
+(``mini_2a``, ``start_2a``) does the same as a ``2a`` lease whose verbs the relay answers.
 """
 
 from __future__ import annotations
@@ -52,7 +53,8 @@ RUNTIME_KEYS = ("runtime", "identity", "prepare", "deliver")  # what a runtime p
 PHONE_NICE = 10  # a lane on a phone-build mini runs below phone builds' priority
 # Each lane kind's hard timeout. The run's deadline and the lane's own timeout come 15 minutes
 # before it, and the lease lasts 30 minutes past it to pull and ingest (2b: 165, 180, 210 minutes).
-HARD_MINUTES = {"2b": 180, "describe": admission.LANE_MINUTES["describe"]}
+HARD_MINUTES = {"2b": 180, "describe": admission.LANE_MINUTES["describe"],
+                "2a": admission.LANE_MINUTES["2a"]}
 LEASE_MINUTES = HARD_MINUTES["2b"] + 30
 POOL = "pool"  # an ``account`` value: serve whichever pool account admission picks
 # The lane runs on the system Python by absolute path. run-on puts Homebrew's bin first on a Mac's
@@ -69,6 +71,20 @@ LANE_SPARSE_EXCLUDE = ("menagerie/data/ledger/", "menagerie/data/store-index/", 
                        "menagerie/data/master_catalog.jsonl", "menagerie/data/crawl_history.json",
                        "menagerie/data/crawl_roster.jsonl", "menagerie/data/routing_manifest.tsv",
                        "menagerie/crawler/records/", "site/site-data/")
+# A 2b lane also leaves out what its agents were never seen to read (the tool calls of 60 trace-host
+# 2b lanes, 30 Oct): the packet comes in the brief, so research packets, describe, review and
+# resolve data, the crawler and the research notes stay out. Adapters and model records stay: its
+# agents read their family's current adapter and recipe, and other families' as examples.
+LANE_2B_EXCLUDE = ("menagerie/data/research/", "menagerie/data/describe/", "menagerie/data/review/",
+                   "menagerie/data/resolve/", "menagerie/data/regression/",
+                   "menagerie/data/atlas_prose/", "menagerie/data/stable_ids.jsonl",
+                   "menagerie/crawler/", "research/")
+
+
+def sparse_exclude(kind: str) -> tuple[str, ...]:
+    """The paths a lane's checkout leaves out: every lane's, and for a 2b lane its own too."""
+
+    return LANE_SPARSE_EXCLUDE + (LANE_2B_EXCLUDE if kind == "2b" else ())
 PHONE_JOB = ["sh", "-c", 'exec "$HOME/.local/bin/phone-job" "$@"', "phone-job", "--status", "--json"]
 OS_NAMES = ("macos", "linux")  # run-on's --os; a mini is macos
 LINUX_CAP_MAX = 12  # a bound on configuration; the budgets and the runner share decide below it
@@ -203,18 +219,20 @@ def status(cfg: Mapping[str, Any]) -> dict[str, str]:
         allowed, why = host_cap(host, spec, cfg)
         lines[host] = f"on: cap {spec['cap']}" + (f"; {why}" if allowed < spec["cap"] else "")
     if any(line.startswith("on") for line in lines.values()) and not serving():
-        lines = {h: ("held: bridge or mini relay not serving" if line.startswith("on") else line)
-                 for h, line in lines.items()}
+        held = "2b held: bridge not serving" if ready("2a") else None
+        lines = {h: (line if not line.startswith("on") else f"{line}; {held}" if held
+                     else "held: bridge or mini relay not serving") for h, line in lines.items()}
     return lines
 
 
 def slots(cfg: Mapping[str, Any]) -> list[str]:
-    """Free configured recipe slots, counting remote leases in the same global lane table."""
+    """Free configured recipe slots, counting remote leases in the same global lane table. They
+    exist while the relay serves; 2b's own hold (the bridge) is the tick's ``_held_2b``."""
     try:
         enabled = _workers(cfg)
     except ValueError:
         return []  # ``status`` names the malformed configuration
-    if not enabled or not serving():
+    if not enabled or not ready("2a"):
         return []
     busy = Counter(x.get("placement") for x in admission.lanes(data=DataLayout.from_env()))
     return [host for host, spec in enabled.items()
@@ -257,9 +275,14 @@ def host_cap(host: str, spec: Mapping[str, Any], cfg: Mapping[str, Any]) -> tupl
     runner comes first (``_big_night``: G runs with no room left for a lane, or would fit once this
     host's lanes finish), and
     lanes fit the share the runners leave with A sized for the 2b lanes the workers can reach
-    (``_reachable_2b``; with ``2b_on_hub`` the whole 2b admission cap, since the tick's lower
+    (``_reachable_2b``; with ``2b_on_hub`` true the whole 2b admission cap, since the tick's lower
     ``lane_limits`` do not bound manual launches), each pledged 1.25 times its peak. A check that fails holds the host, with the reason, rather than the tick.
+    A worker pause (``pause``) gives its host none.
     """
+    from menagerie.pipeline import pause
+
+    if pause.held_host(cfg, host):
+        return 0, f"held: {pause.note(cfg)}"
     cap = spec["cap"]
     try:
         return _trace_cap(host, spec, cfg, cap)
@@ -275,8 +298,9 @@ def _trace_cap(host: str, spec: Mapping[str, Any], cfg: Mapping[str, Any], cap: 
     disk = _disk_state(cfg)
     if disk != "ok":
         return 0, f"held: disk guard {disk} on the trace host"
-    if cfg.get("b_before_lanes", True) and _b_held_out():
-        return 0, "held: runner B is down and refused for capacity; stage 3 comes first"
+    why = _runners_first(host, spec, cfg)
+    if why:
+        return 0, why
     if cfg.get("big_runner") and _big_night(host, spec):
         return 0, ("held: the night big runner comes first (running with no room for a lane, or "
                    "fitting once this host's lanes finish)")
@@ -295,15 +319,32 @@ def _reachable_2b(host: str, cfg: Mapping[str, Any], own: int) -> int:
     """The live 2b lanes runner A must be sized for when ``host`` runs ``own`` of them.
 
     With ``2b_on_hub`` off the tick places 2b lanes only on the workers, so A (one worker per five
-    live lanes) is reserved for the workers' caps, not the nominal 2b cap, and the room A could
+    live lanes) is reserved for the workers' caps (plus N with ``{"lanes": N}``), not the nominal
+    2b cap, and the room A could
     never use goes to the trace host's lanes. Runner B's seat is never counted as room. A manual
     hub launch beyond this makes A's start fall back to a smaller size (``runner_job``'s ladder).
     """
     cap = admission.lane_cap("2b")
-    if cfg.get("2b_on_hub", False):
+    hub = hub_2b_lanes(cfg)
+    if hub is None:
         return cap
     others = sum(spec["cap"] for name, spec in _workers(cfg).items() if name != host)
-    return min(cap, others + own)
+    return min(cap, others + own + hub)
+
+
+def hub_2b_lanes(cfg: Mapping[str, Any]) -> int | None:
+    """The 2b lanes ``config.json``'s ``2b_on_hub`` lets the tick start on the hub: 0 when false
+    (the default), ``None`` (no cap of its own: the hub's free slots decide) when true, and N for
+    ``{"lanes": N}``, at most ``admission.HUB_2B_MAX_LANES`` (each bounded to its share of the hub
+    2b budget at launch, ``admission.HUB_2B_PROPERTIES``)."""
+    value = cfg.get("2b_on_hub", False)
+    if isinstance(value, bool):
+        return None if value else 0
+    if isinstance(value, dict) and set(value) == {"lanes"} and type(value["lanes"]) is int \
+            and 0 <= value["lanes"] <= admission.HUB_2B_MAX_LANES:
+        return value["lanes"]
+    raise ValueError(f'2b_on_hub must be true, false or {{"lanes": N}} with N from 0 to '
+                     f"{admission.HUB_2B_MAX_LANES}")
 
 
 def _b_held_out() -> bool:
@@ -320,12 +361,61 @@ def _b_held_out() -> bool:
         (tick.load_state().get("runners") or {}).get("B")))
 
 
+def _runners_first(host: str, spec: Mapping[str, Any], cfg: Mapping[str, Any]) -> str | None:
+    """Why a runner comes before the trace host's new lanes now (``b_before_lanes``,
+    ``a_before_lanes``), else None."""
+    if cfg.get("b_before_lanes", True) and _b_held_out():
+        return "held: runner B is down and refused for capacity; stage 3 comes first"
+    why = _a_held_out(host, spec) if cfg.get("a_before_lanes", True) else None
+    return f"held: {why}; runner A comes first" if why else None
+
+
+def _a_held_out(host: str, spec: Mapping[str, Any]) -> str | None:
+    """Why the trace host starts no new 2b lane for runner A now, else None (Crawler, 3 Nov: the
+    lanes' tries run only on A, so A at its wanted size comes before new lanes, at any hour).
+
+    Held while A is down and its last start was refused for capacity, while A is between sizes (a
+    resize cancel whose successor has not started), and while A wants a larger size (its record's
+    ``grow_to``) that run-on would admit once this host's live lanes finish but not beside them
+    plus one more. When A's growth would be refused even with the lanes gone, another job holds the
+    room and lanes go on. Running lanes finish and nothing is killed. Reads the last pass's state."""
+    from menagerie.pipeline import runner_job, tick
+
+    a = runner_job.Record.from_mapping((tick.load_state().get("runners") or {}).get("A"))
+    if not a.job:
+        return None
+    if runner_job.refused(a):
+        return "runner A is down and refused for capacity"
+    if a.cancelled == a.job and a.cancelled_for == "resize":
+        return "runner A is between sizes"
+    if a.grow_to is None or a.size is None or a.grow_to <= a.size:
+        return None
+    runner = next((r for r in runner_job.runners() if r.name == "A"), None)
+    if runner is None or a.grow_to >= len(runner.sizes):
+        return None
+    grown = runner.sized(a.grow_to)
+    more = _young_lanes(host) + 1
+    if _admits(_less(grown, spec, -more), a.job):
+        return None  # A's larger size still fits beside the lanes plus this one
+    if _admits(_less(grown, spec, _host_lanes(host)), a.job):
+        return f"runner A wants size {a.grow_to} (now {a.size}) and fits once this host's lanes finish"
+    return None
+
+
+def _less(runner: Any, spec: Mapping[str, Any], lanes: int) -> Any:
+    """``runner``'s declaration less ``lanes`` lanes of ``spec`` (negative: plus), for a probe."""
+    return replace(runner, cpus=max(1, runner.cpus - lanes * spec.get("cpus", 1)),
+                   memory_gib=max(1, runner.memory_gib - lanes * spec["peak_gib"]))
+
+
 def _big_night(host: str, spec: Mapping[str, Any]) -> bool:
     """Whether the night big runner holds new lanes off the trace host now (Crawler, 28 Oct: at
     night G comes before the trace host's 2b lanes; runner A is never displaced).
 
     While G's job runs, lanes start only while run-on would admit one beside it (``_lane_fits``).
-    Before it starts, in its night (with the lead-in) with rows for it, the hold begins when run-on
+    Before it starts, in its night (with the lead-in) with rows for it, a lane still starts while
+    run-on would admit G beside the live lanes plus that one (the handover's night budget; Lead,
+    30 Oct: a 95-minute handover placed no lane on the trace host); else the hold begins when run-on
     would admit G with this host's live 2b lanes gone (``_g_fits``) and lasts while lanes drain
     (``HOLD_FILE``), since the answer moves with the runners' attempts: running lanes finish,
     nothing is killed, and G starts once its own probe admits it. With no lanes left and G still
@@ -344,9 +434,16 @@ def _big_night(host: str, spec: Mapping[str, Any]) -> bool:
     if not (runner_job.big_hold_open() and runner_job.big_work(state)):
         marker.unlink(missing_ok=True)
         return False
+    replaces_b = bool(tick.config().get("g_replaces_b", False))
+    # lanes placed this pass may not hold a run-on claim yet: counted with this one, which also
+    # keys a fresh probe per count (``_admits`` remembers a layout for a pass)
+    more = _young_lanes(host) + 1
+    if _g_fits(runners.get("B") or {}, (-more * spec.get("cpus", 1), -more * spec["peak_gib"]),
+               replaces_b=replaces_b):
+        return False  # the handover's night budget: G still fits beside the lanes plus this one
     lanes = _host_lanes(host)
     fits = _g_fits(runners.get("B") or {}, (lanes * spec.get("cpus", 1), lanes * spec["peak_gib"]),
-                   replaces_b=bool(tick.config().get("g_replaces_b", False)))
+                   replaces_b=replaces_b)
     held = marker.is_file() and time.time() - marker.stat().st_mtime < HOLD_MAX_S
     if fits and not held:
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -368,6 +465,21 @@ def _host_lanes(host: str) -> int:
         except (OSError, ValueError):
             continue
         count += lease.get("kind") in ("2b", "describe") and lease.get("placement") == host
+    return count
+
+
+def _young_lanes(host: str) -> int:
+    """The 2b and describe lanes placed on ``host`` within ``G_FITS_TTL_S`` (this pass's)."""
+    count = 0
+    cutoff = time.time() - G_FITS_TTL_S
+    for path in work_dir("leases").glob("*.json"):
+        try:
+            lease = json.loads(path.read_text(encoding="utf-8"))
+            started = datetime.fromisoformat(lease["started"].replace("Z", "+00:00")).timestamp()
+        except (OSError, ValueError, KeyError, AttributeError):
+            continue
+        count += (lease.get("kind") in ("2b", "describe") and lease.get("placement") == host
+                  and started >= cutoff)
     return count
 
 
@@ -467,6 +579,13 @@ def serving() -> bool:
     return runner.serving(bridge) and mini_relay.serving()
 
 
+def ready(kind: str) -> bool:
+    """Whether a ``kind`` lane may start on a mini: a 2b lane sends tries through the bridge to
+    runner A (``serving``); a 2a or describe lane needs only the relay, so it keeps running while
+    the runner's host is paused or down."""
+    return serving() or (kind != "2b" and mini_relay.serving())
+
+
 def _phone_build(host: str) -> bool:
     """Whether the fleet host roles list the host for phone builds; unknown counts as yes."""
     path = Path(os.environ.get("MENAGERIE_HOST_ROLES")
@@ -515,7 +634,7 @@ def _runtime(role: str, spec: Mapping[str, Any], repair: bool, host: str,
         plan = admission._resolve(candidate, spec["account"], harness="claude")
         if plan["harness"] != "claude":
             continue
-        _, account = admission._admit("claude", candidate, cwd, kind)
+        _, account = admission._admit("claude", candidate, cwd, kind, host)
         if pooled:
             _identity(spec, account)
         elif account != spec["account"]:
@@ -599,7 +718,7 @@ def start_describe(families: Sequence[str], brief: Path, *, role: str, host: str
     folder's brief; the relay stages that folder and ingests ``out/`` and the result beside it."""
     from menagerie.pipeline import implement
 
-    spec = _admissible(host, config, cfg)
+    spec = _admissible(host, config, cfg, kind="describe")
     if not families or any(not implement.LABEL_FAMILY.fullmatch(f) for f in families):
         raise ValueError("describe lane families must be safe family keys")
     plan, selected_role, account = _runtime(role, spec, True, host, kind="describe")
@@ -612,13 +731,45 @@ def start_describe(families: Sequence[str], brief: Path, *, role: str, host: str
     return Started(host, path, lease, tuple(families), None)
 
 
-def finish(started: Started) -> str:
+def start_2a(families: Sequence[str], brief: Path, *, role: str, host: str, pipe: str,
+             config: Mapping[str, Any], cfg: Mapping[str, Any]) -> Started:
+    """A 2a lane on ``host`` up to its proven job start (``finish`` reads its admission): the
+    worker checks of ``start``, the runtime resolved for Claude alone (the role, else its other-lab
+    role's Claude seat) and gated as a 2a lane, a ``2a`` lease on the batch's families with web
+    tools on. ``brief`` is the batch's ``briefs/<label>/BRIEF.md``; ``pipe`` the pipeline command
+    its brief runs verbs with, which the relay runs them with (``mini_2a``)."""
+    from menagerie.pipeline import implement, mini_2a
+
+    mini_2a.folder_of(brief)
+    spec = _admissible(host, config, cfg, kind="2a")
+    if not families or any(not implement.LABEL_FAMILY.fullmatch(f) for f in families):
+        raise ValueError("2a lane families must be safe family keys")
+    plan, selected_role, account = _runtime(role, spec, False, host, kind="2a")
+    spec = {**spec, "account": account}
+    label = mini_2a.LABEL + os.urandom(6).hex()
+    extra = {"web": True, "pipe": pipe, "store": os.environ.get("MENAGERIE_STORE")}
+    path, lease = _reserve(families, host, spec, label, plan, selected_role, cfg, kind="2a",
+                           extra=extra)
+    run = _submit(host, spec, families, label, brief, plan, kind="2a")  # unproven: lease held
+    lease = {**lease, "run": run, "brief": str(brief),
+             "result": str(brief.with_name("BRIEF.result.md"))}
+    return Started(host, path, lease, tuple(families), None)
+
+
+UNREAD = object()  # ``finish``'s admission not read yet
+
+
+def finish(started: Started, admitted: admission.Refused | None | object = UNREAD) -> str:
     """Read a started lane's run-on admission: a proven refusal releases its lease and raises
     ``Refused`` (the caller may fall back); otherwise the lease takes the run and the launch
-    event is written. An unreadable admission raises and keeps the provisional lease."""
+    event is written. An unreadable admission raises and keeps the provisional lease.
+    ``admitted`` is the lane's entry from ``admissions`` when the caller read several together."""
 
     try:
-        _admitted(started.lease["label"])
+        if admitted is UNREAD:
+            _admitted(started.lease["label"])
+        elif isinstance(admitted, admission.Refused):
+            raise admitted
     except admission.Refused:
         started.path.unlink()
         raise
@@ -630,7 +781,7 @@ def finish(started: Started) -> str:
     drive.event(run, "", "launch", **{k: v for k, v in lease.items() if k != "run"},
                 gauges=admission.gauges(lease["account"]))
     if kind != "2b":
-        return run  # a describe lane's one event is its launch, as on the hub
+        return run  # a describe or 2a lane's one event here is its launch, as on the hub
     for family in started.families:
         if len(started.families) > 1:
             drive.event(run, family, "batch:assigned")
@@ -639,9 +790,10 @@ def finish(started: Started) -> str:
     return run
 
 
-def _admissible(host: str, config: Mapping[str, Any], cfg: Mapping[str, Any]) -> dict[str, Any]:
-    """The worker's spec when a lane may start there now, else a ``Refused`` naming why."""
-    if not serving():
+def _admissible(host: str, config: Mapping[str, Any], cfg: Mapping[str, Any],
+                kind: str = "2b") -> dict[str, Any]:
+    """The worker's spec when a ``kind`` lane may start there now, else a ``Refused`` naming why."""
+    if not ready(kind):
         raise admission.Refused("no_admission", "bridge or mini relay not serving")
     try:
         spec = _spec(host, config)
@@ -674,7 +826,8 @@ def _families(families: Sequence[str], data: DataLayout) -> None:
 
 def _reserve(families: Sequence[str], host: str, spec: Mapping[str, Any], label: str,
              plan: Mapping[str, Any], role: str,
-             cfg: Mapping[str, Any], kind: str = "2b") -> tuple[Path, dict[str, Any]]:
+             cfg: Mapping[str, Any], kind: str = "2b",
+             extra: Mapping[str, Any] | None = None) -> tuple[Path, dict[str, Any]]:
     """Reserve before any network preparation; ambiguous starts retain the family and slot."""
     with admission._lease_lock() as leases:
         admission._held(leases, families, label)
@@ -683,7 +836,7 @@ def _reserve(families: Sequence[str], host: str, spec: Mapping[str, Any], label:
         occupied = sum(x.get("placement") == host for x in live)
         if occupied >= host_cap(host, spec, cfg)[0]:
             raise admission.Refused("no_admission", "mini worker slot taken")
-        if not serving():
+        if not ready(kind):
             raise admission.Refused("no_admission", "bridge or mini relay not serving")
         lease = {"label": label, "run": "pending:" + label, "kind": kind, "keys": list(families),
                  "role": role, "harness": "claude", "model": plan["model"],
@@ -692,7 +845,8 @@ def _reserve(families: Sequence[str], host: str, spec: Mapping[str, Any], label:
                  "mini": {"ssh_alias": spec["ssh_alias"], "deliver": spec.get("deliver")},
                  "parent": os.environ.get("FLEET_RUN_ID"), "started": now(),
                  "expires": admission._stamp(datetime.now(timezone.utc)
-                                             + timedelta(minutes=HARD_MINUTES[kind] + 30))}
+                                             + timedelta(minutes=HARD_MINUTES[kind] + 30)),
+                 **(extra or {})}
         path = leases / f"{label}.json"
         admission._write_atomic(path, json.dumps(lease) + "\n")
     return path, lease
@@ -708,7 +862,7 @@ def _submit(host: str, spec: Mapping[str, Any], families: Sequence[str], label: 
     ref = admission._sh(["git", "rev-parse", "HEAD"], cwd=cwd)
     if ref.returncode:
         raise OSError("cannot pin mini lane source")
-    brief_rel, result_rel = mini_relay.layout(families, brief)
+    brief_rel, result_rel = mini_relay.layout(families, brief, kind)
     hard = HARD_MINUTES[kind]
     manifest = {"runtime": spec["runtime"], "identity": spec["identity"], "model": plan["model"],
                 "effort": plan.get("effort") or "high", "account": spec["account"],
@@ -716,7 +870,8 @@ def _submit(host: str, spec: Mapping[str, Any], families: Sequence[str], label: 
                 "result": result_rel, "lane_timeout_s": (hard - 15) * 60,
                 "prepare": spec.get("prepare"),
                 "nice": PHONE_NICE if _phone_first(host, spec) else None,
-                **({"kind": kind} if kind != "2b" else {})}
+                **({"kind": kind} if kind != "2b" else {}),
+                **({"web": True} if kind == "2a" else {})}
     parent = os.environ.get("FLEET_RUN_ID")
     argv = [admission._fleet_run(), "start", "--kind", "remote", "--label", label,
             "--cwd", str(cwd), "--project", "menagerie", "--require-result",
@@ -728,7 +883,7 @@ def _submit(host: str, spec: Mapping[str, Any], families: Sequence[str], label: 
             "--host", host, "--os", spec.get("os", "macos"), "--no-fallback",
             "--ref", ref.stdout.strip(), "--cpus", str(spec.get("cpus", 1)),
             "--memory-gib", str(spec["peak_gib"]),
-            *(arg for path in LANE_SPARSE_EXCLUDE for arg in ("--sparse-exclude", path)),
+            *(arg for path in sparse_exclude(kind) for arg in ("--sparse-exclude", path)),
             "--job", label, "--pull", "outputs/lane/**", "--", LANE_PYTHON,
             "menagerie/pipeline/mini_lane.py", "run", json.dumps(manifest)]
     started = admission._sh(argv, cwd=cwd)
@@ -741,31 +896,76 @@ def _submit(host: str, spec: Mapping[str, Any], families: Sequence[str], label: 
 REFUSED_VERDICTS = ("refused", "waiting", "admission_timeout")
 
 
+ADMIT_WAIT_S = 30
+# Seconds between admission reads: most lanes are read on the first or second, and each read is a
+# run-on process on the hub, so later reads space out (10 reads in 30 s, not 30).
+ADMIT_GAPS_S = (1, 1, 2, 2, 3, 3, 4, 5, 5, 5)
+
+
 def _run_on_state(label: str) -> dict[str, Any]:
     """``run-on state --json``: its record whatever the exit code, since it exits non-zero for
     exactly the verdicts ``_admitted`` acts on (75 admission_timeout, 6 refused); none when no
     JSON came back."""
-    result = admission._sh([admission._tool("run-on"), "state", label, "--json"])
-    try:
-        state = json.loads(result.stdout)
-    except ValueError:
-        return {}
-    return state if isinstance(state, dict) else {}
+    return _run_on_states([label])[label]
+
+
+def _run_on_states(labels: Sequence[str]) -> dict[str, dict[str, Any]]:
+    """``run-on state LABEL... --json`` in one call: one record per line, in order (a single
+    label's record keeps its non-zero exit, as above). A label with no record is empty, unless
+    others came back, when it is asked alone (a run-on that reads only its first job)."""
+    result = admission._sh([admission._tool("run-on"), "state", *labels, "--json"])
+    records = []
+    for line in result.stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    states = {str(r.get("job", labels[n] if n < len(labels) else "")): r
+              for n, r in enumerate(records)}
+    if not states or len(labels) == 1:
+        return {label: states.get(label, {}) for label in labels}
+    return {label: states[label] if label in states else _run_on_states([label])[label]
+            for label in labels}
+
+
+def _admission(state: Mapping[str, Any]) -> admission.Refused | bool:
+    """A lane's run-on record read: its proven refusal, else whether run-on is past pending."""
+    # admission_timeout: run-on's admission wait ran out with no room (NO_CAPACITY); nothing ran
+    if state.get("verdict") in REFUSED_VERDICTS and state.get("state") == "TERMINAL":
+        return admission.Refused("no_admission", "mini worker refused before payload start")
+    # A launch that failed after the claim, with the worker showing no run: nothing ran, so
+    # the slot and the families go back at once instead of waiting out the relay's pulls.
+    if state.get("ran") is False and state.get("launch_failed"):
+        return admission.Refused("no_admission", "mini worker launch failed before payload "
+                                 f"start ({state['launch_failed']})")
+    return state.get("verdict") not in ("pending", "unknown", None)
+
+
+def admissions(labels: Sequence[str]) -> dict[str, admission.Refused | None]:
+    """Several started lanes' run-on admissions, read together: each round is one ``run-on
+    state`` call for the labels still pending, rounds spaced by ``ADMIT_GAPS_S`` up to
+    ``ADMIT_WAIT_S``. Each label maps to its proven refusal, else None (admitted, or still
+    pending at the deadline: its lease stays held). Only a proven pre-payload refusal
+    authorizes the immediate hub fallback."""
+    read: dict[str, admission.Refused | None] = {}
+    pending = list(dict.fromkeys(labels))
+    deadline = time.monotonic() + ADMIT_WAIT_S
+    for gap in ADMIT_GAPS_S:
+        for label, state in _run_on_states(pending).items():
+            seen = _admission(state)
+            if seen is not False:
+                read[label] = seen if isinstance(seen, admission.Refused) else None
+        pending = [label for label in pending if label not in read]
+        if not pending or time.monotonic() + gap >= deadline:
+            break
+        time.sleep(gap)
+    return {label: read.get(label) for label in labels}
 
 
 def _admitted(label: str) -> None:
     """Only a proven pre-payload refusal authorizes the immediate hub fallback."""
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        state = _run_on_state(label)
-        # admission_timeout: run-on's admission wait ran out with no room (NO_CAPACITY); nothing ran
-        if state.get("verdict") in REFUSED_VERDICTS and state.get("state") == "TERMINAL":
-            raise admission.Refused("no_admission", "mini worker refused before payload start")
-        # A launch that failed after the claim, with the worker showing no run: nothing ran, so
-        # the slot and the families go back at once instead of waiting out the relay's pulls.
-        if state.get("ran") is False and state.get("launch_failed"):
-            raise admission.Refused("no_admission", "mini worker launch failed before payload "
-                                    f"start ({state['launch_failed']})")
-        if state.get("verdict") not in ("pending", "unknown", None):
-            return
-        time.sleep(1)
+    refused = admissions([label])[label]
+    if refused is not None:
+        raise refused

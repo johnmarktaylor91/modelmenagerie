@@ -18,6 +18,7 @@ const dist = read("dist.json");
 const crawl = read("crawl.json")?.summary ?? null;
 const pages = read("pages.json");
 const meta = read("meta.json");
+const assets = read("assets.json");
 const lighthouse = read("lighthouse/summary.json");
 
 const gates = [];
@@ -34,6 +35,14 @@ gate("broken links in build", dist?.broken_links, `<= ${t.broken_links}`, dist &
 gate("page links without trailing slash", dist?.links_without_slash, `<= ${t.internal_redirects}`, dist && dist.links_without_slash <= t.internal_redirects, dist?.without_slash_sample?.slice(0, 5));
 const copyHits = dist ? dist.copy_hits : crawl?.copy_hits;
 gate("copy hits", copyHits, `<= ${t.copy_hits}`, copyHits <= t.copy_hits, (dist?.copy_sample ?? crawl?.copy_sample ?? []).slice(0, 8));
+gate("counts typed into the source", dist?.typed_counts, `<= ${t.typed_counts ?? 0}`, dist && dist.typed_counts <= (t.typed_counts ?? 0), dist?.typed_counts_sample?.slice(0, 8));
+gate("printed counts match the listing", dist?.count_mismatches, "= 0", dist && dist.count_mismatches === 0, dist?.counts?.mismatches);
+// The export holds exactly the records the site shows, so its funnel and the pages count one set.
+gate("export counts match the shown set", dist?.counts?.funnel_disagreements?.length, "= 0", dist?.counts?.funnel_disagreements?.length === 0, dist?.counts?.funnel_disagreements);
+// Every asset-host address the build names is one the export names (and so was staged and uploaded),
+// and a sample of each kind answers 200 on the asset host. Skipped when the build names no asset host.
+gate("asset addresses outside the export", assets?.not_in_export, "= 0", assets?.not_in_export === 0, assets?.not_in_export_sample?.slice(0, 5));
+gate("asset host HEAD sample failures", assets?.head_failures, `= 0 of ${assets?.head_checked ?? "-"}`, assets?.head_failures === 0 && assets?.head_checked > 0, assets?.head_failure_sample?.slice(0, 5));
 gate("crawl: sitemap", crawl ? (crawl.sitemap_ok ? 1 : 0) : null, "= 1", crawl?.sitemap_ok, crawl ? `${crawl.sitemap_urls} urls` : undefined);
 gate("crawl: pages failing", crawl?.page_failures?.length, "= 0", crawl && crawl.page_failures.length === 0, crawl?.page_failures?.slice(0, 5));
 gate("crawl: broken targets", crawl?.not_found, `<= ${t.broken_links}`, crawl && crawl.non_ok - crawl.redirects <= t.broken_links, crawl?.bad_sample?.filter((c) => c.status < 300 || c.status >= 400).slice(0, 5));
@@ -62,7 +71,7 @@ if (meta) {
 if (lighthouse) {
   for (const [name, row] of Object.entries(lighthouse)) {
     if (row.error) {
-      gate(`lighthouse ${name}`, null, "", false, row.error);
+      gate(`lighthouse ${name}`, "error", "", false, row.error);
       continue;
     }
     const L = t.lighthouse;
@@ -83,7 +92,7 @@ const failed = gates.filter((g) => g.status === "fail");
 const verdict = { green: failed.length === 0, failed: failed.length, skipped: gates.filter((g) => g.status === "skipped").length, gates };
 fs.writeFileSync(path.join(outDir, "verdict.json"), JSON.stringify(verdict, null, 1));
 for (const g of gates) {
-  console.log(`${g.status.padEnd(7)} ${g.name}: ${g.value ?? "-"} (${g.limit})${g.status === "fail" && g.detail ? ` ${JSON.stringify(g.detail).slice(0, 300)}` : ""}`);
+  console.log(`${g.status.padEnd(7)} ${g.name}: ${g.value ?? "-"} (${g.limit})${(g.status === "fail" || g.status === "note") && g.detail ? ` ${JSON.stringify(g.detail).slice(0, 300)}` : ""}`);
 }
 console.log(verdict.green ? `VERDICT green (${verdict.skipped} skipped)` : `VERDICT red: ${failed.length} failing`);
 process.exitCode = verdict.green ? 0 : 1;

@@ -163,7 +163,21 @@ HANDLERS: dict[str, Handler] = {
     "render": lambda a: _run_model(a, "render"),
     "worker": lambda a: _mod("worker").main(a.attempt_dir),
     "publish export": lambda a: str(_mod("publish").export_site(
-        data=DataLayout.from_env(), out_dir=a.out_dir, ids=a.ids or None, as_of=a.as_of)),
+        data=DataLayout.from_env(), out_dir=a.out_dir, ids=a.ids or None, as_of=a.as_of,
+        accept_pins=a.accept_pins, no_citations=a.no_citations, shown_only=not a.all_records)),
+    "publish derive": lambda a: _mod("publish_assets").derive(
+        a.export_dir, store=StoreLayout.from_env(), derived=a.derived, workers=a.workers,
+        deadline_minutes=a.deadline_minutes, variants=a.variants, share=not a.no_share),
+    "publish stage": lambda a: _mod("publish_assets").stage_summary(
+        a.export_dir, a.dest, store=StoreLayout.from_env(), kinds=a.kinds, derived=a.derived,
+        workers=a.workers),
+    "publish clean": lambda a: _mod("publish_public").clean(
+        a.export_dir, store=StoreLayout.from_env(), derived=a.derived, assets_hint=a.assets_hint,
+        workers=a.workers),
+    "publish restrict": lambda a: _mod("publish_public").restrict(
+        a.export_dir, a.assets, kinds=a.kinds, null_missing=a.null_missing),
+    "publish release": lambda a: _mod("publish_public").release(
+        a.export_dir, a.assets, base=a.base, cache_key=a.cache_key, version=a.version),
 }
 
 
@@ -186,6 +200,7 @@ HANDLERS.update({
         tuple(a.sha or ()), store=StoreLayout.from_env(), data=DataLayout.from_env()),
     "store materialize": lambda a: str(_mod("store").materialize(
         a.sha256, a.dest, store=StoreLayout.from_env())),
+    "store trim-unpack": lambda a: _mod("store").trim_unpack_cache(a.root),
     "family seed": lambda a: _mod("research").seed_family(a.ids, data=DataLayout.from_env()),
     "packet write": lambda a: _mod("research").packet_write(
         a.family, a.file, store=StoreLayout.from_env(), data=DataLayout.from_env()),
@@ -216,6 +231,7 @@ HANDLERS.update({
         a.family, data=DataLayout.from_env(), store=StoreLayout.from_env()),
     "giveup": lambda a: _mod("implement").giveup(
         a.id, a.cls, a.reason, data=DataLayout.from_env(), recipe=a.recipe),
+    "defer": lambda a: _mod("implement").defer(a.family, reason=a.reason, data=DataLayout.from_env()),
     "done": lambda a: _mod("implement").done(a.recipe_file, data=DataLayout.from_env(),
                                              rewrite_family=a.rewrite_family),
     "implement launch": lambda a: _mod("implement").launch(
@@ -267,7 +283,29 @@ HANDLERS.update({
     "checkin": lambda a: str(_mod("drive").checkin(a.run_id, data=DataLayout.from_env(),
                                                    out=a.out)),
     "standin sweep": lambda a: _mod("standin").sweep(data=DataLayout.from_env(), apply=a.apply),
+    "review disputed": lambda a: (
+        _mod("review_disputed").reopen(data=DataLayout.from_env(), apply=a.apply) if a.reopen
+        else _mod("review_disputed").type_no_seat(data=DataLayout.from_env(), cohort=a.cohort,
+                                                  apply=a.apply) if a.no_seat
+        else _mod("review_disputed").type_held(data=DataLayout.from_env(), ids=a.ids or None,
+                                               apply=a.apply, before_repair=a.before_repair,
+                                               cohort=a.cohort)),
+    "review big-deferred": lambda a: (
+        _mod("big_deferred").reopen(data=DataLayout.from_env(), cohort=a.cohort, apply=a.apply,
+                                    all_rows=a.all_rows) if a.reopen
+        else _mod("big_deferred").type_waiting(data=DataLayout.from_env(), cohort=a.cohort,
+                                               apply=a.apply)),
+    "review torchlens-corpus": lambda a: _torchlens_corpus(a),
 })
+
+
+def _torchlens_corpus(a: argparse.Namespace) -> dict[str, Any]:
+    """Build and write the corpus; print its counts and its ten largest clusters."""
+
+    built = _mod("tl_corpus").build(data=DataLayout.from_env(), cohort=a.cohort, out=a.out)
+    top = [{k: g[k] for k in ("id", "signature", "count", "attribution", "representatives")}
+           for g in built["clusters"][:10]]
+    return {k: v for k, v in built.items() if k not in ("rows", "clusters")} | {"top": top}
 
 # Rung 3 verbs (BUILD-PLAN r3 section 1, item 3), each dispatching to its owning lane's module.
 HANDLERS.update({
@@ -432,6 +470,9 @@ def _add_data_verbs(sub: Any) -> None:
     p = _verb(store, "store materialize", "unpack a stored code snapshot")
     p.add_argument("sha256")
     p.add_argument("dest", type=Path)
+    p = _verb(store, "store trim-unpack", "remove unpack cache entries unused for the lease")
+    p.add_argument("--root", type=Path, help="the cache (default MENAGERIE_UNPACK_CACHE, else "
+                   "~/.cache/menagerie/unpack)")
     p = _verb(store, "store fetch", "hub: bring blobs only the box holds back into the worker store")
     p.add_argument("sha256", nargs="+")
     p.add_argument("--remote", help="the worker store as host:path (default MENAGERIE_STORE_REMOTE)")
@@ -510,6 +551,9 @@ def _add_lane_verbs(sub: Any) -> None:
     p.add_argument("reason")
     p.add_argument("--recipe", type=Path,
                    help="the draft to keep: required for oversized, kept for needs_gpu")
+    p = _verb(sub, "defer", "hand a family back for a new session, keeping its drafts")
+    p.add_argument("family")
+    p.add_argument("reason")
     p = _verb(sub, "done", "accept a passing recipe")
     p.add_argument("recipe_file", type=Path)
     p.add_argument("--rewrite-family", action="store_true",
@@ -545,6 +589,35 @@ def _add_lane_verbs(sub: Any) -> None:
     p = _verb(review, "review record", "record a review verdict")
     p.add_argument("id")
     p.add_argument("file", type=Path)
+    p = _verb(review, "review disputed",
+              "list rows held after their disputed repair round (the rung's tail)")
+    p.add_argument("ids", nargs="*", help="default: every row with a provisional fabrication")
+    p.add_argument("--apply", action="store_true", help="type them review_disputed (records)")
+    p.add_argument("--reopen", action="store_true",
+                   help="instead take review_disputed back where a passed main seat can review")
+    p.add_argument("--before-repair", action="store_true",
+                   help="also type disputed rows still owed their repair round")
+    p.add_argument("--cohort", help="only the tick worklist's rows of this cohort")
+    p.add_argument("--no-seat", action="store_true",
+                   help="instead type review_no_seat on the cohort's rows no counting seat may "
+                        "review (needs --cohort)")
+    p = _verb(review, "review big-deferred",
+              "list a cohort's waiting big rows to type big_row_deferred (the rung's tail)")
+    p.add_argument("--cohort", required=True, help="the tick worklist's cohort")
+    p.add_argument("--apply", action="store_true", help="write the records")
+    p.add_argument("--reopen", action="store_true",
+                   help="instead take big_row_deferred back from as many rows as G has room for")
+    p.add_argument("--all", dest="all_rows", action="store_true",
+                   help="with --reopen, take every row back regardless of G's room")
+    p = _verb(review, "review torchlens-corpus",
+              "the failed traces TorchLens may own, attributed and clustered, for TorchLens")
+    which = p.add_mutually_exclusive_group()
+    which.add_argument("--cohort", help="only the tick worklist's rows of this cohort "
+                       "(rows off the worklist are 'earlier')")
+    which.add_argument("--all", dest="all_cohorts", action="store_true",
+                       help="every cohort (the default)")
+    p.add_argument("--out", type=Path, help="folder for corpus.jsonl, clusters.md and "
+                   "summary.json, plus history/<date>/ (default the work root's torchlens-corpus/)")
     prose = _group(sub, "prose", "published prose")
     _verb(prose, "prose audit", "check prose against packets").add_argument("ids", nargs="*")
     _verb(sub, "next", "each model's next step").add_argument("ids", nargs="*")
@@ -792,6 +865,50 @@ def _add_run_verbs(sub: Any) -> Any:
     p.add_argument("out_dir", type=Path)
     p.add_argument("--ids", nargs="*")
     p.add_argument("--as-of", help="measurement date for the published counts")
+    p.add_argument("--accept-pins", nargs="+", default=[], metavar="VERSION",
+                   help="earlier TorchLens pins whose deciding traces stand in, in this order")
+    p.add_argument("--no-citations", action="store_true",
+                   help="export even when the data tree holds no citation counts")
+    p.add_argument("--all-records", action="store_true",
+                   help="also write records the site gives no page (failed checks, fabrications)")
+    p = _verb(publish, "publish derive", "add SVG sizes, top crops and share images to an export")
+    p.add_argument("export_dir", type=Path)
+    p.add_argument("--derived", type=Path, help="derivatives folder (default EXPORT_DIR/derived)")
+    p.add_argument("--workers", type=int, help="raster processes (default MENAGERIE_CPUS or 2)")
+    p.add_argument("--deadline-minutes", type=float,
+                   help="stop starting new rasters after this long, then rewrite the export")
+    p.add_argument("--variants", choices=("all", "default"), default="all",
+                   help="crop every variant (default) or only each record's default")
+    p.add_argument("--no-share", action="store_true", help="skip the 1200 by 630 share images")
+    p = _verb(publish, "publish stage", "copy an export's assets to DEST/<key> with MANIFEST.tsv")
+    p.add_argument("export_dir", type=Path)
+    p.add_argument("dest", type=Path)
+    p.add_argument("--kinds", default="svg,thumb,crop,pdf,share",
+                   help="comma list of asset kinds, or 'all' (adds html, netron, model_explorer "
+                        "and tiles)")
+    p.add_argument("--derived", type=Path, help="derivatives folder (default EXPORT_DIR/derived)")
+    p.add_argument("--workers", type=int, help="copy threads (default MENAGERIE_CPUS or 2)")
+    p = _verb(publish, "publish clean",
+              "point an export at copies of its SVGs without renderer diagnostics (before derive)")
+    p.add_argument("export_dir", type=Path)
+    p.add_argument("--derived", type=Path, help="derivatives folder (default EXPORT_DIR/derived)")
+    p.add_argument("--assets-hint", type=Path,
+                   help="a staged assets folder to read SVGs from before the store")
+    p.add_argument("--workers", type=int, help="threads (default MENAGERIE_CPUS or 2)")
+    p = _verb(publish, "publish restrict",
+              "remove references to objects that did not stage (after stage)")
+    p.add_argument("export_dir", type=Path)
+    p.add_argument("assets", type=Path, help="the staged folder holding MANIFEST.tsv")
+    p.add_argument("--kinds", default="svg,thumb,crop,pdf,share", help="the uploaded kinds")
+    p.add_argument("--null-missing", nargs="*", default=[], metavar="KIND",
+                   help="uploaded kinds whose missing objects are left out instead of refused")
+    p = _verb(publish, "publish release",
+              "write the gzipped public JSON Lines into the staged folder (after restrict)")
+    p.add_argument("export_dir", type=Path)
+    p.add_argument("assets", type=Path)
+    p.add_argument("--base", required=True, help="public asset address, e.g. https://assets...")
+    p.add_argument("--cache-key", default="?v=1", help="query added to every asset address")
+    p.add_argument("--version", help="release folder name (default the export date)")
     return runner
 
 

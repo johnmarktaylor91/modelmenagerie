@@ -5,7 +5,8 @@
  */
 import type { APIRoute, GetStaticPaths } from "astro";
 
-import { getAllModels, getCatalogIndex, getModelBySlug, listModelSlugs } from "@/lib/catalog";
+import { getCatalogIndex, getModelBySlug, listModelSlugs } from "@/lib/catalog";
+import { getSiteCounts } from "@/lib/counts";
 import { SHARE_IMAGE_SLUGS } from "@/lib/featured";
 import { categoryLabel, formatNumber } from "@/lib/labels";
 import { shareImageName } from "@/lib/seo";
@@ -20,7 +21,7 @@ function caption(key: string): string | null {
 }
 
 function cards(): Map<string, ShareCard> {
-  const total = formatNumber(getAllModels().length);
+  const total = formatNumber(getSiteCounts().validated);
   const result = new Map<string, ShareCard>([
     ["default", { headline: "Computational graphs of neural networks", subline: `${total} architectures, traced and drawn with TorchLens.`, crop: "default", caption: caption("default") }],
     ["dataset", { headline: "The dataset", subline: `One record per model for ${total} models, with every diagram file. CSV and JSON Lines.`, crop: "default", caption: caption("default") }],

@@ -56,6 +56,8 @@ export interface ModelRecord {
   stable_id: string;
   slug: string;
   display_name: string;
+  /** Site-side: the catalog's own name when `featured.ts` DISPLAY_NAMES gives a cleaner one (never in the export). */
+  source_name?: string;
   category: string;
   family_normalized: string;
   domain: string;
@@ -118,6 +120,10 @@ export interface ModelRecord {
   // Describe pass, withheld when ungrounded (publish.py).
   tagline?: string | null;
   summary_markdown?: string | null;
+  /** What the summary was written from: "full", "abstract", "docs", "readme" or "none"; null when unknown. */
+  summary_basis?: string | null;
+  /** True when the summary was checked against its sources after it was written; absent or false otherwise. */
+  summary_checked?: boolean | null;
   key_contribution?: string | null;
   keywords?: string[];
 
@@ -144,14 +150,14 @@ export interface FamilyRecord {
 
 /** Public counts. The preview export has the first block; `site-export/1` the dated second block. */
 export interface Funnel {
-  cataloged: number;
-  build_verified: number;
-  forward_validated_real: number;
-  forward_validated_wrapper: number;
-  rendered: number;
-  quarantined: number;
-  deferred: number;
-  predicate_note: string;
+  cataloged?: number;
+  build_verified?: number;
+  forward_validated_real?: number;
+  forward_validated_wrapper?: number;
+  rendered?: number;
+  quarantined?: number;
+  deferred?: number;
+  predicate_note?: string;
   as_of?: string;
   roster_names?: number;
   validated_records?: number;

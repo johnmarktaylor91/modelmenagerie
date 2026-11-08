@@ -3,7 +3,8 @@
 #
 #   bash qa/run.sh                     # from site/: install, astro check, build, serve dist, check it
 #   bash qa/run.sh --url https://...   # check a deployed site instead (no build, no file checks)
-#   options: --out DIR (default qa/out), --skip-lighthouse, --skip-install, --pages N (crawl size, 400)
+#   options: --out DIR (default qa/out), --skip-lighthouse, --skip-install, --pages N (crawl size, 400),
+#            --full-page (also full-length screenshots at 390 and 1280 px in OUT/shots-full)
 #
 # Run it on a worker, never on the hub; it needs Node 22.18 or later and a Chrome or Chromium
 # (CHROME=/path, default: chromium or google-chrome on PATH). docs/site.md has the run-on line.
@@ -24,6 +25,7 @@ while [ $# -gt 0 ]; do
     --skip-lighthouse) skip_lh=1; shift ;;
     --skip-install) skip_install=1; shift ;;
     --pages) max_pages="$2"; shift 2 ;;
+    --full-page) export FULL_PAGE=1; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -64,6 +66,8 @@ if [ -z "$url" ]; then
   [ "$build_exit" -eq 0 ] || { echo "build failed (see $out/build.log)" >&2; exit 2; }
   step "files, links and copy in dist"
   node qa/dist-checks.mjs dist "$out/dist.json" >> "$log" 2>&1 || { echo "dist checks broke (see $log)" >&2; exit 2; }
+  step "asset host references"
+  node qa/assets.mjs dist "$out/assets.json" >> "$log" 2>&1 || { echo "asset checks broke (see $log)" >&2; exit 2; }
   port=$(( 4400 + RANDOM % 400 ))
   npx astro preview --port "$port" --host 127.0.0.1 > "$out/preview.log" 2>&1 &
   server_pid=$!

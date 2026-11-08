@@ -4,9 +4,9 @@
  * The static page's own cards stay on screen until a filtered result is ready; a failed or
  * slow index request shows an error with Retry instead of an endless loading state.
  */
-import { matchesFacets } from "@/lib/facets";
-import { renderCardHtml } from "@/scripts/CardView";
-import { createListingLoader, loadFailureText, type LoadedIndex } from "@/scripts/IndexLoader";
+import { matchesFacets, type FacetFields } from "@/lib/facets";
+import { PRIORITY_CARDS, renderCardHtml } from "@/scripts/CardView";
+import { createListingLoader, loadFailureText, loadRosterIndex, type LoadedIndex, type LoadedRoster } from "@/scripts/IndexLoader";
 import type { IndexEntry } from "@/scripts/ListingIndex";
 import { rangeText, renderPagerHtml } from "@/scripts/ListingPager";
 import { rememberListingUrl } from "@/scripts/ListingReturn";
@@ -25,6 +25,7 @@ import {
   type SortKey,
 } from "@/scripts/ListingState";
 import { initListingView, type ListingView } from "@/scripts/ListingView";
+import { renderRosterEntryHtml, type RosterEntry } from "@/scripts/RosterIndex";
 import { compactText } from "@/scripts/CardView";
 import { parseQuery, scoreMatch } from "@/scripts/SearchMatch";
 
@@ -45,7 +46,11 @@ interface Elements {
   pager: HTMLElement;
   note: HTMLElement;
   family: HTMLElement;
+  untraced: HTMLInputElement | null;
 }
+
+/** One result: a model (card with a page) or a catalogued model with no diagram (text entry). */
+export type ResultItem = { kind: "model"; entry: IndexEntry } | { kind: "roster"; entry: RosterEntry };
 
 function required<T extends Element>(root: ParentNode, selector: string): T {
   const element = root.querySelector<T>(selector);
@@ -71,6 +76,7 @@ function findElements(root: HTMLElement): Elements {
     pager: required(root, "#listing-pager"),
     note: required(root, "#listing-note"),
     family: required(root, "#listing-family"),
+    untraced: root.querySelector<HTMLInputElement>("input[data-untraced]"),
   };
 }
 
@@ -82,6 +88,14 @@ function compareKnown(left: number | null, right: number | null, direction: 1 | 
   return direction * (left - right);
 }
 
+/** Ranked entries (0, 1, ...) first in rank order, unranked (-1) after. */
+function rankFirst(left: number, right: number): number {
+  if (left < 0 || right < 0) {
+    return Number(left < 0) - Number(right < 0);
+  }
+  return left - right;
+}
+
 /** The primary comparison for a sort key; 0 leaves the order to the catalog tiebreak. */
 function comparePrimary(sort: SortKey, left: { entry: IndexEntry; score: number }, right: { entry: IndexEntry; score: number }): number {
   const a = left.entry;
@@ -89,6 +103,8 @@ function comparePrimary(sort: SortKey, left: { entry: IndexEntry; score: number 
   switch (sort) {
     case "match":
       return left.score - right.score || a.card.name.length - b.card.name.length;
+    case "featured":
+      return rankFirst(a.featured, b.featured) || Number(!a.hasPicture) - Number(!b.hasPicture);
     case "preview":
       return Number(!a.hasPicture) - Number(!b.hasPicture);
     case "ops-desc":
@@ -116,7 +132,7 @@ export function computeResults(index: LoadedIndex, state: ListingState): IndexEn
   const families = new Set(state.filters.family.map(compactText));
   const scored: Array<{ entry: IndexEntry; score: number }> = [];
   for (const entry of index.entries) {
-    if (!matchesFacets(entry.facets, state.filters)) {
+    if ((entry.structure && !state.untraced) || !matchesFacets(entry.facets, state.filters)) {
       continue;
     }
     if (families.size && !families.has(compactText(entry.familyName))) {
@@ -129,6 +145,32 @@ export function computeResults(index: LoadedIndex, state: ListingState): IndexEn
   }
   const sort: SortKey = effectiveSort(state);
   scored.sort((left, right) => comparePrimary(sort, left, right) || left.entry.order - right.entry.order);
+  return scored.map(({ entry }) => entry);
+}
+
+/** Facet fields of a roster entry: only year and paper are known, so other filters leave it out. */
+function rosterFacets(entry: RosterEntry): FacetFields {
+  return { category: "", nOps: null, paramCount: null, year: entry.year, backend: "", licence: "", hasPaper: entry.paperUrl !== "", citations: null };
+}
+
+/** Roster entries for a state (none unless it lists untraced entries), best match first while searching, else by name. */
+export function computeRosterResults(roster: LoadedRoster, state: ListingState): RosterEntry[] {
+  if (!state.untraced) {
+    return [];
+  }
+  const query = parseQuery(state.q);
+  const families = new Set(state.filters.family.map(compactText));
+  const scored: Array<{ entry: RosterEntry; score: number; order: number }> = [];
+  roster.entries.forEach((entry, order) => {
+    if (!matchesFacets(rosterFacets(entry), state.filters) || (families.size && !families.has(compactText(entry.family || entry.name)))) {
+      return;
+    }
+    const score = query ? scoreMatch(roster.fields[order], query) : 0;
+    if (score !== null) {
+      scored.push({ entry, score, order });
+    }
+  });
+  scored.sort((left, right) => left.score - right.score || left.order - right.order);
   return scored.map(({ entry }) => entry);
 }
 
@@ -147,7 +189,7 @@ export function initListing(root: HTMLElement): void {
   const staticPage = parsePage(root.dataset.staticPage ?? null);
   const lastPage = parsePage(root.dataset.lastPage ?? null);
   const staticPath = staticPage === 1 ? "/models/" : `/models/${staticPage}/`;
-  const loadIndex = createListingLoader((root.dataset.assetBase ?? "").replace(/\/+$/, ""));
+  const loadIndex = createListingLoader();
   const staticView = { grid: els.grid.innerHTML, count: els.count.textContent ?? "", pager: els.pager.innerHTML };
   const firstParams = new URLSearchParams(location.search);
   let state = readListingState(firstParams);
@@ -167,12 +209,25 @@ export function initListing(root: HTMLElement): void {
 
   function syncControls(): void {
     els.search.value = state.q;
+    if (els.untraced) {
+      els.untraced.checked = state.untraced;
+    }
     for (const input of root.querySelectorAll<HTMLInputElement>("input[data-filter]")) {
       const key = input.dataset.filter as (typeof FILTER_KEYS)[number];
       input.checked = state.filters[key]?.includes(input.value) ?? false;
     }
+    // "Diagrams first" only means something while models with no diagram are listed.
+    const diagramsFirst = els.sort.querySelector<HTMLOptionElement>('option[value="preview"]');
+    if (diagramsFirst) {
+      diagramsFirst.hidden = !state.untraced;
+      diagramsFirst.disabled = !state.untraced;
+    }
     els.sort.value = effectiveSort(state);
-    const active = activeFilterCount(state);
+    const untracedNote = root.querySelector<HTMLElement>("[data-untraced-note]");
+    if (untracedNote) {
+      untracedNote.hidden = !state.untraced;
+    }
+    const active = activeFilterCount(state) + Number(state.untraced);
     els.filterCount.textContent = active ? `(${active})` : "";
     const family = state.filters.family.join(", ");
     els.family.hidden = family === "";
@@ -206,7 +261,14 @@ export function initListing(root: HTMLElement): void {
     history.replaceState(null, "", staticUrl());
   }
 
-  function renderResults(results: IndexEntry[], push: boolean): void {
+  function itemHtml(item: ResultItem, position: number): string {
+    if (item.kind === "roster") {
+      return renderRosterEntryHtml(item.entry);
+    }
+    return renderCardHtml(item.entry.card, { priority: state.page === 1 && position < PRIORITY_CARDS });
+  }
+
+  function renderResults(results: ResultItem[], push: boolean): void {
     const asked = state.page;
     state = { ...state, page: clampPage(state.page, results.length, pageSize) };
     if (pendingPageNote !== null || asked !== state.page) {
@@ -216,7 +278,7 @@ export function initListing(root: HTMLElement): void {
     const pages = Math.max(1, Math.ceil(results.length / pageSize));
     const start = (state.page - 1) * pageSize;
     const slice = results.slice(start, start + pageSize);
-    els.grid.innerHTML = slice.map((entry) => renderCardHtml(entry.card)).join("");
+    els.grid.innerHTML = slice.map(itemHtml).join("");
     els.grid.hidden = slice.length === 0;
     els.grid.removeAttribute("aria-busy");
     els.empty.hidden = slice.length !== 0;
@@ -241,9 +303,18 @@ export function initListing(root: HTMLElement): void {
     els.grid.setAttribute("aria-busy", "true");
     els.count.textContent = "Loading the full model list...";
     try {
-      const index = await loadIndex();
+      const wantRoster = state.untraced;
+      const [index, roster] = await Promise.all([
+        loadIndex(),
+        wantRoster ? loadRosterIndex().catch(() => null) : Promise.resolve(null),
+      ]);
       if (token === renderToken) {
-        renderResults(computeResults(index, state), push);
+        const models: ResultItem[] = computeResults(index, state).map((entry) => ({ kind: "model", entry }));
+        const listed: ResultItem[] = roster ? computeRosterResults(roster, state).map((entry) => ({ kind: "roster", entry })) : [];
+        renderResults([...models, ...listed], push);
+        if (wantRoster && !roster) {
+          showNote("The list of models without a checked diagram could not be loaded. Only models with a checked diagram are shown.");
+        }
       }
     } catch (error) {
       if (token === renderToken) {
@@ -283,10 +354,13 @@ export function initListing(root: HTMLElement): void {
   });
   for (const button of root.querySelectorAll<HTMLButtonElement>("[data-clear-filters]")) {
     button.addEventListener("click", () => {
-      setState({ q: "", filters: emptyFilters(), sort: null, page: 1 });
+      setState({ q: "", filters: emptyFilters(), sort: null, page: 1, untraced: false });
       els.search.focus();
     });
   }
+  els.untraced?.addEventListener("change", () => {
+    setState({ untraced: els.untraced?.checked ?? false, page: 1 });
+  });
   required<HTMLButtonElement>(root, "[data-clear-family]").addEventListener("click", () => {
     setState({ filters: { ...state.filters, family: [] }, page: 1 });
   });

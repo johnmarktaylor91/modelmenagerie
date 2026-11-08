@@ -1,6 +1,6 @@
 // usage: node qa/meta.mjs BASEURL OUT.json
 // Share previews and structured data on the key pages: title, description, canonical address on the
-// apex with a trailing slash, Open Graph and Twitter tags, the share image (fetched: PNG, 1200 by 630),
+// apex with a trailing slash, Open Graph and Twitter tags, the share image (fetched: PNG or JPEG, 1200 by 630),
 // and JSON-LD of the expected type. Fetches each page as the link-preview robots do too.
 import fs from "node:fs";
 
@@ -48,7 +48,30 @@ function pngSize(bytes) {
   const signature = [0x89, 0x50, 0x4e, 0x47];
   if (bytes.length < 24 || !signature.every((b, i) => bytes[i] === b)) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  return { width: view.getUint32(16), height: view.getUint32(20) };
+  return { format: "png", width: view.getUint32(16), height: view.getUint32(20) };
+}
+
+/** Width and height of a JPEG from its first start-of-frame segment, or null. */
+function jpegSize(bytes) {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let at = 2;
+  while (at + 9 < bytes.length) {
+    if (bytes[at] !== 0xff) return null;
+    const marker = bytes[at + 1];
+    const length = view.getUint16(at + 2);
+    // SOF0 to SOF15, except DHT (C4), JPG (C8) and DAC (CC), carry the frame size.
+    if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+      return { format: "jpeg", width: view.getUint16(at + 7), height: view.getUint16(at + 5) };
+    }
+    at += 2 + length;
+  }
+  return null;
+}
+
+/** Format, width and height of a PNG or JPEG share image, or null for anything else. */
+function imageSize(bytes) {
+  return pngSize(bytes) ?? jpegSize(bytes);
 }
 
 const results = {};
@@ -73,10 +96,10 @@ for (const [name, route] of Object.entries(ROUTES)) {
     const imageUrl = meta["og:image"].startsWith(APEX) ? base + meta["og:image"].slice(APEX.length) : meta["og:image"];
     const imageResponse = await fetch(imageUrl);
     const bytes = new Uint8Array(await imageResponse.arrayBuffer());
-    const size = pngSize(bytes);
+    const size = imageSize(bytes);
     image = { url: meta["og:image"], status: imageResponse.status, type: imageResponse.headers.get("content-type"), bytes: bytes.length, ...size };
     if (imageResponse.status !== 200) problems.push(`share image status ${imageResponse.status}`);
-    if (!size) problems.push("share image is not a PNG");
+    if (!size) problems.push("share image is not a PNG or JPEG");
     else if (size.width !== 1200 || size.height !== 630) problems.push(`share image is ${size.width} by ${size.height}`);
     if (meta["og:image:width"] && Number(meta["og:image:width"]) !== size?.width) problems.push("og:image:width does not match the image");
   }

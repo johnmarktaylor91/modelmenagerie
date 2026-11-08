@@ -606,3 +606,11 @@ def test_the_daily_trim_runs_portable_twin_after_portable_rendered() -> None:
     assert store_trim.TWIN in store_trim.POLICIES and store_trim.TWIN in store_trim.POLICY
     usage = (Path(store_trim.__file__).with_name("store_trim_job.sh")).read_text()
     assert "portable-rendered|portable-twin|pack" in usage
+
+
+def test_a_placement_drops_a_signed_query_an_older_line_recorded():
+    line = StoreIndexLine(sha256="a" * 64, bytes=3, mime="application/pdf",
+                          fetched="2026-10-28T02:54:41Z", license_class="third-party",
+                          url="https://b.r2.example.com/x.pdf?X-Amz-Signature=ab&X-Amz-Expires=60")
+    placed = store_trim._restated(line, location="box:" + "b" * 64)
+    assert placed.url == "https://b.r2.example.com/x.pdf" and placed.location.startswith("box:")

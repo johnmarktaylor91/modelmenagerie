@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -40,7 +41,7 @@ from menagerie.pipeline import (
     roster,
     write_json,
 )
-from menagerie.pipeline import citecheck
+from menagerie.pipeline import citecheck, paper_check
 from menagerie.pipeline.records import (
     Amendment,
     Citation,
@@ -76,6 +77,9 @@ RUNG0_PAPERS: dict[str, tuple[str, str | None, str]] = {
     "f-original-lstm-1997-no-forget-gate": (
         "10.1162/neco.1997.9.8.1735", None, "Hochreiter and Schmidhuber 1997"),
 }
+
+
+ROWS_FILE = "rows.json"  # the rows of a 2a lane, beside its brief (``lane_rows``)
 
 
 def _get_json(url: str) -> dict[str, Any] | None:
@@ -187,9 +191,11 @@ def _paper(packet: Packet, ref: str, *, store: StoreLayout, data: DataLayout,
     except (fetch.FetchError, ValueError) as exc:
         report["paper"] = f"not fetched: {exc}"
         return sources, changed
-    text = next((line.sha256 for line in lines if line.derived_from == lines[0].sha256), None)
+    # The PDF's text when one came (an arXiv abstract page holds only the abstract).
+    doc = next((line for line in lines if line.mime == "application/pdf"), lines[0])
+    text = next((line.sha256 for line in lines if line.derived_from == doc.sha256), None)
     filled = Source(sid=paper.sid if paper else _next_sid(sources), role="paper",
-                    url=lines[0].url or url, blob=lines[0].sha256, text=text,
+                    url=doc.url or url, blob=doc.sha256, text=text,
                     official=True, fetched=now())
     sources = [filled if s.sid == filled.sid else s for s in sources]
     if paper is None:
@@ -252,7 +258,10 @@ def complete(family: str, *, store: StoreLayout, data: DataLayout) -> dict[str, 
     ref, title, why = RUNG0_PAPERS.get(family, (None, None, "the library's own paper link"))
     report: dict[str, Any] = {"family": family}
     sources, changed = list(packet.sources), []
-    if ref is not None or any(s.role == "paper" for s in sources):
+    if paper_check.refused_link(packet) or any(
+            s.role == "paper" and s.sid in paper_check.retired(packet) for s in sources):
+        report["paper"] = "refused: paper harvest refused this link or the paper is retired"
+    elif ref is not None or any(s.role == "paper" for s in sources):
         sources, changed = _paper(packet, ref or "", store=store, data=data, report=report)
     sources, licensed = _licenses(sources, store=store, data=data, report=report)
     paper = next((s for s in sources if s.role == "paper" and s.blob), None)
@@ -620,7 +629,8 @@ def brief(batch: Mapping[str, Any], *, data: DataLayout, lane_dir: Path) -> str:
     return "".join(proposals + parts)
 
 
-def launch(batch_file: Path, *, data: DataLayout, role: str | None = None) -> list[str]:
+def launch(batch_file: Path, *, data: DataLayout, role: str | None = None,
+           hosts: list[str] | None = None) -> list[str]:
     """Start one 2a lane per family batch listed in ``batch_file``, each on the first admitted lab.
 
     Inputs: a JSON file ``{"parent": <run id or null>, "batches": [{"label", "role" (default
@@ -633,6 +643,10 @@ def launch(batch_file: Path, *, data: DataLayout, role: str | None = None) -> li
     lane writes ``BRIEF.result.md`` beside it. Returns: the lane run ids (``queued:<label>`` for
     a queued batch). Side effects: briefs, lanes, their leases, their launch events and one
     ``tier`` event per family with a tier (the plan's case, read by ``measures``).
+
+    ``hosts`` (the tick's free worker slots, one name per slot, with ``mini_2a`` on) are tried
+    first for a batch that is not paper-only: its Claude-lab lane runs there (``mini_2a``) and the
+    slot is taken off the list; with none left or each refusing, the batch goes to the hub.
     """
 
     from menagerie.pipeline import admission, drive
@@ -644,14 +658,62 @@ def launch(batch_file: Path, *, data: DataLayout, role: str | None = None) -> li
         (lane_dir / "drafts").mkdir(parents=True, exist_ok=True)
         path = lane_dir / "BRIEF.md"
         path.write_text(brief(batch, data=data, lane_dir=lane_dir), encoding="utf-8")
+        (lane_dir / ROWS_FILE).write_text(json.dumps(
+            [i for f in batch["families"] for i in f["ids"]]) + "\n", encoding="utf-8")
         keys = [f.get("family") or seed_family(f["ids"], data=data)["family"]
                 for f in batch["families"]]
         first = role or batch.get("role", "model-default")
+        placed = _on_worker(path, keys, first, hosts, data) \
+            if hosts and not batch.get("paper_only") else None
+        if placed is not None:
+            for item in _tier_events(keys, batch):
+                drive.event(placed, item["family"], "tier", tier=item["tier"])
+            runs.append(placed)
+            continue
         roles = [first, *filter(None, [admission.other_role(first)])]
         runs.append(drive.launch_first("2a", roles, path, keys=keys, parent=spec.get("parent"),
                                        label=batch["label"], web=True,
                                        on_start=_tier_events(keys, batch)))
     return runs
+
+
+def lane_rows(brief: str | Path) -> list[str]:
+    """The roster rows a 2a lane works on, which ``launch`` lists beside its brief (``ROWS_FILE``);
+    none for a lane started before the list was written. A row with no record or packet yet has no
+    family the lane's lease could name, so this is how the tick knows the lane holds it."""
+
+    try:
+        return json.loads((Path(brief).parent / ROWS_FILE).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+
+
+def _on_worker(brief: Path, families: Sequence[str], role: str, hosts: list[str],
+               data: DataLayout) -> str | None:
+    """The batch's lane on the first worker in ``hosts`` that admits it (``mini_2a``): its run,
+    with that slot taken off ``hosts``; None when each refused. A start whose outcome is unproven
+    keeps its lease and raises ``Refused`` (``worker_uncertain``), so the batch is not started
+    twice."""
+
+    from menagerie.pipeline import admission, mini_placement, tick  # noqa: PLC0415
+
+    cfg = tick.config()
+    pipe = _pipeline_command(data, brief.parent / "drafts")
+    for host in list(dict.fromkeys(hosts)):
+        try:
+            started = mini_placement.start_2a(
+                families, brief, role=role, host=host, pipe=pipe, cfg=cfg,
+                config=(cfg.get("mini_workers") or {}).get(host) or {})
+            run = mini_placement.finish(started)
+        except admission.Refused:
+            while host in hosts:
+                hosts.remove(host)  # this pass, the worker takes no more 2a lanes
+            continue
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise admission.Refused("worker_uncertain", f"{host}: {exc}"[:300]) from exc
+        hosts.remove(host)
+        return run
+    return None
 
 
 def _tier_events(families: Sequence[str], batch: Mapping[str, Any]) -> list[dict[str, Any]]:

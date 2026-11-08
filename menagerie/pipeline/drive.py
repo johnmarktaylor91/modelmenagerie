@@ -19,6 +19,8 @@ import json
 import os
 import re
 import statistics
+import sys
+import time
 from collections import Counter, defaultdict
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -27,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from menagerie.paths import work_dir
-from menagerie.pipeline import DataLayout, now, read_json
+from menagerie.pipeline import DataLayout, now, read_json, read_json_cached
 from menagerie.pipeline.admission import (  # noqa: F401  (re-exported: drive's launch verbs)
     LABEL,
     LANE_CAPS,
@@ -219,18 +221,18 @@ class _Files:
     memo: _Memo = field(default_factory=_Memo)
 
     def record(self, model_id: str) -> ModelRecord | None:
-        return self.memo.get(self.data.model(model_id), lambda p: read_json(ModelRecord, p))
+        return self.memo.get(self.data.model(model_id), lambda p: read_json_cached(ModelRecord, p))
 
     def packet(self, family: str) -> Packet | None:
         if family not in self.packets:
-            self.packets[family] = self.memo.get(self.data.packet(family), lambda p: read_json(Packet, p))
+            self.packets[family] = self.memo.get(self.data.packet(family), lambda p: read_json_cached(Packet, p))
         return self.packets[family]
 
     def family_of(self, model_id: str) -> str | None:
         if self.members is None:
             self.members = {}
             for path in sorted((self.data.root / "research").glob("*/*.json")):
-                packet = self.memo.get(path, lambda p: read_json(Packet, p))
+                packet = self.memo.get(path, lambda p: read_json_cached(Packet, p))
                 self.packets[packet.family] = packet
                 self.members.update((m.id, packet.family) for m in packet.members)
         return self.members.get(model_id)
@@ -258,9 +260,72 @@ def _ledger_line(raw: Mapping[str, Any]) -> Any:
 
 def shard_rows(memo: _Memo, shard: Path) -> list[Any]:
     """One ledger shard's rows through the memo: the ledger is append-only, so a grown shard
-    costs only its new lines (``_Memo.appended``)."""
+    costs only its new lines (``_Memo.appended``). With ``LEDGER_CACHE_ENV`` set (the tick's
+    unit), a new process starts from the parse an earlier one kept (``_kept_tail``)."""
 
-    return memo.appended(shard, _ledger_line)
+    folder = os.environ.get(LEDGER_CACHE_ENV)
+    if not folder:
+        return memo.appended(shard, _ledger_line)
+    if shard not in memo.tails:
+        kept = _kept_tail(Path(folder), shard)
+        if kept is not None:
+            memo.tails[shard] = kept
+    before = memo.tails.get(shard)
+    rows = memo.appended(shard, _ledger_line)
+    after = memo.tails.get(shard)
+    if after is not None and (before is None or before.offset != after.offset):
+        _keep_tail(Path(folder), shard, after)
+    return rows
+
+
+# A tick pass is a new process, and parsing the ledger is most of its CPU (11 s of 47 MB, Oct
+# 2026): the parsed shards are kept in this folder, each checked by ``_Tail.extended_by`` before
+# use, so a pass parses only the lines appended since the last one.
+LEDGER_CACHE_ENV = "MENAGERIE_LEDGER_CACHE"
+
+
+def _tail_file(folder: Path, shard: Path) -> Path:
+    """The kept parse of ``shard``, named for the shard and for the code that parsed it."""
+
+    import hashlib  # noqa: PLC0415
+
+    from menagerie.pipeline import records  # noqa: PLC0415
+
+    digest = hashlib.sha256(str(shard.resolve()).encode())
+    for source in (records.__file__, __file__):  # the line parser and ``_Tail``
+        digest.update(Path(source).read_bytes())
+    return folder / f"{shard.stem}-{digest.hexdigest()[:16]}.pickle"
+
+
+def _kept_tail(folder: Path, shard: Path) -> _Tail | None:
+    """A kept parse of ``shard``; none when absent or unreadable (the shard is parsed in full)."""
+
+    import pickle  # noqa: PLC0415  (our own file, written by ``_keep_tail``)
+
+    try:
+        tail = pickle.loads(_tail_file(folder, shard).read_bytes())
+    except (OSError, pickle.UnpicklingError, EOFError, AttributeError, ImportError, TypeError):
+        return None
+    return tail if isinstance(tail, _Tail) else None
+
+
+def _keep_tail(folder: Path, shard: Path, tail: _Tail) -> None:
+    """Keep ``tail`` for the next process, replacing older kept parses of the shard. A failure
+    to write leaves the next pass to parse the shard in full, so it does not stop this one."""
+
+    import pickle  # noqa: PLC0415
+
+    target = _tail_file(folder, shard)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.{os.getpid()}")
+        tmp.write_bytes(pickle.dumps(tail, protocol=pickle.HIGHEST_PROTOCOL))
+        os.replace(tmp, target)
+        for old in folder.glob(f"{shard.stem}-*.pickle"):
+            if old != target:
+                old.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"menagerie: ledger cache not kept ({exc})", file=sys.stderr)
 
 
 def _roster_row(raw: Mapping[str, Any]) -> RosterRow:
@@ -580,22 +645,41 @@ def type_render(model_id: str, why: str, *, data: DataLayout) -> ModelRecord:
 
 def _review_step(model_id: str, record: ModelRecord, files: _Files,
                  rows: Sequence[Any]) -> tuple[str, str]:
+    from menagerie.pipeline.review import CONFIRM_ROLES, stale  # review imports drive
+
     packet = files.packet(record.family)
     if not _authored(record, packet):
         return "done", f"{record.source_case}: traced and rendered"
+    # A confirm-only seat's answer counts only when it confirms a fabrication; a verdict given
+    # against texts the packet no longer holds counts not at all (it is reviewed again).
+    every = rows  # a dispute reads the confirm-only seats' other answers too (``dispute``)
+    rows = [r for r in rows if not (isinstance(r, LedgerRow) and r.stage == "review" and (
+        (r.reviewer in CONFIRM_ROLES and r.verdict != "fabrication") or stale(r, packet)))]
     review = _current(rows, "review", record.recipe.rev)
     unjudged = review is None or review.verdict == "cannot_judge"
     if unjudged and packet is not None and _sourceless(packet):
         return "2a", f"packet {packet.family} has no saved source to review against: 2a first"
-    if review is not None and review.verdict == "cannot_judge" and _sources_since(packet, review.at):
-        review = None  # the packet gained sources after a review that had none to judge by
+    if review is not None and review.verdict == "cannot_judge" and _unjudged_again(review):
+        review = None  # the case now holds more than the review had to judge by
     if review is None:
         return "review", f"{record.source_case} recipe with no review at {record.recipe.rev}"
-    if review.verdict == "fabrication" and not _confirmed(rows, record.recipe.rev):
-        return "review", "a provisional seat's fabrication: a second seat's review before the repair"
     if review.verdict == "fabrication":
-        return "2b", "review found fabrication: the repair round"
+        return _fabrication_step(model_id, record, files, every, rows)
     return "done", f"reviewed: {review.verdict}"
+
+
+def _fabrication_step(model_id: str, record: ModelRecord, files: _Files, every: Sequence[Any],
+                      counted: Sequence[Any]) -> tuple[str, str]:
+    """A recipe whose current review is ``fabrication``: the repair round once it is confirmed
+    or disputed (``dispute``), else a wait at ``review`` for a second seat. ``counted`` are the
+    rows ``_review_step`` counts; ``every`` keeps the confirm-only seats' other answers."""
+
+    if _confirmed(counted, record.recipe.rev):
+        return "2b", "review found fabrication: the repair round"
+    disputed = dispute(model_id, record, every, files.packet(record.family), files.data)
+    if disputed is not None:
+        return ("2b", DISPUTE_REPAIR) if disputed[1] else ("review", DISPUTE_HELD)
+    return "review", "a provisional seat's fabrication: a second seat's review before the repair"
 
 
 REVIEW_SOURCES = ("paper", "code", "page")
@@ -610,11 +694,14 @@ def _sourceless(packet: Packet) -> bool:
         s.role in REVIEW_SOURCES and (s.text or s.blob) for s in packet.sources)
 
 
-def _sources_since(packet: Packet | None, at: str) -> bool:
-    """Whether the packet's sources were amended after ``at``."""
+def _unjudged_again(review: LedgerRow) -> bool:
+    """A ``cannot_judge`` is reviewed again once the case builder adds what its lane's case
+    lacked (``review.CASE_VERSION``); one given against other texts is already dropped
+    (``review.stale``)."""
 
-    return packet is not None and any(
-        a.at > at and any(c.startswith("sources") for c in a.changed) for a in packet.amendments)
+    from menagerie.pipeline.review import CASE_VERSION, case_version  # review imports drive
+
+    return case_version(review) < CASE_VERSION
 
 
 def _confirmed(rows: Sequence[Any], rev: str) -> bool:
@@ -627,6 +714,116 @@ def _confirmed(rows: Sequence[Any], rev: str) -> bool:
     found = [r for r in rows if isinstance(r, LedgerRow) and r.stage == "review"
              and r.recipe_rev == rev and r.outcome != "infra" and r.verdict == "fabrication"]
     return len({r.reviewer for r in found}) > 1 or any(not needs_second_review(r) for r in found)
+
+
+# A provisional fabrication that every other counting seat has answered without confirming is
+# disputed: it gets the repair round a confirmed fabrication gets, from the provisional seat's
+# findings, once per row; still disputed after it, the row waits at ``review`` until the rung's
+# tail types it ``review_disputed`` (decisions.md 2026-11-03).
+DISPUTE_REPAIR = "a disputed provisional fabrication: the repair round"
+DISPUTE_HELD = ("a disputed provisional fabrication after its one repair round: held for "
+                "review_disputed")
+_SEATS: dict[tuple[Any, ...], frozenset[str]] = {}
+
+
+def counting_seats(data: DataLayout) -> frozenset[str]:
+    """The reviewer seats whose calibration counts at the prompt in force (a held third-lab seat
+    left out, as ``review.seats``), read once per change of the calibration files."""
+
+    from menagerie.pipeline import calibration
+    from menagerie.pipeline.review import CONFIRM_ROLES, MAIN_ROLES, _third_lab, prompt_version
+
+    prompt, folder = prompt_version(), Path(data.root) / "review"
+    roles = (*MAIN_ROLES, *_third_lab(), *CONFIRM_ROLES)
+    key = (str(folder.resolve()), prompt, roles, _stamp(folder / "calibration.jsonl"),
+           _stamp(folder / "calibration-cases.jsonl"))
+    if key not in _SEATS:
+        _SEATS[key] = frozenset(r for r in roles if calibration.counts(r, prompt, data=data))
+    return _SEATS[key]
+
+
+def _disputed_at(reviews: Sequence[LedgerRow], seats: Collection[str]) -> LedgerRow | None:
+    """The provisional fabrication among one revision's ``reviews`` when it is disputed: one
+    provisional seat called it, no other seat did, and every other seat of ``seats`` (at least
+    one) answered."""
+
+    from menagerie.pipeline.review import needs_second_review  # review imports drive
+
+    fabs = [r for r in reviews if r.verdict == "fabrication"]
+    if not fabs or not all(map(needs_second_review, fabs)) or len({r.reviewer for r in fabs}) > 1:
+        return None
+    others = set(seats) - {fabs[0].reviewer}
+    if not others or not others <= {r.reviewer for r in reviews}:
+        return None
+    return max(fabs, key=lambda r: r.at)
+
+
+# Which members' provisional findings a 2b brief carried as a repair round, per family:
+# ``{id: {"rev": recipe revision, "at": epoch the brief was written}}`` (``implement.brief``).
+DISPUTE_MARKS = "disputed-repairs.json"
+
+
+def _marks(family: str) -> dict[str, Any]:
+    path = work_dir("2b") / family / DISPUTE_MARKS
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def mark_briefed(family: str, rows: Sequence[LedgerRow]) -> None:
+    """Note that this family's brief carries ``rows`` (provisional fabrications) as a repair
+    round; a member already noted at the same recipe keeps its first time."""
+
+    marks, now_s = _marks(family), time.time()
+    fresh = {r.id: {"rev": r.recipe_rev, "at": now_s} for r in rows
+             if marks.get(r.id, {}).get("rev") != r.recipe_rev}
+    if fresh:
+        path = work_dir("2b") / family / DISPUTE_MARKS
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({**marks, **fresh}) + "\n", encoding="utf-8")
+
+
+def briefed(family: str, model_id: str, rev: str) -> float | None:
+    """When a 2b brief first carried ``model_id``'s provisional findings at ``rev``, else ``None``."""
+
+    mark = _marks(family).get(model_id) or {}
+    return float(mark["at"]) if mark.get("rev") == rev and "at" in mark else None
+
+
+def _round_ended(family: str, model_id: str, rev: str) -> bool:
+    """Whether a 2b lane briefed with this member's findings at ``rev`` has written its result."""
+
+    at = briefed(family, model_id, rev)
+    result = work_dir("2b") / family / "BRIEF.result.md"
+    return at is not None and result.is_file() and result.stat().st_mtime > at
+
+
+def dispute(model_id: str, record: ModelRecord, rows: Sequence[Any], packet: Packet | None,
+            data: DataLayout) -> tuple[LedgerRow, bool] | None:
+    """A disputed row's provisional fabrication at its recipe, and whether its repair round is
+    still owed; ``None`` when the row is not disputed. Counting seats are those at the prompt in
+    force; reviews given against texts the packet no longer holds do not count (``stale``).
+
+    The round is owed once per row: not when an earlier recipe of the row was disputed too (the
+    round made this recipe), nor once a 2b lane whose brief carried the findings has ended (a
+    lane that changed nothing; ``briefed``)."""
+
+    from menagerie.pipeline.review import stale  # review imports drive
+
+    rev = record.recipe.rev
+    mine = [r for r in rows if isinstance(r, LedgerRow) and r.id == model_id
+            and r.stage == "review" and r.outcome != "infra"]
+    current = [r for r in mine if r.recipe_rev == rev and not stale(r, packet)]
+    found = _disputed_at(current, counting_seats(data))
+    if found is None:
+        return None
+    earlier: dict[str | None, list[LedgerRow]] = {}
+    for r in mine:
+        if r.recipe_rev != rev:
+            earlier.setdefault(r.recipe_rev, []).append(r)
+    repaired = any(_disputed_at(g, {r.reviewer for r in g}) for g in earlier.values())
+    return found, not repaired and not _round_ended(record.family, model_id, rev)
 
 
 def _authored(record: ModelRecord, packet: Packet | None) -> bool:

@@ -11,6 +11,8 @@ export const COPY_RULES = [
   ["em dash", /—|\s--\s/, "house voice: no em dashes"],
   ["arrow joiner", /\s(->|=>|→)\s/, "house voice: no arrows as joiners"],
   ["hype", /\b(revolutionary|cutting-edge|state-of-the-art|seamless(ly)?|game-?changing|groundbreaking|world-class|best-in-class|blazing|effortless(ly)?|unleash|supercharge)\b/i, "plain copy"],
+  ["personal address", /@(gmail|googlemail|columbia)\.|\bjt3295\b|johnmarkedwardtaylor/i, "no personal email on the public site; corrections go to the repository's issues"],
+  ["markup as text", /<!--|-->/, "an HTML comment escaped into visible text (for example a Cloudflare marker given to set:html as a quoted string)"],
   ["unverifiable", /\b(the (largest|biggest|most complete)|every neural network|all neural networks|complete catalog|definitive)\b/i, "claims the site cannot back"],
 ];
 
@@ -37,11 +39,24 @@ export function dataNames(modelsJsonl) {
   return [...names].sort((a, b) => b.length - a.length);
 }
 
+/**
+ * Elements marked `data-quoted` hold words quoted from the paper or written from it (paper titles,
+ * the labelled summary, key idea, keywords): not the site's own copy. They are taken out before the
+ * rules run and checked apart (`quotedHits`), for the data to be cleaned upstream.
+ */
+const QUOTED = /<([a-z]+)\b(?:[^>"']|"[^"]*"|'[^']*')*\sdata-quoted(?:="")?(?:[^>"']|"[^"]*"|'[^']*')*>[\s\S]*?<\/\1>/gi;
+
+/** The quoted regions of a page, as HTML. */
+export function quotedRegions(html) {
+  return [...html.matchAll(QUOTED)].map((match) => match[0]);
+}
+
 /** Visible text of an HTML page plus alt, title and aria-label text and the meta description. */
 export function readableText(html) {
   const attrs = [...html.matchAll(/\s(?:alt|title|aria-label)="([^"]*)"/g)].map((m) => m[1]);
   const meta = [...html.matchAll(/<meta\s+(?:name="description"|property="og:(?:title|description)")\s+content="([^"]*)"/g)].map((m) => m[1]);
   const body = html
+    .replace(QUOTED, " ")
     .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
     .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
     .replace(/<pre\b[\s\S]*?<\/pre>/gi, " ")
@@ -61,13 +76,22 @@ function ruleHits(text) {
       if (hits.length > 20) break;
     }
   }
-  // The header tag says "preview" once on every page and the home page adds one sentence (ruling look.4);
-  // more than that on one page is repetition.
+  // A preview build: the header tag says "preview" once on every page and the home page adds one sentence
+  // (ruling look.4); more than that on one page is repetition. A launch build (PUBLIC_SITE_STAGE=launch, what
+  // production builds) has neither, so any "preview" left is stale preview copy.
   const previews = (text.match(/\bpreview\b/gi) ?? []).length;
-  if (previews > 3) {
-    hits.push({ rule: "preview repeated", why: "tag plus one sentence only", match: `${previews} mentions`, context: "" });
+  const launch = (process.env.PUBLIC_SITE_STAGE ?? "").trim().toLowerCase() === "launch";
+  if (launch ? previews > 0 : previews > 3) {
+    const why = launch ? "a launch build says preview nowhere" : "tag plus one sentence only";
+    hits.push({ rule: "preview repeated", why, match: `${previews} mentions`, context: "" });
   }
   return hits;
+}
+
+/** Rule hits inside the quoted regions of a page (reported, never gated). */
+export function quotedHits(html) {
+  const text = quotedRegions(html).join(" \n ").replace(TAG, " ").replace(/&amp;/g, "&").replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+  return ruleHits(text).filter((hit) => hit.rule !== "preview repeated");
 }
 
 /** Copy hits on one page: [{rule, why, match, context}], after taking out the `exempt` catalog names. */

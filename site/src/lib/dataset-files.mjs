@@ -10,14 +10,17 @@ export const PAGES_MAX_FILE_BYTES = 25 * 1024 * 1024;
 /** How the export names a diagram file; the copy names it by its public address instead. */
 const EXPORT_ASSET_PREFIX = "/export/assets/";
 
+/** An export diagram address and its object key. */
+const EXPORT_ASSET_ADDRESS = new RegExp(`${EXPORT_ASSET_PREFIX}([A-Za-z0-9._-]+)`, "g");
+
 /**
  * The file's text with every diagram address made public, so a downloaded file links to the diagrams
- * it lists. `assetBase` is PUBLIC_R2_BASE (no trailing slash), or empty for local previews.
+ * it lists. `assetHref` maps an object key to its public address (`lib/assets.ts`, or `makeAssetHref`
+ * from `asset-href.mjs` where the site's modules are not loaded).
  * @param {string} text
- * @param {string} assetBase
+ * @param {(key: string) => string} assetHref
  * @returns {string}
  */
-export function publicDatasetText(text, assetBase) {
-  const base = assetBase ? `${assetBase.replace(/\/+$/, "")}/` : "/assets/";
-  return text.split(EXPORT_ASSET_PREFIX).join(base);
+export function publicDatasetText(text, assetHref) {
+  return text.replace(EXPORT_ASSET_ADDRESS, (_match, key) => assetHref(key));
 }

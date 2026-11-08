@@ -1,8 +1,12 @@
 // usage: node qa/pages.mjs BASEURL OUTDIR
 // Each page type at 390, 800 and 1280 px in light and dark: sideways scroll, console errors, failed
-// same-origin requests and a screenshot; axe-core (every impact) at 390 and 1280 px.
+// same-origin requests and a screenshot; axe-core (every impact) at 390 and 1280 px. With
+// FULL_PAGE=1 (run.sh --full-page) it also takes a full-length screenshot of every page at 390
+// and 1280 px into OUTDIR/shots-full, after scrolling once so lazy pictures load.
 import fs from "node:fs";
 import { createRequire } from "node:module";
+
+import { modelRoutes } from "./lib/routes.mjs";
 
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright-core");
@@ -11,21 +15,47 @@ const axeSource = fs.readFileSync(require.resolve("axe-core/axe.min.js"), "utf8"
 const [base, outDir] = process.argv.slice(2);
 const shots = `${outDir}/shots`;
 fs.mkdirSync(shots, { recursive: true });
+const fullPage = process.env.FULL_PAGE === "1";
+const FULL_WIDTHS = new Set([390, 1280]);
+const shotsFull = `${outDir}/shots-full`;
+if (fullPage) fs.mkdirSync(shotsFull, { recursive: true });
 
-export const PAGES = {
+/** Scroll to the bottom in screen steps so lazy pictures load, wait for them, then return to the top. */
+async function loadWholePage(page) {
+  await page.evaluate(async () => {
+    const step = Math.max(200, window.innerHeight - 100);
+    for (let y = 0; y < document.documentElement.scrollHeight; y += step) {
+      window.scrollTo(0, y);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    window.scrollTo(0, 0);
+  });
+  await page.waitForLoadState("networkidle").catch(() => undefined);
+  await page.evaluate(async () => {
+    const pending = [...document.images].filter((img) => !img.complete).map((img) => new Promise((resolve) => { img.addEventListener("load", resolve, { once: true }); img.addEventListener("error", resolve, { once: true }); }));
+    await Promise.race([Promise.all(pending), new Promise((resolve) => setTimeout(resolve, 8000))]);
+  });
+}
+
+const models = modelRoutes();
+const PAGE_LIST = {
   home: "/",
   listing: "/models/",
   "listing-2": "/models/2/",
-  "model-small": "/models/resnet18/",
-  "model-wide": "/models/gpt2/",
-  "model-large": "/models/espnet-tts-tacotron2-gst/",
-  "model-monster": "/models/nllb-moe/",
+  // The listing with the catalog's untraced rows included, as a list.
+  "listing-untraced": "/models/?untraced=1&view=list",
+  "model-small": models.small,
+  "model-wide": models.wide,
+  "model-large": models.large,
+  "model-monster": models.monster,
+  "model-structure": models.structure,
   dataset: "/dataset/",
   about: "/about/",
   legal: "/legal/",
   changelog: "/changelog/",
   notfound: "/no-such-page/",
 };
+export const PAGES = Object.fromEntries(Object.entries(PAGE_LIST).filter(([, route]) => route));
 const WIDTHS = [
   [390, 844],
   [800, 900],
@@ -89,6 +119,12 @@ for (const [name, pathname] of Object.entries(PAGES)) {
         });
       }
       await page.screenshot({ path: `${shots}/${name}-${width}-${scheme}.png` });
+      let brokenImages = null;
+      if (fullPage && FULL_WIDTHS.has(width)) {
+        await loadWholePage(page);
+        await page.screenshot({ path: `${shotsFull}/${name}-${width}-${scheme}.png`, fullPage: true });
+        brokenImages = await page.evaluate(() => [...document.images].filter((img) => img.complete && img.naturalWidth === 0 && img.getAttribute("src")).map((img) => img.currentSrc || img.src).slice(0, 5));
+      }
       const row = {
         name,
         path: pathname,
@@ -101,6 +137,7 @@ for (const [name, pathname] of Object.entries(PAGES)) {
         errors,
         failed,
         axe,
+        ...(brokenImages ? { broken_images: brokenImages } : {}),
       };
       rows.push(row);
       console.log(name, width, scheme, "status", row.status, "overflow", row.overflow, "axe", (axe ?? []).map((v) => `${v.id}:${v.impact}`).join(",") || "-", "errors", errors.length, "failed", failed.length);

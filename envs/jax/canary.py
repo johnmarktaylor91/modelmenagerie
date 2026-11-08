@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import importlib
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the checkout: names that differ by pin
+from menagerie import tl_compat  # noqa: E402
 
 PROMISED = ("jax", "jaxlib", "flax", "equinox", "torch", "torchlens", "numpy", "psutil", "yaml",
             "pydantic", "jsonschema", "referencing", "PIL")
@@ -22,7 +26,8 @@ def check(tl: object, name: str, model: object, args: list) -> str:
     trace = tl.trace(model, args, backend="jax")
     # The worker's validation: the live capture's replay (no preview takes random_seed).
     verdict = state(trace.validate_forward_pass([model(*args)], validate_metadata=True))
-    print(f"  {name}: {trace.num_ops} ops, module mode {trace.module_identity_mode}, "
+    mode = tl_compat.trace_field(trace, "module_identity_mode")
+    print(f"  {name}: {tl_compat.num_ops(trace)} ops, module mode {mode}, "
           f"validation {verdict}")
     return verdict
 

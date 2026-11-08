@@ -154,10 +154,13 @@ def test_only_the_lanes_verbs_targets_and_options_run(scope: mini_verbs.Scope, t
     assert plan.family == "f-one"
     assert mini_verbs.authorize(["giveup", "t1", "oversized", "too big /opt"], scope,
                                 base).family == "f-two"
+    assert mini_verbs.authorize(["giveup", "m1", "degenerate_forward:constant", "silent at init"], scope,
+                                base).argv[2] == "degenerate_forward:constant"
     assert mini_verbs.authorize(["done", f"{scope.folders[1]}/recipe.json"], scope,
                                 base).family == "f-two"
     for refused in (["bridge", "serve"], ["try", "m1", "--spool", "/tmp/x"], ["try", "other"],
-                    ["giveup", "m1", "Bad Class", "r"], ["defer", "f-three", "r"],
+                    ["giveup", "m1", "Bad Class", "r"], ["giveup", "m1", "standin:", "r"],
+                    ["giveup", "m1", "needs_env:$(id)", "r"], ["defer", "f-three", "r"],
                     ["try", "m1", "--member", "other"], ["try", "m1", "--recipe=/etc/passwd"],
                     ["done", "../../leases/x.json"], ["src"], ["try", "m1", "--with", "$(id)"],
                     # only the target family's drafts are brought in, so only they may be named
@@ -448,6 +451,115 @@ def test_undelivered_answers_are_kept_and_sent_later(lane: dict[str, Any]) -> No
     assert json.loads((root / f"spool/done/{name}.json").read_text())["rc"] == 2
 
 
+class CountingRemote(LocalRemote):
+    """A local worker that keeps every command it was asked to run."""
+
+    def __init__(self, home: Path) -> None:
+        super().__init__(home)
+        self.commands: list[str] = []
+
+    def run(self, command: str, *, data: bytes | None = None) -> bytes:
+        self.commands.append(command)
+        return super().run(command, data=data)
+
+
+def test_one_listing_reads_every_lanes_spool_boxes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mini_relay, "SPOOL_MAX", 2)
+    remote = CountingRemote(tmp_path)
+    one, two = str(tmp_path / "one/.mini-lane"), str(tmp_path / "two/.mini-lane")
+    for name in ("3-0123abcd", "1-0123abcd", "2-0123abcd"):
+        (Path(one) / "spool/new").mkdir(parents=True, exist_ok=True)
+        (Path(one) / f"spool/new/{name}.json").write_text("{}")
+    (Path(one) / "spool/new/bad;name.json").write_text("{}")
+    (Path(one) / "spool/new/4-0123abcd.json.part").write_text("{}")
+    (Path(two) / "spool/claimed/5-0123abcd.json").mkdir(parents=True)  # a folder, not a request
+    (Path(two) / "spool/done").mkdir(parents=True)
+    (Path(two) / "spool/done/6-0123abcd.json").write_text("{}")
+    listed = mini_relay.list_boxes(remote, [one, two])
+    assert len(remote.commands) == 1
+    assert len(listed[one]["new"]) == 2 and set(listed[one]["new"]) < {"1-0123abcd", "2-0123abcd", "3-0123abcd"}
+    assert listed[one]["claimed"] == listed[one]["done"] == []  # missing folders list as empty
+    assert listed[two] == {"new": [], "claimed": [], "done": ["6-0123abcd"]}
+    assert mini_relay._waiting(listed[one]) and not mini_relay._waiting(listed[two])
+    assert mini_relay._waiting({"new": [], "claimed": ["7-0123abcd"], "done": []})
+
+
+def _ready_lane(lane: dict[str, Any], label: str) -> Path:
+    """A second live lease on the same worker, staged and ready, with its own spool."""
+    root = lane["home"] / label / ".mini-lane"
+    for box in ("new", "claimed", "done"):
+        (root / "spool" / box).mkdir(parents=True)
+    mini_relay.state_dir(label).mkdir(parents=True)
+    (mini_relay.state_dir(label) / "staged.json").write_text(json.dumps(
+        {"root": str(root), "worktree": str(lane["worktree"].resolve()), "paths": {}, "phase": "ready"}))
+    (lane["lease_path"].parent / f"{label}.json").write_text(json.dumps({**lane["lease"], "label": label}))
+    return root
+
+
+def _settle(relay: mini_relay.Relay) -> None:
+    for thread in list(relay.listers.values()):
+        thread.join(timeout=10)
+    for one in relay.lanes.values():
+        if one.task:
+            one.task.join(timeout=10)
+        for thread in list(one.inflight.values()):
+            thread.join(timeout=10)
+
+
+@needs_rsync
+def test_relay_lists_a_workers_lanes_in_one_ssh_and_backs_off_when_quiet(
+        lane: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(admission, "_status", lambda run: {"run": {"state": "RUNNING"}})
+    roots = [_ready_lane(lane, label) for label in ("2b-mini-one", "2b-mini-two")]
+    lane["lease_path"].unlink()
+    clock = [1000.0]
+    remote = CountingRemote(lane["home"])
+    relay = mini_relay.Relay(connect=lambda alias, control: remote, clock=lambda: clock[0])
+    request = {"id": "1-0123abcd", "family": "f-one", "args": ["bridge", "serve"], "cwd": "/"}
+    (roots[1] / "spool/new/1-0123abcd.json").write_text(json.dumps(request))
+    relay.once()
+    _settle(relay)
+    assert sum("find " in c for c in remote.commands) == 1  # both lanes, one listing
+    assert json.loads((roots[1] / "spool/done/1-0123abcd.json").read_text())["rc"] == 2
+    assert relay.pause() == mini_relay.POLL_S
+
+    clock[0] += mini_relay.IDLE_AFTER_S + 1  # a quiet minute: answered, nothing queued
+    remote.commands.clear()
+    relay.once()
+    _settle(relay)
+    assert sum("find " in c for c in remote.commands) == 1
+    assert relay.pause() == mini_relay.IDLE_POLL_S
+
+    (roots[0] / "spool/new/2-0123abcd.json").write_text(json.dumps({**request, "id": "2-0123abcd"}))
+    relay.once()  # the slow pass that sees the request makes the next one fast again
+    _settle(relay)
+    assert relay.pause() == mini_relay.POLL_S
+    assert (roots[0] / "spool/done/2-0123abcd.json").is_file()
+
+
+@needs_rsync
+def test_unchanged_drafts_skip_the_leak_scan_and_copy(lane: dict[str, Any]) -> None:
+    one, root = _staged_lane(lane)
+    work, family = root / "work/f-one", lane["family"]
+    work.mkdir(parents=True)
+    (work / "recipe.json").write_text('{"kind": "notes"}')
+    scans: list[str] = []
+    copy = one._scanned_copy
+    one._scanned_copy = lambda name, *rest: (scans.append(name), copy(name, *rest))[1]  # type: ignore[method-assign]
+    assert one.bring_in("1-0123abcd", "f-one") is None
+    assert (family / "recipe.json").read_text() == '{"kind": "notes"}'
+    assert one.bring_in("2-0123abcd", "f-one") is None  # same drafts: no scan, nothing written
+    assert scans == ["1-0123abcd"]
+    (family / "recipe.json").write_text("changed on the hub")
+    assert one.bring_in("3-0123abcd", "f-one") is None  # the hub copy moved: scan and copy again
+    assert (family / "recipe.json").read_text() == '{"kind": "notes"}'
+    (work / "recipe.json").write_text('{"kind": "notes", "v": 2}')
+    assert one.bring_in("4-0123abcd", "f-one") is None  # the worker draft changed
+    assert scans == ["1-0123abcd", "3-0123abcd", "4-0123abcd"]
+    assert (family / "recipe.json").read_text() == '{"kind": "notes", "v": 2}'
+    assert not list((root / "snap").glob("*"))
+
+
 @needs_rsync
 def test_failed_login_delivery_aborts_before_ready(lane: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
     lease = {**lane["lease"], "mini": {"ssh_alias": "worker-a-ssh", "deliver": ["false", "{job}"]}}
@@ -575,3 +687,132 @@ def test_describe_lane_stages_its_batch_and_ingests_only_its_drafts(describe_lan
     assert not (folder / "out/f-other.json").exists()  # only the lease's families come back
     assert (folder / "BRIEF.result.md").read_text() == f"done; drafts in {folder}/out\n"
     assert admission._live(describe_lane["lease_path"], describe_lane["lease"]) is None
+
+
+# --- a 2a lane: the 2a verbs through the hub lane's command, fetched blobs to the worker ----------
+
+
+TWO_A_LABEL = "2a-mini-test"
+TWO_A_AGENT = r'''
+import json, re, subprocess, sys
+prompt = sys.stdin.read()
+pipe = re.search(r"Verbs: `(\S+) <verb>", prompt)[1]
+store = re.search(r"Store: `(\S+)`", prompt)[1]
+drafts = re.search(r"Drafts go in `(\S+)/<family>.json`", prompt)[1]
+result = re.search(r"then write `(\S+)`", prompt)[1]
+notes = {"argv": sys.argv[1:]}
+def run(*argv):
+    done = subprocess.run(list(argv), capture_output=True, text=True)
+    return [done.returncode, done.stdout, done.stderr]
+notes["paper"] = run(pipe, "fetch", "paper", "2401.00001")
+sha = notes["paper"][1].split()[0]
+notes["text"] = open(f"{store}/sha256/{sha[:2]}/{sha}").read()
+notes["gh"] = run("gh", "search", "repos", "resnet", "--limit", "3")
+notes["refused"] = run(pipe, "try", "m1")
+notes["no_family"] = run(pipe, "fetch", "code", "https://github.com/a/b")
+json.dump({"members": [{"id": "m1"}]}, open(drafts + "/f-one.json", "w"))
+notes["packet"] = run(pipe, "packet", "write", "f-one", "drafts/f-one.json")
+json.dump(notes, open(drafts + "/notes.json", "w"))
+open(result, "w").write("f-one packet written; drafts in " + drafts + "\n")
+'''
+
+
+@pytest.fixture
+def two_a_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """A hub 2a lane folder, a fake pipeline command and gh, a hub store, a worker home, a lease."""
+    from menagerie.pipeline import mini_2a
+
+    monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path / "work"))
+    monkeypatch.setattr(mini_relay, "STATUS_EVERY_S", 0.0)
+    folder = tmp_path / "work/briefs/2a-tick-1"
+    (folder / "drafts").mkdir(parents=True)
+    store = tmp_path / "store"
+    hub_log = tmp_path / "hub-verbs.jsonl"
+    pipe = _script(tmp_path / "hub-pipe", f"""#!{sys.executable}
+import hashlib, json, os, pathlib, sys
+args = sys.argv[1:]
+with open({str(hub_log)!r}, "a") as log:
+    log.write(json.dumps({{"args": args, "run": os.environ.get("FLEET_RUN_ID")}}) + "\\n")
+if args[:2] == ["fetch", "paper"]:
+    body = b"We present ResNet."
+    sha = hashlib.sha256(body).hexdigest()
+    blob = pathlib.Path({str(store)!r}) / "sha256" / sha[:2] / sha
+    blob.parent.mkdir(parents=True, exist_ok=True)
+    blob.write_bytes(body)
+    print(sha, "text/plain")
+elif args[:2] == ["packet", "write"]:
+    print("written", pathlib.Path(args[3]).read_text())
+""")
+    gh = _script(tmp_path / "hub-gh", f"#!{sys.executable}\nimport sys\nprint('gh', *sys.argv[1:])\n")
+    monkeypatch.setattr(mini_2a, "GH", str(gh))
+    (folder / "BRIEF.md").write_text(
+        f"# 2a lane\n\nVerbs: `{pipe} <verb>`. Store: `{store}`. Drafts go in "
+        f"`{folder}/drafts/<family>.json`. When every family is done, then write "
+        f"`{folder}/BRIEF.result.md`.\n")
+    home = tmp_path / "worker"
+    worktree = home / mini_relay.WORKTREE.format(label=TWO_A_LABEL)
+    (worktree / "menagerie/pipeline").mkdir(parents=True)
+    shutil.copy(LANE_FILE, worktree / "menagerie/pipeline/mini_lane.py")
+    outputs = tmp_path / "outputs"
+    fake_pull = _script(tmp_path / "pull-outputs", FAKE_PULL.format(
+        python=sys.executable, home=str(home), outputs=str(outputs)))
+    fake_run_on = _script(tmp_path / "run-on", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setattr(admission, "_tool", lambda name: str(
+        {"pull-outputs": fake_pull, "run-on": fake_run_on}[name]))
+    lease = {"label": TWO_A_LABEL, "run": "run-a", "kind": "2a", "keys": ["f-one"],
+             "placement": "worker-a", "account": ACCOUNT, "web": True, "pipe": str(pipe),
+             "store": str(store), "mini": {"ssh_alias": "worker-a-ssh", "deliver": None},
+             "brief": str(folder / "BRIEF.md"), "result": str(folder / "BRIEF.result.md"),
+             "started": "2026-10-29T00:00:00Z", "expires": "2099-01-01T00:00:00Z"}
+    leases = tmp_path / "work/leases"
+    leases.mkdir(parents=True)
+    (leases / f"{TWO_A_LABEL}.json").write_text(json.dumps(lease))
+    return {"tmp": tmp_path, "folder": folder, "home": home, "worktree": worktree, "lease": lease,
+            "lease_path": leases / f"{TWO_A_LABEL}.json", "hub_log": hub_log}
+
+
+@needs_rsync
+def test_2a_lane_runs_its_verbs_on_the_hub_and_reads_fetched_text_on_the_worker(
+        two_a_lane: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    folder, worktree = two_a_lane["folder"], two_a_lane["worktree"]
+    assert mini_relay.layout(["f-one"], folder / "BRIEF.md", "2a") == (
+        "work/2a-tick-1/BRIEF.md", "work/2a-tick-1/BRIEF.result.md")
+    assert mini_relay.layout(["f-one", "f-two"], folder / "BRIEF.md")[0] == "work/_batch/BRIEF.md"
+    state = {"run": "RUNNING"}
+    monkeypatch.setattr(admission, "_status", lambda run: {"run": {"state": state["run"]}})
+    agent = two_a_lane["tmp"] / "agent.py"
+    agent.write_text(TWO_A_AGENT)
+    spec = {"label": TWO_A_LABEL, "account": ACCOUNT, "model": "m", "effort": "high", "kind": "2a",
+            "web": True, "runtime": [sys.executable, str(agent)],
+            "identity": [sys.executable, "-c", f"print('{{\"harness\":\"claude\",\"account\":\"{ACCOUNT}\"}}')"],
+            "families": ["f-one"], "brief": "work/2a-tick-1/BRIEF.md",
+            "result": "work/2a-tick-1/BRIEF.result.md", "stage_timeout_s": 60, "lane_timeout_s": 120}
+    job: dict[str, Any] = {}
+    worker = threading.Thread(target=lambda: job.update(rc=mini_lane.run(spec, cwd=worktree)))
+    worker.start()
+    relay = mini_relay.Relay(connect=lambda alias, control: LocalRemote(two_a_lane["home"]))
+    _drive(relay, lambda: not worker.is_alive())
+    worker.join(timeout=1)
+    assert job.get("rc") == 0, (worktree / "outputs/lane/agent.log").read_text()
+    state["run"] = "TERMINAL"
+    assert admission._live(two_a_lane["lease_path"], two_a_lane["lease"]) == "INGESTING"
+    _drive(relay, lambda: mini_relay.ingested(TWO_A_LABEL))
+    assert json.loads((mini_relay.state_dir(TWO_A_LABEL) / "ingested.json").read_text())["status"] == "ingested"
+    assert admission._live(two_a_lane["lease_path"], two_a_lane["lease"]) is None
+
+    notes = json.loads((folder / "drafts/notes.json").read_text())
+    argv = notes["argv"]
+    assert argv[argv.index("--disallowedTools") + 1] == "mcp__executor"  # its own web tools stay
+    assert notes["paper"][0] == 0 and notes["text"] == "We present ResNet."  # the blob reached it
+    assert notes["gh"] == [0, "gh search repos resnet --limit 3\n", ""]
+    assert notes["refused"][0] == 2 and "verbs here" in notes["refused"][2]
+    assert notes["no_family"][0] == 2 and "needs --family" in notes["no_family"][2]
+    assert notes["packet"][0] == 0 and notes["packet"][1] == 'written {"members": [{"id": "m1"}]}\n'
+    calls = [json.loads(line) for line in two_a_lane["hub_log"].read_text().splitlines()]
+    assert [c["args"] for c in calls] == [
+        ["fetch", "paper", "2401.00001"],
+        ["packet", "write", "f-one", os.path.realpath(folder / "drafts/f-one.json")]]
+    assert {c["run"] for c in calls} == {"run-a"}  # fetch events and the packet's author are the lane's
+    assert json.loads((folder / "drafts/f-one.json").read_text()) == {"members": [{"id": "m1"}]}
+    assert (folder / "BRIEF.result.md").read_text() == f"f-one packet written; drafts in {folder}/drafts\n"
+    assert str(folder) not in (worktree / ".mini-lane/work/2a-tick-1/BRIEF.md").read_text()

@@ -1,82 +1,84 @@
 """McCulloch-Pitts threshold logic net (1943), Warren McCulloch and Walter Pitts.
 
 Paper: "A logical calculus of the ideas immanent in nervous activity."
-Binary threshold neurons implement propositional logic with fixed excitatory and
-inhibitory connections; any active inhibitory input vetoes the unit.
+All-or-none neurons fire when the number of active excitatory synapses reaches a fixed
+threshold, and any active inhibitory synapse absolutely prevents firing. A net without
+circles of such neurons realizes propositional logic, one synaptic delay per layer. This net
+wires its units as the paper's elementary propositions (conjunction, disjunction, a conjunction
+with an inhibitory veto, a two-of-three majority) and composes them in a second layer; the
+example input is the complete truth table of its six input neurons.
 """
 
 from __future__ import annotations
 
+import itertools
+
 import torch
 from torch import Tensor, nn
 
+N_IN = 6
+
+# Hidden units over inputs x0..x5: (excitatory inputs, inhibitory inputs, threshold).
+HIDDEN = (
+    ((0, 1), (), 2.0),  # h0 = x0 AND x1
+    ((2, 3), (), 1.0),  # h1 = x2 OR x3
+    ((4,), (5,), 1.0),  # h2 = x4 AND NOT x5
+    ((1, 3, 5), (), 2.0),  # h3 = at least two of x1, x3, x5
+)
+
+# Output units over hidden units h0..h3, same layout.
+OUTPUT = (
+    ((0, 1), (), 1.0),  # o0 = h0 OR h1
+    ((1, 2), (), 2.0),  # o1 = h1 AND h2
+    ((2, 3), (0,), 1.0),  # o2 = (h2 OR h3) AND NOT h0
+)
+
+
+def _synapses(units: tuple, n_from: int) -> tuple[Tensor, Tensor, Tensor]:
+    """Excitatory and inhibitory 0/1 connection matrices and thresholds for a unit table."""
+    exc = torch.zeros(len(units), n_from)
+    inh = torch.zeros(len(units), n_from)
+    for row, (excitatory, inhibitory, _) in enumerate(units):
+        exc[row, list(excitatory)] = 1.0
+        inh[row, list(inhibitory)] = 1.0
+    theta = torch.tensor([threshold for _, _, threshold in units])
+    return exc, inh, theta
+
 
 class McCullochPittsNet(nn.Module):
-    """Fixed binary threshold-logic network with inhibitory veto connections."""
+    """Fixed two-layer threshold-logic net with absolute inhibitory veto connections."""
 
-    def __init__(self, n_in: int = 6, n_hidden: int = 4, n_out: int = 3) -> None:
-        """Initialize fixed threshold-logic weights.
-
-        Parameters
-        ----------
-        n_in
-            Number of binary input units.
-        n_hidden
-            Number of hidden threshold units.
-        n_out
-            Number of output threshold units.
-        """
+    def __init__(self) -> None:
+        """Wire the fixed hidden and output threshold units from the unit tables."""
         super().__init__()
-        hidden_exc = torch.tensor(
-            [
-                [1.0, 1.0, 0.0, 0.0, 1.0, 0.0],
-                [0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
-                [1.0, 0.0, 0.0, 1.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0, 1.0, 0.0, 1.0],
-            ]
-        )[:n_hidden, :n_in]
-        hidden_inh = torch.tensor(
-            [
-                [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            ]
-        )[:n_hidden, :n_in]
-        out_exc = torch.ones(n_hidden, n_out)
-        out_inh = torch.zeros(n_hidden, n_out)
-        out_inh[0, 1 % n_out] = 1.0
+        hidden_exc, hidden_inh, hidden_theta = _synapses(HIDDEN, N_IN)
+        out_exc, out_inh, out_theta = _synapses(OUTPUT, len(HIDDEN))
         self.register_buffer("hidden_exc", hidden_exc)
         self.register_buffer("hidden_inh", hidden_inh)
-        self.register_buffer("hidden_theta", torch.full((n_hidden,), 2.0))
+        self.register_buffer("hidden_theta", hidden_theta)
         self.register_buffer("out_exc", out_exc)
         self.register_buffer("out_inh", out_inh)
-        self.register_buffer("out_theta", torch.tensor([2.0, 2.0, 3.0])[:n_out])
+        self.register_buffer("out_theta", out_theta)
 
-    def _threshold_layer(
-        self,
-        x: Tensor,
-        exc: Tensor,
-        inh: Tensor,
-        theta: Tensor,
-    ) -> Tensor:
-        """Apply a McCulloch-Pitts threshold layer.
+    @staticmethod
+    def _threshold_layer(x: Tensor, exc: Tensor, inh: Tensor, theta: Tensor) -> Tensor:
+        """Apply one layer of McCulloch-Pitts neurons.
 
         Parameters
         ----------
         x
-            Binary input activations of shape ``(batch, features)``.
+            Binary activations of shape ``(batch, features)``.
         exc
-            Excitatory connection matrix.
+            Excitatory connections, shape ``(units, features)``.
         inh
-            Inhibitory connection matrix.
+            Inhibitory connections, shape ``(units, features)``.
         theta
-            Threshold vector.
+            Threshold of each unit.
 
         Returns
         -------
         Tensor
-            Binary output activations.
+            Binary activations of shape ``(batch, units)``.
         """
         excitation = x @ exc.T
         inhibited = (x @ inh.T) > 0.0
@@ -84,24 +86,24 @@ class McCullochPittsNet(nn.Module):
         return active.to(x.dtype)
 
     def forward(self, x: Tensor) -> Tensor:
-        """Compute binary threshold-logic outputs.
+        """Compute the output neurons' firing for each input state.
 
         Parameters
         ----------
         x
-            Binary input tensor of shape ``(batch, n_in)``.
+            Binary input tensor of shape ``(batch, 6)``.
 
         Returns
         -------
         Tensor
-            Binary output tensor.
+            Binary output tensor of shape ``(batch, 3)``.
         """
         hidden = self._threshold_layer(x, self.hidden_exc, self.hidden_inh, self.hidden_theta)
-        return self._threshold_layer(hidden, self.out_exc.T, self.out_inh.T, self.out_theta)
+        return self._threshold_layer(hidden, self.out_exc, self.out_inh, self.out_theta)
 
 
 def build() -> nn.Module:
-    """Build a small random-free McCulloch-Pitts threshold network.
+    """Build the fixed McCulloch-Pitts threshold-logic net (no learned or random weights).
 
     Returns
     -------
@@ -112,11 +114,11 @@ def build() -> nn.Module:
 
 
 def example_input() -> Tensor:
-    """Return a binary example input.
+    """Return every binary state of the six input neurons (the net's truth table).
 
     Returns
     -------
     Tensor
-        Example input tensor.
+        Tensor of shape ``(64, 6)`` holding 0.0 and 1.0.
     """
-    return torch.tensor([[1.0, 1.0, 0.0, 0.0, 1.0, 0.0]])
+    return torch.tensor(list(itertools.product((0.0, 1.0), repeat=N_IN)))

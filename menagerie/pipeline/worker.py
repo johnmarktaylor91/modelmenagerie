@@ -11,11 +11,12 @@ GPU window. Each capture is of a freshly built model. Torch is imported inside f
 A recipe whose ``backend`` is not ``torch`` (TensorFlow, JAX, Paddle, MLX) runs its forward and
 trace modes in ``worker_preview``, through TorchLens's public backend surface.
 
-Validation goes through TorchLens's private ``_validate_forward_pass_torch``, exactly as the June
-validator calls it (``docs/torchlens-boundary.md``), so verdicts are the June validator's at the
-pin. The public ``validate_forward_pass`` returns ``unverified`` unless the capture keeps every
-activation and argument; with those it agreed with the private entry on the eleven models checked
-at 2.35.2, but it skips the private entry's retrace check and witness mode. A failed verdict is
+Validation goes through ``menagerie.tl_validation``: TorchLens's ``_validate_forward_pass_torch``
+at the pin, exactly as the June validator calls it, and the public ``tl.validate(trace_observer=)``
+once the installed TorchLens offers it (``docs/torchlens-boundary.md``). The public
+``validate_forward_pass`` returns ``unverified`` unless the capture keeps every activation and
+argument; with those it agreed with the private entry on the eleven models checked at 2.35.2, but
+it skips the private entry's retrace check and witness mode. A failed verdict is
 retried once on a fresh model with one thread, as the June validator does.
 
 The validation and the save capture a freshly built model warmed by one plain forward
@@ -57,6 +58,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from menagerie import tl_compat
 from menagerie.pipeline import now, read_json, tree_sha256, write_json
 from menagerie.pipeline.records import (
     LedgerRow, Modes, Offense, OutputFile, Recipe, RunRequest, RunResult,
@@ -84,9 +86,10 @@ class Failure(Exception):
     """A typed model failure: ``cls`` is a class from the closed taxonomy."""
 
     def __init__(self, cls: str, msg: str, tail: tuple[str, ...] = (),
-                 offenses: tuple[Offense, ...] = ()) -> None:
+                 offenses: tuple[Offense, ...] = (), frames: tuple[str, ...] = ()) -> None:
         super().__init__(msg)
         self.cls, self.msg, self.tail, self.offenses = cls, msg, tail, offenses
+        self.frames = frames
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,33 @@ def _rss_mb() -> int:
 
 
 _HOME = re.compile(r"/(?:home|Users)/[^/\s\"']+/")
+
+
+FRAMES = 6
+_PACKAGE_DIRS = ("/site-packages/", "/dist-packages/")
+
+
+def _where(filename: str) -> str:
+    """A frame's file from its package (``torchlens/...``) or the repository root, else its last
+    three path parts with the home directory written ``~/``."""
+
+    for mark in _PACKAGE_DIRS:
+        if mark in filename:
+            return filename.rsplit(mark, 1)[1]
+    code = str(Path(__file__).resolve().parents[2]) + "/"
+    if filename.startswith(code):
+        return filename[len(code):]
+    at = filename.rfind("/torchlens/")  # a TorchLens source checkout put first on the path
+    if at >= 0:
+        return filename[at + 1:]
+    return "/".join(_HOME.sub("~/", filename).split("/")[-3:])
+
+
+def _frames(exc: BaseException) -> tuple[str, ...]:
+    """The exception's innermost ``FRAMES`` frames, innermost last (``LedgerRow.frames``)."""
+
+    found = traceback.extract_tb(exc.__traceback__)[-FRAMES:]
+    return tuple(f"{_where(f.filename)}:{f.lineno} {f.name}" for f in found)
 
 
 def _first_line(exc: BaseException) -> str:
@@ -161,7 +191,7 @@ def _stage(cls: str) -> Iterator[None]:
             cls = "compiled_ext"  # torch's extension builder, or what it needs, failed
         elif isinstance(exc, ImportError) and cls == "construct_error":
             cls = "missing_dependency"
-        raise Failure(cls, _first_line(exc), tail, _offenses(exc)) from exc
+        raise Failure(cls, _first_line(exc), tail, _offenses(exc), _frames(exc)) from exc
 
 
 def _wrap_torch() -> None:
@@ -228,28 +258,77 @@ def tensors(value: Any) -> list[Any]:
 def nonfinite(value: Any) -> str | None:
     """Where a forward's output is not finite: the first floating or complex output tensor that
     holds NaN or inf, with its counts, or ``None`` when every one is finite. Integer and boolean
-    outputs are finite by type; sparse and meta tensors hold no values to read here."""
+    outputs are finite by type; sparse and meta tensors hold no values to read here. A real
+    tensor whose only non-finite values are -inf beside some finite ones is a log-space mask and
+    counts as finite (``masked``); an all -inf tensor does not (Lead, decisions.md 2026-10-29)."""
 
-    import torch
-
-    for i, t in enumerate(tensors(value)):
-        if not (t.is_floating_point() or t.is_complex()) or t.is_sparse or t.is_meta:
+    for i, data in _nonfinite_tensors(value):
+        if _mask_counts(data) is not None:
             continue
-        data = t.detach()
-        if bool(torch.isfinite(data).all()):
-            continue
-        nan, inf = int(torch.isnan(data).sum()), int(torch.isinf(data).sum())
-        return (f"output {i} of shape {tuple(data.shape)} holds {nan} NaN and {inf} inf of "
+        nan, inf, down = _counts(data)
+        # The sign of the infinities tells a log-space mask (-inf only) from an overflow.
+        signs = f" ({inf - down} +inf, {down} -inf)" if inf and not data.is_complex() else ""
+        return (f"output {i} of shape {tuple(data.shape)} holds {nan} NaN and {inf} inf{signs} of "
                 f"{data.numel()} values")
     return None
 
 
-def _finite(out: Any, mode: str) -> None:
-    """Raise ``NONFINITE`` when a plain forward's output holds NaN or inf."""
+def masked(value: Any) -> str | None:
+    """A one-line note when some output tensor is a log-space mask (``nonfinite`` passes it),
+    else ``None``."""
+
+    found = [(i, data, _mask_counts(data)) for i, data in _nonfinite_tensors(value)]
+    found = [(i, data, n) for i, data, n in found if n is not None]
+    if not found:
+        return None
+    parts = ", ".join(f"output {i} {n} of {data.numel()}" for i, data, n in found)
+    return (f"-inf only where masked ({parts} values; no NaN or +inf, the rest finite): a log-space "
+            "mask, accepted as finite (decisions.md 2026-10-29)")
+
+
+def _nonfinite_tensors(value: Any) -> list[tuple[int, Any]]:
+    import torch
+
+    out = []
+    for i, t in enumerate(tensors(value)):
+        if not (t.is_floating_point() or t.is_complex()) or t.is_sparse or t.is_meta:
+            continue
+        data = t.detach()
+        if not bool(torch.isfinite(data).all()):
+            out.append((i, data))
+    return out
+
+
+def _counts(data: Any) -> tuple[int, int, int]:
+    """NaN, inf and -inf counts of a tensor (no -inf counted for a complex one)."""
+
+    import torch
+
+    nan, inf = int(torch.isnan(data).sum()), int(torch.isinf(data).sum())
+    down = int((data == float("-inf")).sum()) if not data.is_complex() else 0
+    return nan, inf, down
+
+
+def _mask_counts(data: Any) -> int | None:
+    """How many -inf a real tensor holds when they are its only non-finite values and some value
+    is finite; ``None`` otherwise."""
+
+    if data.is_complex():
+        return None
+    nan, inf, down = _counts(data)
+    return down if nan == 0 and inf == down and down < data.numel() else None
+
+
+def _finite(out: Any, mode: str, subject: Subject | None = None) -> str | None:
+    """Raise ``NONFINITE`` when a plain forward's output holds NaN or inf; given the eval
+    ``subject``, the message names the init change that would fix it (``_init_fix``). Returns
+    the ``masked`` note of an output whose only non-finite values are a -inf mask."""
 
     why = nonfinite(out)
     if why is not None:
-        raise Failure(NONFINITE, f"{mode}-mode forward is not finite: {why}")
+        raise Failure(NONFINITE, f"{mode}-mode forward is not finite: {why}"
+                      f"{_init_fix(subject, None) if subject is not None else ''}")
+    return masked(out)
 
 
 def _valued(value: Any) -> list[Any]:
@@ -280,23 +359,58 @@ def constant(value: Any, other: Any | None = None) -> str | None:
     return "the output is the same for two distinct inputs" if same else None
 
 
-def _not_constant(subject: Subject, out: Any, boundary: str) -> None:
+def _not_constant(subject: Subject, out: Any, boundary: str) -> str | None:
     """Raise ``CONSTANT`` when an eval output is all zero, or, when some module reads the input
-    (``input_boundary`` ``real``), the same for the changed inputs ``input_boundary`` uses."""
+    (``input_boundary`` ``real``), the same for the changed inputs ``input_boundary`` uses.
+
+    A collapse only at a discrete output step with a live train mode is not degenerate
+    (``degenerate.discrete_step``): the note is returned for the row's message instead. A
+    degenerate failure's message names the init change that would fix it (``_init_fix``)."""
 
     import torch
 
-    other = None
-    if constant(out) is None and boundary == "real":
-        args, kwargs = _perturbed((subject.args, subject.kwargs))
+    from menagerie.pipeline import degenerate
+
+    zero = constant(out)
+    other, changed = None, None
+    if boundary == "real":
+        changed = _perturbed((subject.args, subject.kwargs))
         try:
             with torch.no_grad():
-                other = _forward(Subject(subject.model, args, kwargs))
+                other = _forward(Subject(subject.model, *changed))
         except Exception:  # noqa: BLE001 -- a model that breaks on other values reads them
-            return
-    why = constant(out, other)
-    if why is not None:
-        raise Failure(CONSTANT, f"eval-mode forward is degenerate: {why}")
+            if zero is None:
+                return None
+            changed = None
+    why = zero or constant(out, other)
+    if why is None:
+        return None
+    step, alive = None, False
+    if changed is not None:
+        step, alive = degenerate.discrete_step(subject.model, _forward_of(subject),
+                                               (subject.args, subject.kwargs), changed)
+        if alive or step in degenerate.QUANTIZE:
+            return degenerate.discrete_note(str(step), alive=alive)
+    aside = (f"; it collapses at a discrete step ({step}), but the train-mode output is degenerate "
+             "too" if step else "")
+    raise Failure(CONSTANT, f"eval-mode forward is degenerate: {why}{aside}"
+                  f"{_init_fix(subject, changed)}")
+
+
+def _forward_of(subject: Subject) -> Any:
+    return lambda args, kwargs: _forward(Subject(subject.model, args, kwargs))
+
+
+def _init_fix(subject: Subject, changed: tuple[Any, Any] | None) -> str:
+    """``; init-change fix: ...`` when an init change the rule allows (decisions.md 2026-10-28)
+    makes the eval forward finite and not constant, else empty. It changes the model, so it runs
+    only on a build the worker is about to discard."""
+
+    from menagerie.pipeline import degenerate
+
+    fix = degenerate.init_fix(subject.model, _forward_of(subject), (subject.args, subject.kwargs),
+                              changed)
+    return f"; init-change fix: {fix}" if fix else ""
 
 
 def _shapes(value: Any) -> tuple[tuple[int, ...], ...]:
@@ -310,6 +424,19 @@ def _forward(subject: Subject) -> Any:
     return subject.model(*subject.args, **subject.kwargs)
 
 
+def _input_copy(subject: Subject) -> Subject:
+    """The subject with deep copies of its inputs, so a forward that changes its inputs in place
+    (SlowFast's pathway packer; TorchLens corpus cluster c-5070614f) leaves the capture's inputs as
+    built. A copy that fails (an input that refuses ``deepcopy``) falls back to the originals."""
+
+    import copy
+
+    try:
+        return Subject(subject.model, copy.deepcopy(subject.args), copy.deepcopy(subject.kwargs))
+    except Exception:  # noqa: BLE001 -- arbitrary input objects; the warm-up then runs as before
+        return subject
+
+
 def _warm(subject: Subject, threads: int | None = None) -> str | None:
     """One plain forward before a capture: eval mode, no grad, the capture's thread count.
 
@@ -319,7 +446,9 @@ def _warm(subject: Subject, threads: int | None = None) -> str | None:
     eval and back; an eval model is never switched, because timm's ``train()`` (``eval()`` too)
     clears the cache the warm-up filled. No grad matters:
     a cache filled with gradients on holds a graph, and TorchLens then refuses the deep copy it
-    validates (``precondition_refusal``, probed on those timm families at 2.35.3). Only a forward
+    validates (``precondition_refusal``, probed on those timm families at 2.35.3). The forward runs
+    on copies of the inputs (``_input_copy``), so a model that edits its inputs in place leaves the
+    capture's inputs as built. Only a forward
     that raises without autograd (a physics-informed net's ``torch.autograd.grad``) is warmed
     with gradients on.
     Memory: the model is the capture's own build and the forward keeps no graph, so the peak is
@@ -341,7 +470,7 @@ def _warm(subject: Subject, threads: int | None = None) -> str | None:
         for grad in (False, True):
             try:
                 with torch.set_grad_enabled(grad):
-                    _forward(subject)
+                    _forward(_input_copy(subject))
                 return None
             except Exception as exc:  # noqa: BLE001 -- model code raises anything; recorded
                 if isinstance(exc, MemoryError) or _MEMORY.search(str(exc)):
@@ -510,10 +639,10 @@ def _forward_mode(request: RunRequest, attempt_dir: Path) -> RunResult:
         return worker_preview.forward_mode(request, attempt_dir)
     subject = _build(request.recipe)
     eval_out, secs, eval_ops = _timed_forward(subject, record=True)
-    _finite(eval_out, "eval")
+    mask = _finite(eval_out, "eval", subject)
     peak = _rss_mb()
     boundary = input_boundary(subject, eval_out)
-    _not_constant(subject, eval_out, boundary)
+    note = "; ".join(filter(None, (mask, _not_constant(subject, eval_out, boundary)))) or None
     params = sum(int(p.numel()) for p in subject.model.parameters())
     del subject
     train, div = "pass", None
@@ -526,9 +655,9 @@ def _forward_mode(request: RunRequest, attempt_dir: Path) -> RunResult:
     modes = Modes(eval="pass", train=train, divergence=div)
     row = _base_row(request, stage="forward", outcome="pass", mode="eval", params=params,
                     params_source="counted", forward_secs=round(secs, 3),
-                    forward_peak_rss_mb=peak, input_boundary=boundary)
+                    forward_peak_rss_mb=peak, input_boundary=boundary, msg=note)
     return _result(request, "pass", rows=(row,), output_shapes=_shapes(eval_out),
-                   params=params, modes=modes, input_boundary=boundary)
+                   params=params, modes=modes, input_boundary=boundary, msg=note)
 
 
 @dataclass(frozen=True)
@@ -556,35 +685,37 @@ def _replay_status(trace: Any) -> dict[str, Any]:
 
     status = getattr(trace, "validation_replay_status", None)
     return {"state": getattr(status, "state", None), "reason": getattr(status, "reason", None),
-            "failed": getattr(status, "failed_node_count", None)}
+            "failed": tl_compat.status_count(status, "failed") if status is not None else None}
 
 
-def _validate(subject: Subject, threads: int | None) -> Validation:
-    """Validate through the June validator's private entry: its own ground truth, one capture of
-    every activation, the retrace check and per-op replay (``docs/torchlens-boundary.md``)."""
+def _validate(subject: Subject, threads: int | None,
+              save_options: dict[str, Any] | None = None) -> Validation:
+    """Validate through Menagerie's validator door (``menagerie.tl_validation``): TorchLens's own
+    ground truth, one capture of every activation, the retrace check and per-op replay, with the
+    validation trace read by an observer (``docs/torchlens-boundary.md``). On a GPU
+    ``save_options`` keep the validation capture's saves in host memory (``gpu_save_options``)."""
 
-    import torchlens as tl
-    from torchlens.user_funcs import _validate_forward_pass_torch
+    from menagerie import tl_validation
 
     seen: dict[str, Any] = {}
 
     def observe(trace: Any) -> None:
         if trace is not None:  # None: a precondition refusal before any capture (2.35.2)
-            seen.update(n_ops=int(trace.num_ops), graph_hash=trace.graph_shape_hash or None,
+            seen.update(n_ops=tl_compat.num_ops(trace), graph_hash=tl_compat.graph_hash(trace),
                         **_replay_status(trace))
 
     with _stage("capture_error"):
         seen["warm"] = _warm(subject, threads)
         started = time.perf_counter()
-        passed = bool(_validate_forward_pass_torch(
-            subject.model, list(subject.args), subject.kwargs, random_seed=SEED,
-            validate_metadata=True, num_threads=threads, _trace_observer=observe))
+        passed = tl_validation.validate_forward(
+            subject.model, list(subject.args), subject.kwargs, seed=SEED, num_threads=threads,
+            observer=observe, save_options=save_options)
         secs = time.perf_counter() - started
-    failure = None if passed else tl.validation.last_validation_failure()
+    failure = None if passed else tl_validation.last_failure()
     msg = None if passed else "validation returned False with no failure record"
     if failure is not None:
         msg = failure.summary() if hasattr(failure, "summary") else str(failure)
-        seen["check"] = getattr(failure, "check", None)
+        seen["check"] = tl_validation.failure_check(failure)
     return Validation(passed, msg and _HOME.sub("~/", msg[:300]), secs, **seen)
 
 
@@ -612,7 +743,7 @@ def _save_runnable(trace: Any, path: Path, skeleton: str) -> Saved:
 
     shutil.rmtree(path, ignore_errors=True)  # a retry saves over the first attempt's file
     try:
-        tl.save(trace, path, level="runnable")
+        tl_compat.save(trace, path, level="runnable")
         runnable, level = "ready", "runnable"
     except Exception as exc:  # noqa: BLE001 -- the refusal code is recorded, not raised
         code = re.search(r"\[([a-z0-9_]+)\]", str(exc))
@@ -622,7 +753,7 @@ def _save_runnable(trace: Any, path: Path, skeleton: str) -> Saved:
             return Saved(runnable, None)
         level = "portable"
     try:
-        same = tl.hash.trace(tl.load(path)) == skeleton
+        same = tl_compat.skeleton(tl.load(path)) == skeleton
     except Exception:  # noqa: BLE001 -- a save that does not load is not runnable
         return Saved("refused:round_trip_load", level)
     return Saved(runnable if same else "refused:round_trip_hash", level)
@@ -631,11 +762,10 @@ def _save_runnable(trace: Any, path: Path, skeleton: str) -> Saved:
 def _portable(trace: Any, path: Path) -> bool:
     import shutil
 
-    import torchlens as tl
 
     shutil.rmtree(path, ignore_errors=True)
     try:
-        tl.save(trace, path, level="portable", include_outs=False)
+        tl_compat.save(trace, path, level="portable", include_outs=False)
         return True
     except Exception:  # noqa: BLE001 -- e.g. TorchLensIOError on beit's module state
         shutil.rmtree(path, ignore_errors=True)
@@ -671,8 +801,7 @@ def gpu_save_options(device: str, rss_mb: int) -> dict[str, Any]:
     fraction of the attempt's memory cap (``rss_mb``, sized from the job's declaration), not of
     the node's free memory, which TorchLens's ``"auto"`` reads on a CPU device.
 
-    TorchLens 2.35.3's validator entry takes no capture options, so its capture keeps
-    ``save_budget="auto"`` on the card (``docs/torchlens-boundary.md``).
+    The validation capture takes the same options through the validator door (``_validate``).
     """
 
     if device == "cpu":
@@ -691,13 +820,13 @@ def _hash_capture(subject: Subject, *, structure_only: bool = False, device: str
     """
 
     import torchlens as tl
-    from torchlens.options import CaptureOptions
 
     from menagerie.structural_digest import _restored_host_rng_state
 
-    options = (CaptureOptions(structure_only=True) if structure_only
-               else CaptureOptions(inference_only=True, random_seed=SEED,
-                                   **gpu_save_options(device, rss_mb)))
+    options = (tl_compat.capture_options(structure_only=True) if structure_only
+               else tl_compat.capture_options(inference_only=True, random_seed=SEED,
+                                              measure_host_peak_memory=True,
+                                              **gpu_save_options(device, rss_mb)))
     with _stage("capture_error"), _restored_host_rng_state():
         return tl.trace(subject.model, list(subject.args), input_kwargs=subject.kwargs,
                         capture=options)
@@ -733,18 +862,17 @@ def _save(request: RunRequest, attempt_dir: Path,
     import shutil
 
     import torchlens as tl
-    from torchlens.options import CaptureOptions
 
     subject = _build(request.recipe, train=request.model_mode == "train", device=device)
     with _stage("capture_error"):
         _warm(subject)  # a raise is recorded from the validation's warm-up of the same build
         started = time.perf_counter()
         trace = tl.trace(subject.model, list(subject.args), input_kwargs=subject.kwargs,
-                         capture=CaptureOptions(intervention_ready=request.intervention_ready,
-                                                random_seed=SEED,
-                                                **gpu_save_options(device, request.caps.rss_mb)))
+                         capture=tl_compat.capture_options(
+                             intervention_ready=request.intervention_ready, random_seed=SEED,
+                             **gpu_save_options(device, request.caps.rss_mb)))
         secs = time.perf_counter() - started
-    saved = _save_runnable(trace, attempt_dir / TRACE_FILE, tl.hash.trace(trace))
+    saved = _save_runnable(trace, attempt_dir / TRACE_FILE, tl_compat.skeleton(trace))
     shutil.rmtree(attempt_dir / RENDER_FILE, ignore_errors=True)  # a retry's twin goes too
     twin = saved.level != "portable" and _portable(trace, attempt_dir / RENDER_FILE)
     return saved.state, secs, None if (saved.level or twin) else trace
@@ -764,21 +892,21 @@ def _trace_mode(request: RunRequest, attempt_dir: Path, device: str = "cpu") -> 
     train = request.model_mode == "train"
     subject = _build(request.recipe, train=train, device=device)
     truth, forward_secs, _ = _timed_forward(subject)
-    _finite(truth, request.model_mode)
+    mask = _finite(truth, request.model_mode, None if train else subject)
     forward_peak = _rss_mb()
     boundary = input_boundary(subject, truth)
-    if not train:
-        _not_constant(subject, truth, boundary)
+    note = "; ".join(filter(None, (mask, None if train else _not_constant(subject, truth, boundary))))
     del subject
     gc.collect()
     # The verdict is taken on a fresh build warmed by exactly one forward (``_warm``), never on
     # the timed model: its forward ran with gradients and in the request's mode, and restoring
     # the state dict would not undo what it cached (ConViT's relative position indices).
-    check = _validate(_build(request.recipe, train=train, device=device), None)
+    saves = gpu_save_options(device, request.caps.rss_mb)  # empty on the CPU
+    check = _validate(_build(request.recipe, train=train, device=device), None, saves)
     msg = check.msg
     gc.collect()
     if not check.passed:
-        check = _validate(_build(request.recipe, train=train, device=device), 1)
+        check = _validate(_build(request.recipe, train=train, device=device), 1, saves)
         msg = f"single-thread retry: {check.msg}" if not check.passed else (
             f"passed on the single-thread retry after: {msg}")
     if check.n_ops is None:
@@ -788,6 +916,7 @@ def _trace_mode(request: RunRequest, attempt_dir: Path, device: str = "cpu") -> 
         msg = f"unverified ({check.reason}): {msg}"
     if check.warm:
         msg = "; ".join(filter(None, (msg, f"warm-up raised: {check.warm}")))
+    msg = "; ".join(filter(None, (msg, note)))
     summary, hashes = _digest(request, device)
     runnable, save_secs, unsaved = _save(request, attempt_dir, device)
     timings = {"forward_secs": round(forward_secs, 3), "capture_secs": round(check.secs, 3),
@@ -826,7 +955,7 @@ def _trace_mode(request: RunRequest, attempt_dir: Path, device: str = "cpu") -> 
 
 
 # The failure check TorchLens records when its pristine re-trace diverged after a replay that
-# otherwise passed (``torchlens.validation.diagnostics.CHECK_RETRACE_MISMATCH`` at 2.35.3).
+# otherwise passed (``CHECK_RETRACE_MISMATCH`` in TorchLens's validation diagnostics, 2.35.3 on).
 RETRACE_MISMATCH = "retrace_mismatch"
 
 
@@ -873,9 +1002,9 @@ def _structure_only_mode(request: RunRequest, attempt_dir: Path) -> RunResult:
     params = sum(int(p.numel()) for p in subject.model.parameters())
     row = _base_row(
         request, stage="trace", outcome="pass", mode=request.model_mode,
-        capture="structure_only", n_ops=int(trace.num_ops),
+        capture="structure_only", n_ops=tl_compat.num_ops(trace),
         hashes=trace_summary.ledger_hashes(hashes),
-        graph_hash=trace.graph_shape_hash or None,
+        graph_hash=tl_compat.graph_hash(trace),
         params=params, params_source="geometry", peak_rss_mb=_rss_mb(), capture_secs=secs,
         validation_state="structure_only", runnable="n/a", trace=sha.get("tlspec"),
         summary=sha.get("summary"), msg=msg,
@@ -1022,7 +1151,7 @@ def _failed(request: RunRequest, failure: Failure) -> RunResult:
     row = _base_row(
         request, stage="forward" if request.mode == "forward" else "trace", outcome="fail",
         cls=failure.cls, mode=request.model_mode, msg=failure.msg,
-        offenses=failure.offenses or None,
+        offenses=failure.offenses or None, frames=failure.frames or None,
         capture=None if request.mode == "forward" else (
             "structure_only" if structure_only else "full"),
         validation_state="structure_only" if structure_only else None,

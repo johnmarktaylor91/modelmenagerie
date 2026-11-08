@@ -28,6 +28,7 @@ from typing import Any, ContextManager, Mapping, Sequence, cast
 from menagerie.paths import work_dir
 from menagerie import cluster_runner
 from menagerie import host_budget
+from menagerie import tl_compat
 from menagerie.catalog import CatalogRow, catalog_row_from_payload, load_rows
 from menagerie import envs
 from menagerie.recipe import (
@@ -3299,8 +3300,9 @@ def _trace_n_ops_and_hash_from_trace(trace: Any) -> tuple[int | None, str, str]:
     """
 
     try:
-        n_ops = int(getattr(trace, "num_ops", 0) or len(getattr(trace, "layer_logs", {}) or {}))
-        graph_shape_hash = str(getattr(trace, "graph_shape_hash", "") or "")
+        n_ops = (tl_compat.num_ops(trace) if hasattr(trace, "num_ops") or hasattr(trace, "ops")
+                 else 0) or len(getattr(trace, "layer_logs", {}) or {})
+        graph_shape_hash = tl_compat.graph_hash(trace, missing_ok=True) or ""
     except Exception as error:
         return None, "", f"{error!r}\n{traceback.format_exc(limit=8)}"
     return n_ops, graph_shape_hash, ""
@@ -3436,7 +3438,6 @@ def _save_tlspec_artifact(
         Relative artifact path and SHA-256 digest.
     """
 
-    import torchlens as tl
 
     assert_min_free(tlspec_out_dir, min_free_gb)
     final_path = tlspec_artifact_stem(row, tlspec_out_dir).with_suffix(".tlspec")
@@ -3458,7 +3459,7 @@ def _save_tlspec_artifact(
         setattr(trace, "layer_list", list(getattr(trace, "layer_logs", {}).values()))
         missing_defaults.append("layer_list")
     try:
-        tl.save(
+        tl_compat.save(
             trace,
             tmp_path,
             level="portable" if include_activations else "audit",
@@ -4093,7 +4094,8 @@ def _validate_one_unscaled_note(
         """
 
         import torchlens as tl
-        from torchlens.user_funcs import _validate_forward_pass_torch
+
+        from menagerie import tl_validation
 
         n_ops: int | None = None
         graph_shape_hash = ""
@@ -4127,9 +4129,7 @@ def _validate_one_unscaled_note(
                 validation_trace = trace
                 n_ops, graph_shape_hash, trace_error = _trace_n_ops_and_hash_from_trace(trace)
             try:
-                from torchlens.validation.diagnostics import get_validation_failure
-
-                failure = get_validation_failure(trace)
+                failure = tl_validation.failure_for(trace)
                 if failure is not None:
                     replay_failure_summary = failure.summary()
             except Exception:
@@ -4156,15 +4156,13 @@ def _validate_one_unscaled_note(
             graph_shape_hash = ""
             trace_error = ""
             replay_failure_summary = ""
-            forward_value = _validate_forward_pass_torch(
+            return tl_validation.validate_forward(
                 attempt_model,
                 attempt_input,
-                random_seed=validation_seed,
-                validate_metadata=True,
+                seed=validation_seed,
                 num_threads=num_threads,
-                _trace_observer=observe_validation_trace,
+                observer=observe_validation_trace,
             )
-            return bool(forward_value)
 
         try:
             forward_result = run_forward_attempt(num_threads=None)

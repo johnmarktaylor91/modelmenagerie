@@ -28,7 +28,8 @@ import numpy as np
 
 import torch
 import torchlens as tl
-from torchlens.options import CaptureOptions
+
+from menagerie import tl_compat
 
 
 def _to_cpu(value: Any) -> Any:
@@ -115,7 +116,9 @@ def _trace_for_digest(model: Any, example_input: Any) -> Any:
         return tl.trace(
             model,
             _to_cpu(example_input),
-            capture=CaptureOptions(inference_only=True, random_seed=_DIGEST_TRACE_SEED),
+            capture=tl_compat.capture_options(inference_only=True,
+                                              random_seed=_DIGEST_TRACE_SEED,
+                                              measure_host_peak_memory=True),
         )
 
 
@@ -169,7 +172,7 @@ def architecture_distinctness_hash(model: Any, example_input: Any) -> str:
     """
 
     trace = _trace_for_digest(model, example_input)
-    graph_hash = getattr(trace, "graph_shape_hash", None)
+    graph_hash = tl_compat.graph_hash(trace)
     if not graph_hash:
         raise RuntimeError("TorchLens trace did not expose graph_shape_hash")
     return str(graph_hash)

@@ -9,12 +9,16 @@ into code.
 
 from __future__ import annotations
 
+import atexit
 import fcntl
 import functools
 import hashlib
 import json
 import os
+import pickle
 import re
+import sys
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,7 +30,7 @@ from menagerie.pipeline import written
 
 __all__ = [
     "NON_TRACE_ROOTS", "DataLayout", "StoreLayout", "append_jsonl", "month_of", "now", "read_json",
-    "read_jsonl", "recipe_revision", "shard", "trace_lock_digest", "tree_sha256", "write_json",
+    "read_json_cached", "read_jsonl", "recipe_revision", "shard", "trace_lock_digest", "tree_sha256", "write_json",
 ]
 
 
@@ -34,6 +38,86 @@ def read_json(cls: type[R], path: Path) -> R:
     """Read one record from a JSON file."""
 
     return from_dict(cls, json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+_CACHED: dict[tuple[str, str], tuple[tuple[int, int, int], Any]] = {}
+CACHE_RACY_S = 2.0  # a file this new may change again within its stamp's resolution
+JSON_CACHE_ENV = "MENAGERIE_JSON_CACHE"  # a file the tick keeps parsed records in between passes
+
+
+def read_json_cached(cls: type[R], path: Path) -> R:
+    """``read_json`` through a cache keyed by the file's size, mtime and inode: a tick pass that
+    reads every packet in several steps parses each once, and with ``JSON_CACHE_ENV`` set the
+    next pass starts from this one's parses (``_Kept``). The records are frozen, so the callers
+    share them. A file written within ``CACHE_RACY_S`` is read again next time."""
+
+    _KEPT.start()
+    path = Path(path)
+    st = path.stat()
+    stamp = (st.st_size, st.st_mtime_ns, st.st_ino)
+    key = (f"{cls.__module__}.{cls.__qualname__}", str(path))
+    hit = _CACHED.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    value = read_json(cls, path)
+    if time.time() - st.st_mtime_ns / 1e9 > CACHE_RACY_S:
+        _CACHED[key] = (stamp, value)
+        _KEPT.dirty = True
+    return value
+
+
+class _Kept:
+    """The parses ``read_json_cached`` keeps for the next process in the file ``JSON_CACHE_ENV``
+    names (the tick's unit): loaded on first use, saved at exit when this process parsed a file
+    anew, less the files gone since. Each entry is still checked against its file's stamp
+    before use, and the file is keyed by the record code, so a changed record class starts it
+    afresh. A tick pass is a new process; parsing the packets and model records was a fifth of
+    its CPU (Oct 2026)."""
+
+    def __init__(self) -> None:
+        self.started, self.dirty, self.path = False, False, None
+
+    def start(self) -> None:
+        if self.started:
+            return
+        self.started = True
+        named = os.environ.get(JSON_CACHE_ENV)
+        if not named:
+            return
+        self.path = Path(named)
+        try:
+            version, entries = pickle.loads(self.path.read_bytes())  # our own file (``save``)
+        except (OSError, pickle.UnpicklingError, EOFError, AttributeError, ImportError,
+                TypeError, ValueError):
+            version, entries = None, {}
+        if version == _records_version() and isinstance(entries, dict):
+            _CACHED.update(entries)
+        atexit.register(self.save)
+
+    def save(self) -> None:
+        """Write the cache for the next process; a failure only costs that process a full parse."""
+        if self.path is None or not self.dirty:
+            return
+        entries = {key: hit for key, hit in _CACHED.items() if os.path.exists(key[1])}
+        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(pickle.dumps((_records_version(), entries),
+                                         protocol=pickle.HIGHEST_PROTOCOL))
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            print(f"menagerie: record cache not kept ({exc})", file=sys.stderr)
+        self.dirty = False
+
+
+@functools.cache
+def _records_version() -> str:
+    from menagerie.pipeline import records  # noqa: PLC0415
+
+    return hashlib.sha256(Path(records.__file__).read_bytes()).hexdigest()
+
+
+_KEPT = _Kept()
 
 
 def write_json(record: Record, path: Path) -> None:
@@ -264,6 +348,8 @@ def recipe_revision(recipe: Mapping[str, Any], adapter: bytes | None, lock: byte
     payload = {k: recipe.get(k) for k in REVISION_FIELDS}
     if recipe.get("code"):  # only when set, so every recipe without extra trees keeps its revision
         payload["code"] = list(recipe["code"])
+    if recipe.get("weights"):  # the same: only a pretrained-weights recipe's revision names them
+        payload["weights"] = recipe["weights"]
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
     digest.update(b"\0" + hashlib.sha256(adapter or b"").digest())
     digest.update(b"\0" + trace_lock_digest(lock).encode())
@@ -275,11 +361,22 @@ def tree_sha256(path: Path) -> str:
 
     path = Path(path)
     if path.is_file():
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        return _file_sha256(path)
     digest = hashlib.sha256()
     for item in sorted(p for p in path.rglob("*") if p.is_file()):
         rel = item.relative_to(path).as_posix()
-        digest.update(f"{rel}\0{hashlib.sha256(item.read_bytes()).hexdigest()}\n".encode())
+        digest.update(f"{rel}\0{_file_sha256(item)}\n".encode())
+    return digest.hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    """A file's sha256 read in 1 MiB chunks: a big row's trace save holds single files of about
+    2 GiB, and reading one whole killed the 2 GiB store trim (2026-11-06)."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
     return digest.hexdigest()
 
 

@@ -51,6 +51,22 @@ MSG = ("single-thread retry: forward_replay mismatch at conv2d_33_391:1 (conv2d)
        "max_abs_diff=4.768e-07 max_rel_diff=7.022e-04 reduction_depth=9")
 
 
+def _old_reader() -> bool:
+    try:
+        from torchlens._io.bundle import (  # noqa: F401
+            _prescan_metadata_pickle_opcodes,
+            _RenameAwareUnpickler,
+        )
+    except ImportError:
+        return False
+    return True
+
+
+# A pickled (2.37-and-earlier) save is read only under a TorchLens before 2.38: the reader env.
+old_reader = pytest.mark.skipif(not _old_reader(), reason="needs the torchlens<2.38 reader")
+
+
+@old_reader
 def test_shallow_conv_and_packed_metadata_only_trace(world, tmp_path: Path) -> None:
     data, blobs, out = world
     sha = save(data, blobs, tmp_path / "trace", OPS)
@@ -67,6 +83,7 @@ def test_shallow_conv_and_packed_metadata_only_trace(world, tmp_path: Path) -> N
     assert row["metadata_status"] == "ok" and result["by_op_type"] == {"conv2d": 1}
 
 
+@old_reader
 def test_insensitive_row_names_the_perturbed_parent(world, tmp_path: Path) -> None:
     data, blobs, out = world
     sha = save(data, blobs, tmp_path / "trace", OPS)
@@ -206,3 +223,70 @@ def test_cli_exclude_parses_id_reason_pairs_and_rejects_bare_ids(capsys) -> None
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["replay", "table", "--exclude", "m4310"])
     assert "ID=REASON" in capsys.readouterr().err
+
+
+def test_old_save_under_a_new_torchlens_names_the_reader_env(
+        world, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    data, blobs, out = world
+    sha = save(data, blobs, tmp_path / "trace", OPS)
+    trace(data, sha, MSG)
+    monkeypatch.setitem(sys.modules, "torchlens._io.bundle", None)  # as at TorchLens 2.38 and 3.0
+    row, = read(replay_table.table(data=data, store=blobs, pin="2.35.3", out=out)["table"])
+    assert row["metadata_status"] == "unavailable" and row["op_type"] == "conv2d"
+    error = row["metadata_error"]
+    assert error.startswith("OldSaveError") and "torchlens<2.38" in error
+
+
+def test_new_save_is_read_through_tl_load(world, tmp_path: Path,
+                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    import torchlens as tl
+
+    data, blobs, out = world
+    folder = tmp_path / "trace"
+    folder.mkdir()
+    (folder / "manifest.json").write_text(json.dumps({"torchlens_version": "3.0.1"}))
+    sha = store.put(folder, store=blobs, data=data, mime="application/x-tlspec",
+                    license_class="open").sha256
+    view = SimpleNamespace(label="view_1_2:1", func_name="view", type="view",
+                           shape=(1, 64, 7, 7), parents=[])
+    conv = SimpleNamespace(label="conv2d_33_391:1", func_name="conv2d", type="conv2d",
+                           shape=(1, 64, 7, 7), parents=[view])  # 3.0 may give the Op itself
+
+    class Loaded:
+        def __iter__(self):
+            return iter([view, conv])
+
+    monkeypatch.setattr(tl, "load", lambda path: Loaded())
+    trace(data, sha, MSG)
+    row, = read(replay_table.table(data=data, store=blobs, pin="2.35.3", out=out)["table"])
+    assert row["metadata_status"] == "ok", row["metadata_error"]
+    assert json.loads(row["parents"]) == [{"label": "view_1_2:1", "op_type": "view",
+                                           "shape": [1, 64, 7, 7]}]
+
+
+def test_other_backend_save_names_the_backend_env(world, tmp_path: Path,
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    import torchlens as tl
+
+    data, blobs, out = world
+    folder = tmp_path / "trace"
+    folder.mkdir()
+    (folder / "manifest.json").write_text(json.dumps({"torchlens_version": "3.0.2"}))
+    sha = store.put(folder, store=blobs, data=data, mime="application/x-tlspec",
+                    license_class="open").sha256
+
+    class BackendRuntimeCompatibilityError(RuntimeError):  # TorchLens 3.0's, matched by name
+        pass
+
+    def refuse(path):
+        raise BackendRuntimeCompatibilityError("backend 'tensorflow' is not installed")
+
+    monkeypatch.setattr(tl, "load", refuse)
+    trace(data, sha, MSG)
+    row, = read(replay_table.table(data=data, store=blobs, pin="2.35.3", out=out)["table"])
+    assert row["metadata_status"] == "unavailable" and row["op_type"] == "conv2d"
+    assert row["metadata_error"].startswith("BackendSaveError") and "(tf, jax)" in row["metadata_error"]

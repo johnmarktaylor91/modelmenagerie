@@ -11,15 +11,21 @@ from menagerie.pipeline import DataLayout, describe_stage, describe_write, tick_
 
 
 class _Systemd:
-    """Stands in for ``systemctl --user is-active`` and ``systemd-run``."""
+    """Stands in for ``systemctl --user is-active``, ``systemd-run`` and the hub CPU-pressure gate
+    (``gate``: its exit code, or an exception it raises)."""
 
-    def __init__(self, active: bool = False, rc: int = 0) -> None:
-        self.active, self.rc, self.calls = active, rc, []
+    def __init__(self, active: bool = False, rc: int = 0, gate: int | Exception = 0) -> None:
+        self.active, self.rc, self.gate, self.calls, self.gate_env = active, rc, gate, [], None
 
     def __call__(self, argv, **kw):
         self.calls.append(list(argv))
         if argv[0] == "systemctl":
             return subprocess.CompletedProcess(argv, 0 if self.active else 3, "", "")
+        if argv[0] == str(describe_stage.GATE):
+            self.gate_env = kw.get("env")
+            if isinstance(self.gate, Exception):
+                raise self.gate
+            return subprocess.CompletedProcess(argv, self.gate, "hub-psi-gate: skipped" if self.gate == 1 else "", "")
         return subprocess.CompletedProcess(argv, self.rc, "", "unit exists" if self.rc else "")
 
     def started(self) -> list[list[str]]:
@@ -153,3 +159,26 @@ def test_worker_room_starts_a_run_while_the_hub_is_full():
     describe_workers.record_room(["zm"], ["zm"], held=False)  # 2b took the slot
     out = describe_stage.stage({"lanes": 2, "workers": True}, dry_run=False, run=_Systemd(), slots=lambda: 0)
     assert out["held"].startswith("every seat is staged")
+
+
+def test_the_pressure_gate_holds_a_run_as_the_tick_and_a_missing_gate_never_does(monkeypatch):
+    monkeypatch.delenv("TRIGGER_UNIT", raising=False)
+    gated = _Systemd(gate=1)
+    out = describe_stage.stage({}, dry_run=False, run=gated, slots=lambda: 20)
+    assert out["held"] == "hub-psi-gate: skipped" and not gated.started()
+    [call] = [c for c in gated.calls if c[0] == str(describe_stage.GATE)]
+    assert call[1:] == [describe_stage.UNIT, "1200"]
+    # a transient unit has no TRIGGER_UNIT, and the gate never skips without one
+    assert gated.gate_env["TRIGGER_UNIT"] == "menagerie-tick.service"
+    for gate in (0, 2, FileNotFoundError("no gate")):
+        assert "started" in describe_stage.stage({}, dry_run=False, run=_Systemd(gate=gate), slots=lambda: 20)
+
+
+def test_a_started_run_yields_like_the_tick_and_stamps_the_gate_only_on_success():
+    systemd = _Systemd()
+    describe_stage.stage({}, dry_run=False, run=systemd, slots=lambda: 20)
+    [argv] = systemd.started()
+    assert {"--property=CPUWeight=20", "--property=IOWeight=20", "--property=Nice=10"} <= set(argv)
+    [stamp] = [a for a in argv if "ExecStopPost=" in a]
+    assert '"$$SERVICE_RESULT" = success' in stamp
+    assert stamp.endswith(f"{describe_stage.GATE} --ran {describe_stage.UNIT}'")

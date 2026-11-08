@@ -183,7 +183,7 @@ export function fixtureFamily(): Family {
 
 /** A family with no members, the empty case for the family page. */
 export function emptyFamily(): Family {
-  return { name: "Fixture: empty family", slug: "fixture-empty", members: [], paper: null, summary: null };
+  return { name: "Fixture: empty family", displayName: "Fixture: empty family", slug: "fixture-empty", members: [], paper: null, summary: null };
 }
 
 /** Fixture model pages: slug, record and the family context the page shows. */

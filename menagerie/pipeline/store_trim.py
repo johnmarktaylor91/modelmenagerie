@@ -515,7 +515,9 @@ def _unlink_batches(sha: str, links: Sequence[Path], names: Sequence[str] = ()) 
 
 
 def _restated(line: StoreIndexLine, **changes: Any) -> StoreIndexLine:
-    return replace(line, **changes)
+    """A placement restating ``line``; a signed URL an older line recorded loses its query."""
+
+    return replace(line, **{"url": store_mod.public_url(line.url), **changes})
 
 
 def _free(store: StoreLayout) -> int:

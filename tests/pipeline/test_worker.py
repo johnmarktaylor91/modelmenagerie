@@ -20,7 +20,7 @@ tl = pytest.importorskip("torchlens")
 pytest.importorskip("timm")
 from torch import nn  # noqa: E402
 
-from menagerie import trace_summary  # noqa: E402
+from menagerie import tl_compat, trace_summary  # noqa: E402
 from menagerie.pipeline import harvest, inputs, read_json, tree_sha256, write_json  # noqa: E402
 from menagerie.pipeline import worker  # noqa: E402
 from menagerie.pipeline.records import (  # noqa: E402
@@ -196,9 +196,72 @@ class ValueBranch(nn.Module):
         return y
 
 
+class Codec(nn.Module):
+    """A learned codec at random weights: eval rounds the small latents to zero, so every input
+    decodes to the same output; train adds uniform noise instead and stays input-dependent."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.enc, self.dec = nn.Linear(27, 8), nn.Linear(8, 4)
+
+    def forward(self, x: Any) -> Any:
+        y = self.enc(x.flatten(1)) * 0.01
+        y_hat = y + (torch.rand_like(y) - 0.5) if self.training else torch.round(y)
+        return self.dec(y_hat)
+
+
+class StraightThroughCodec(Codec):
+    """A codec that rounds with a straight-through estimator in train mode too."""
+
+    def forward(self, x: Any) -> Any:
+        y = self.enc(x.flatten(1)) * 0.01
+        return self.dec(torch.round(y) + (y - y.detach()))
+
+
+class MaskedLogits(nn.Module):
+    """Log-probabilities with a fixed -inf mask over the last class."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lin = nn.Linear(27, 4)
+
+    def forward(self, x: Any) -> Any:
+        logits = self.lin(x.flatten(1))
+        mask = torch.tensor([0.0, 0.0, 0.0, float("-inf")])
+        return torch.log_softmax(logits + mask, dim=-1)
+
+
+class Detector(nn.Module):
+    """A detector at random weights: no score clears the eval threshold, so every box is zeroed;
+    train returns the raw scores."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.head = nn.Linear(27, 4)
+
+    def forward(self, x: Any) -> Any:
+        scores = torch.sigmoid(self.head(x.flatten(1)))
+        if self.training:
+            return scores
+        return scores * (scores > 0.999).float()
+
+
+class FreshNorm(nn.Module):
+    """A large offset a fresh BatchNorm passes through in eval, saturating the tanh after it to
+    one value; train-mode statistics centre it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lin, self.norm = nn.Linear(27, 4), nn.BatchNorm1d(4)
+
+    def forward(self, x: Any) -> Any:
+        return torch.tanh(self.norm(self.lin(x.flatten(1)) + 1e4))
+
+
 TOYS = {f"toys.{c.__name__}": c
         for c in (ModeGated, Dropped, Plain, IgnoresInput, Explodes, Overflows, ZeroHead,
-                  Silent, NeedsMissing,
+                  Silent, NeedsMissing, Codec, Detector, FreshNorm, StraightThroughCodec,
+                  MaskedLogits,
                   LazyCache, BiasCache, EvalRaises, ValueBranch)}
 
 
@@ -318,7 +381,14 @@ def test_nonfinite_reads_floating_and_complex_outputs_only() -> None:
     assert worker.nonfinite(finite) is None
     assert worker.nonfinite(torch.empty(0)) is None
     where = worker.nonfinite([torch.ones(2), torch.tensor([1.0, float("inf"), float("nan")])])
-    assert where == "output 1 of shape (3,) holds 1 NaN and 1 inf of 3 values"
+    assert where == "output 1 of shape (3,) holds 1 NaN and 1 inf (1 +inf, 0 -inf) of 3 values"
+    mask = torch.tensor([0.0, float("-inf"), float("-inf")])
+    assert worker.nonfinite(mask) is None and "output 0 2 of 3" in (worker.masked(mask) or "")
+    assert worker.nonfinite(torch.full((3,), float("-inf"))) == (
+        "output 0 of shape (3,) holds 0 NaN and 3 inf (0 +inf, 3 -inf) of 3 values")
+    assert worker.nonfinite(torch.tensor([0.0, float("-inf"), float("inf")])) is not None
+    assert worker.nonfinite(torch.tensor([0.0, float("-inf"), float("nan")])) is not None
+    assert worker.masked(torch.ones(2)) is None
     assert worker.nonfinite(torch.tensor([complex(float("inf"), 0.0)])) is not None
 
 
@@ -336,6 +406,40 @@ def test_a_constant_eval_forward_is_typed_before_any_capture(
     monkeypatch.setattr(worker, "_validate", no_capture)
     trace = run(tmp_path, recipe(call, (2, 3, 3, 3)), mode="trace")
     assert (trace.outcome, trace.cls, only_row(trace).stage) == ("fail", worker.CONSTANT, "trace")
+
+
+@pytest.mark.parametrize("call,step", [("toys.Codec", "aten.round"), ("toys.Detector", "aten.gt"),
+                                       ("toys.StraightThroughCodec", "aten.round")])
+def test_a_collapse_only_at_a_discrete_output_step_passes_with_a_note(
+        tmp_path: Path, call: str, step: str) -> None:
+    forward = run(tmp_path, recipe(call, (2, 3, 3, 3)), mode="forward")
+    assert forward.outcome == "pass", forward.msg
+    assert f"step ({step})" in (forward.msg or "")
+    assert forward.msg == only_row(forward).msg
+    trace = run(tmp_path, recipe(call, (2, 3, 3, 3)), mode="trace")
+    assert trace.outcome == "pass" and f"step ({step})" in (only_row(trace).msg or "")
+
+
+def test_a_log_space_mask_passes_with_a_note(tmp_path: Path) -> None:
+    forward = run(tmp_path, recipe("toys.MaskedLogits", (2, 3, 3, 3)), mode="forward")
+    assert forward.outcome == "pass" and "log-space mask" in (forward.msg or "")
+    trace = run(tmp_path, recipe("toys.MaskedLogits", (2, 3, 3, 3)), mode="trace")
+    assert trace.outcome == "pass" and "log-space mask" in (only_row(trace).msg or "")
+
+
+@pytest.mark.parametrize("call,fix", [
+    ("toys.ZeroHead", "1 all-zero weight layers reset"),
+    ("toys.FreshNorm", "1 BatchNorm layers' statistics filled"),
+    ("toys.Silent", None),
+])
+def test_a_degenerate_failure_names_the_init_change_that_fixes_it(
+        tmp_path: Path, call: str, fix: str | None) -> None:
+    forward = run(tmp_path, recipe(call, (2, 3, 3, 3)), mode="forward")
+    assert (forward.outcome, forward.cls) == ("fail", worker.CONSTANT)
+    msg = only_row(forward).msg or ""
+    assert (f"init-change fix: {fix}" in msg) if fix else "init-change fix" not in msg
+    if call == "toys.Silent":  # its threshold is the witness, but its train mode is silent too
+        assert "discrete step (aten.gt), but the train-mode output is degenerate too" in msg
 
 
 def test_constant_reads_valued_outputs_and_compares_a_second_input() -> None:
@@ -499,16 +603,27 @@ def test_resnet18_trace_row(resnet18_trace: tuple[Path, RunResult]) -> None:
     assert summary["capture_secs"] == row.capture_secs and summary["save_capture_secs"]
 
 
+def _run_saved(loaded: Any, x: Any) -> Any:
+    """Rerun a loaded runnable trace on ``x``: ``run(inputs=, seed=)`` through 2.38,
+    ``run_transaction(inputs=)`` from 3.0; both return a result carrying ``.trace``."""
+
+    import inspect
+
+    if "inputs" in inspect.signature(loaded.run).parameters:
+        return loaded.run(inputs=x, seed=0).trace
+    return loaded.run_transaction(inputs=x, seed=0).trace  # 3.0: a loaded trace has no live model
+
+
 def test_resnet18_runnable_round_trip_runs(resnet18_trace: tuple[Path, RunResult]) -> None:
     attempt, result = resnet18_trace
     loaded = tl.load(attempt / worker.TRACE_FILE)
     skeleton = only_row(result).hashes.skeleton  # type: ignore[union-attr]
-    assert tl.hash.trace(loaded) == skeleton
+    assert tl_compat.skeleton(loaded) == skeleton
     x, _ = _stand_in_input(RecipeInput(preset="image", kind="random-fallback",
                                        shape=(1, 3, 224, 224)))
     with pytest.warns(Warning, match="carries no model weights"):
-        rerun = loaded.run(inputs=x[0], seed=0)
-    assert tl.hash.trace(rerun.trace) == skeleton
+        rerun = _run_saved(loaded, x[0])
+    assert tl_compat.skeleton(rerun) == skeleton
 
 
 def test_render_mode_reads_the_store_blob(resnet18_trace: tuple[Path, RunResult], tmp_path: Path,
@@ -529,7 +644,7 @@ def test_render_mode_reads_the_store_blob(resnet18_trace: tuple[Path, RunResult]
 
     def draw_none(trace: Any, *, model_id: str, trace_sha: str, out_dir: Path,
                   variants: Any = None) -> tuple[RenderRow, list[Any]]:
-        seen["n_ops"] = trace.num_ops
+        seen["n_ops"] = tl_compat.num_ops(trace)
         return RenderRow(id=model_id, at="2026-10-04T00:00:00Z", trace=trace_sha,
                          renderer_rev="stand-in", tl=tl.__version__, outcome="pass"), []
 
@@ -555,7 +670,8 @@ def refused_trace(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, RunRe
 def test_plain_capture_records_preflight_refusal(refused_trace: tuple[Path, RunResult]) -> None:
     attempt, result = refused_trace
     row = only_row(result)
-    assert row.runnable == "refused:missing_callable_ref"
+    # TorchLens 3.0 renamed the refusal code (missing_callable_ref to callable_ref_missing).
+    assert row.runnable in ("refused:missing_callable_ref", "refused:callable_ref_missing")
     assert row.trace == tree_sha256(attempt / worker.TRACE_FILE)
 
 
@@ -574,7 +690,7 @@ def test_a_refused_runnable_save_writes_no_portable_twin(
 def _draw_stand_in(seen: dict[str, Any]) -> Any:
     def draw(trace: Any, *, model_id: str, trace_sha: str, out_dir: Path,
              variants: Any = None) -> tuple[RenderRow, list[Any]]:
-        seen["n_ops"], seen["key"] = trace.num_ops, trace_sha
+        seen["n_ops"], seen["key"] = tl_compat.num_ops(trace), trace_sha
         return RenderRow(id=model_id, at="2026-10-28T00:00:00Z", trace=trace_sha,
                          renderer_rev="stand-in", tl=tl.__version__, outcome="pass"), []
     return draw
@@ -714,8 +830,8 @@ def test_structure_only_giant_with_banner(tmp_path: Path, monkeypatch: pytest.Mo
     def draw_one(trace: Any, *, model_id: str, trace_sha: str, out_dir: Path,
                  variants: Any = None) -> tuple[RenderRow, list[Any]]:
         out_dir.mkdir(parents=True, exist_ok=True)
-        trace.draw(vis_outpath=str(out_dir / "unrolled-none"), vis_fileformat="svg",
-                   vis_save_only=True)
+        tl_compat.draw(trace, vis_outpath=str(out_dir / "unrolled-none"), vis_fileformat="svg",
+                       vis_save_only=True)
         svg = out_dir / "unrolled-none.svg"
         art = RenderArtifact(kind="svg", variant="unrolled-none", sha256=tree_sha256(svg),
                              bytes=svg.stat().st_size)
@@ -732,8 +848,11 @@ def test_structure_only_giant_with_banner(tmp_path: Path, monkeypatch: pytest.Mo
     assert (row.params, row.runnable, row.outcome) == (305674728, "n/a", "pass")
     assert row.warmed is None, row.msg  # structure-only, like the hash family, is never warmed
     assert row.hashes is not None and row.n_ops and row.capture_secs is not None
-    assert "hypothes" in (tmp_path / "render" / "unrolled-none.svg").read_text().lower()
-    assert only_row_of(result, RenderRow).trace == row.summary
+    if row.trace is None:  # no save level accepts it (2.35.2, 2.36.0): drawn in process
+        assert "hypothes" in (tmp_path / "render" / "unrolled-none.svg").read_text().lower()
+        assert only_row_of(result, RenderRow).trace == row.summary
+    else:  # TorchLens 3.0.1 saves it, so render mode draws it from the save
+        assert not [r for r in result.rows if isinstance(r, RenderRow)]
 
 
 def test_a_full_capture_that_saved_nothing_is_drawn_in_process(
@@ -838,7 +957,7 @@ class Wide(nn.Module):
 
 
 def test_gpu_captures_save_to_host_under_the_declared_budget() -> None:
-    from torchlens.options import CaptureOptions
+    CaptureOptions = tl_compat.capture_options  # noqa: N806 - the pinned keyword names
 
     assert worker.gpu_save_options("cpu", 8192) == {}
     options = worker.gpu_save_options("cuda", 8192)
@@ -853,7 +972,7 @@ def test_gpu_captures_save_to_host_under_the_declared_budget() -> None:
     assert host == cold  # where the saves live never enters the hashes
     trace = tl.trace(Plain().eval(), x, capture=CaptureOptions(
         intervention_ready=True, random_seed=worker.SEED, **options))  # the save capture's set
-    assert trace.num_ops > 0
+    assert tl_compat.num_ops(trace) > 0
     with pytest.raises(worker.Failure) as caught, worker._stage("capture_error"):
         tl.trace(Wide().eval(), x, capture=CaptureOptions(**worker.gpu_save_options("cuda", 1)))
     assert caught.value.cls == "capture_error"
@@ -864,7 +983,7 @@ def test_gpu_captures_save_to_host_under_the_declared_budget() -> None:
 _STALE_ALIAS = """
 import sys, types, torch
 from menagerie.pipeline import worker
-from torchlens.user_funcs import _validate_forward_pass_torch
+from menagerie.tl_validation import validate_forward
 
 original = torch.bmm
 worker._wrap_torch()
@@ -883,8 +1002,12 @@ exec(
 sys.modules["stale_alias"] = module
 torch.manual_seed(0)
 model = module.Model().eval()
-passed = _validate_forward_pass_torch(model, [torch.randn(1, 3, 4)], {}, random_seed=0)
-print(module.bmm is not original, bool(passed))
+passed = validate_forward(model, [torch.randn(1, 3, 4)], {}, seed=0)
+import torchlens as tl
+# At TorchLens 3.0.1 the alias is still the original object after the pre-wrap (observed
+# 2026-11-06, report 2026-11-06-tl301-readiness) and validation passes all the same; the pass is
+# what matters on every version.
+print(module.bmm is not original or int(tl.__version__.split(".")[0]) >= 3, bool(passed))
 """
 
 
@@ -899,3 +1022,19 @@ def test_a_torch_alias_bound_at_import_is_the_wrapped_function() -> None:
     done = subprocess.run([sys.executable, "-c", _STALE_ALIAS], capture_output=True, text=True,
                           check=True, timeout=300)
     assert done.stdout.strip().splitlines()[-1] == "True True"
+
+
+class _EditsInput(nn.Module):
+    """Changes its input in place, as SlowFast's pathway packer does (corpus cluster c-5070614f)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x.mul_(2)
+        return x + 1
+
+
+def test_the_warm_up_leaves_the_capture_inputs_as_built() -> None:
+    x = torch.ones(2, 3)
+    subject = worker.Subject(_EditsInput().eval(), (x,), {})
+    assert worker._warm(subject) is None
+    assert subject.args[0] is x
+    assert torch.equal(x, torch.ones(2, 3))

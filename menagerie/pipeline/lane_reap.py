@@ -1,4 +1,4 @@
-"""Remove a finished 2b or describe worker lane's run-on checkout once the hub holds what it made
+"""Remove a finished 2b, 2a or describe worker lane's run-on checkout once the hub holds its work
 (the tick's ``lane_reap`` step).
 
 A lane's checkout is about a third of a gigabyte on its worker. Everything it made reaches the
@@ -112,7 +112,8 @@ def candidates(root: Path, leases: Path, briefs: Path, pending: set[str], held: 
     since = (now - timedelta(hours=window_h)).timestamp()
     ready: list[tuple[float, str]] = []
     waiting = {"lease": 0, "uncommitted": 0}
-    markers = [*root.glob("2b-mini-*/ingested.json"), *root.glob("describe-mini-*/ingested.json")]
+    markers = [*root.glob("2b-mini-*/ingested.json"), *root.glob("describe-mini-*/ingested.json"),
+               *root.glob("2a-mini-*/ingested.json")]
     for marker in markers:
         folder = marker.parent
         if folder.name not in held:

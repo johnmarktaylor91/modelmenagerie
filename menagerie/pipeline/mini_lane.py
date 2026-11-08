@@ -6,11 +6,15 @@ and family folders into ``.mini-lane/`` in the job's checkout, answers the verb 
 lane's wrappers queue in ``.mini-lane/spool/``, and after the job ends pulls ``outputs/lane/``
 with ``pull-outputs``. No runtime installation, credentials or SSH configuration happens here.
 A describe lane (manifest ``kind`` ``describe``) has no verbs: its agent reads the staged batch
-folder beside its brief and writes ``out/<family>.json`` there, which ``finish`` returns.
+folder beside its brief and writes ``out/<family>.json`` there, which ``finish`` returns. A 2a lane
+(``kind`` ``2a``) has one verb wrapper for the lane, ``work/<lane>/menagerie``, a ``gh`` wrapper
+on its PATH for ``gh search``, the agent's own web tools (manifest ``web``), and returns its
+``drafts/`` folder as evidence.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -101,10 +105,22 @@ def wrapper_text(root: Path, family: str) -> str:
 
 def write_wrappers(root: Path, families: Sequence[str]) -> None:
     for family in families:
-        path = root / "work" / family / "menagerie"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(wrapper_text(root, family), encoding="utf-8")
-        path.chmod(0o755)
+        _wrapper(root / "work" / family / "menagerie", wrapper_text(root, family))
+
+
+def _wrapper(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def write_2a_wrappers(root: Path, lane: str) -> Path:
+    """A 2a lane's verb wrapper and its ``gh`` (``bin/gh``, queued as the ``gh`` verb); returns
+    the folder to put first on the agent's PATH."""
+    _wrapper(root / "work" / lane / "menagerie", wrapper_text(root, lane))
+    text = wrapper_text(root, lane).replace(' "$@"\n', ' gh "$@"\n')
+    _wrapper(root / "bin" / "gh", text)
+    return root / "bin"
 
 
 def verb(root: Path, family: str, args: Sequence[str], *, wait: float = VERB_WAIT_S) -> int:
@@ -168,7 +184,20 @@ def snapshot(root: Path, name: str, family: str) -> dict[str, Any]:
         return {"refused": f"drafts too large for the hub ({len(files)} files, {total} bytes)"}
     if files:
         _copy_drafts(folder, dest / family)
-    return {"files": len(files), "bytes": total, "skipped": skipped}
+    return {"files": len(files), "bytes": total, "skipped": skipped,
+            "digest": _digest(dest / family)}
+
+
+def _digest(folder: Path) -> str:
+    """One hash over the snapshot's file names and contents, read from the copy the hub scans:
+    the hub skips its leak scan and copy when the drafts it last brought in are unchanged
+    (``mini_relay.Lane.bring_in``)."""
+    whole = hashlib.sha256()
+    files = sorted(p for p in folder.rglob("*") if p.is_file()) if folder.is_dir() else []
+    for path in files:
+        body = hashlib.sha256(path.read_bytes()).hexdigest()
+        whole.update(f"{path.relative_to(folder)}\0{body}\n".encode())
+    return whole.hexdigest()
 
 
 def finish(root: Path, out: Path, spec: Mapping[str, Any], rc: int | None) -> bool:
@@ -177,6 +206,9 @@ def finish(root: Path, out: Path, spec: Mapping[str, Any], rc: int | None) -> bo
     if spec.get("kind") == "describe":
         drafts = root / Path(spec["brief"]).parent / "out"
         skipped = {"out": _copy_drafts(drafts, out / "describe")} if drafts.is_dir() else {}
+    elif spec.get("kind") == "2a":
+        drafts = root / Path(spec["brief"]).parent / "drafts"
+        skipped = {"drafts": _copy_drafts(drafts, out / "drafts")} if drafts.is_dir() else {}
     else:
         skipped = {family: _copy_drafts(root / "work" / family, out / "families" / family)
                    for family in spec["families"] if (root / "work" / family).is_dir()}
@@ -194,8 +226,10 @@ def agent_argv(spec: Mapping[str, Any]) -> list[str]:
     runtime = expand(spec["runtime"], {"job": spec["label"], "account": spec["account"]})
     if spec.get("nice"):  # on a phone-build mini, below the phone builds' priority
         runtime = ["nice", "-n", str(int(spec["nice"])), *runtime]
+    # A 2a lane (manifest ``web``) keeps the agent's own web tools; no lane gets the executor.
+    blocked = "mcp__executor" if spec.get("web") else "WebFetch,WebSearch,mcp__executor"
     return [*runtime, "--model", spec["model"], "--effort", spec["effort"],
-            "--dangerously-skip-permissions", "--disallowedTools", "WebFetch,WebSearch,mcp__executor",
+            "--dangerously-skip-permissions", "--disallowedTools", blocked,
             "--disable-slash-commands", "--strict-mcp-config", "-p"]
 
 
@@ -217,7 +251,10 @@ def run(spec: Mapping[str, Any], cwd: Path | None = None) -> int:
     try:
         wait_ready(root, float(spec.get("stage_timeout_s", STAGE_TIMEOUT_S)))
         env = runtime_env(spec)
-        if spec.get("kind") != "describe":  # a describe lane has no verbs
+        if spec.get("kind") == "2a":
+            path = write_2a_wrappers(root, Path(spec["brief"]).parent.name)
+            env = {**env, "PATH": f"{path}{os.pathsep}{env.get('PATH', '')}"}
+        elif spec.get("kind") != "describe":  # a describe lane has no verbs
             write_wrappers(root, spec["families"])
         brief = root / spec["brief"]
         with (out / "agent.log").open("w", encoding="utf-8") as log:

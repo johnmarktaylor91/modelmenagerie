@@ -28,11 +28,15 @@ export const CATEGORY_LABELS: Readonly<Record<string, string>> = {
   "neuro_scientific-signals": "Neuroscience signals",
   "medical-imaging": "Medical imaging",
   exotic_other: "Other",
-  history: "Assorted",
+  history: "Historical",
 };
 
-/** Catch-all categories listed after the named ones, whatever their size. */
-const TRAILING_CATEGORIES = new Set(["exotic_other", "history"]);
+/** Categories listed after the named ones, whatever their size, in this order: the catch-all "Other" comes last. */
+const TRAILING_ORDER = ["history", "exotic_other"];
+const trailingRank = (value: string) => {
+  const index = TRAILING_ORDER.indexOf(value);
+  return index === -1 ? 0 : index + 1;
+};
 
 /** Size buckets by recorded operation count; values match the catalog's size facet. */
 export const SIZE_LABELS: Readonly<Record<string, string>> = {
@@ -96,6 +100,12 @@ export function isPresent(value: string | null | undefined): value is string {
   return trimmed !== "" && trimmed !== "unknown" && trimmed !== "pending";
 }
 
+/** The value when it is a web address (http or https), else null: repository paths are not links. */
+export function webUrl(value: string | null | undefined): string | null {
+  const trimmed = (value ?? "").trim();
+  return /^https?:\/\/\S+$/i.test(trimmed) ? trimmed : null;
+}
+
 /** Turn an unmapped slug into words: "foo_bar-baz" becomes "Foo bar baz". */
 function humanizeSlug(slug: string): string {
   const words = slug.replace(/[_-]+/g, " ").trim();
@@ -105,6 +115,20 @@ function humanizeSlug(slug: string): string {
 /** Return the plain-word label for a category slug. */
 export function categoryLabel(slug: string): string {
   return CATEGORY_LABELS[slug] ?? humanizeSlug(slug);
+}
+
+/** The catch-all category the describe step leaves unlabelled; it reads "Other" only in the task filter. */
+export const UNSORTED_CATEGORY = "exotic_other";
+
+/**
+ * The task as a card, list row, heading or At-a-glance row prints it: "" for the catch-all
+ * category, which says nothing about the model (the task filter still lists it as "Other").
+ */
+export function taskLabel(slug: string | null | undefined): string {
+  if (!slug || slug === UNSORTED_CATEGORY) {
+    return "";
+  }
+  return categoryLabel(slug);
 }
 
 /** Return the plain-word label for a size bucket. */
@@ -167,7 +191,7 @@ export function labelCategoryFacets(facets: readonly FacetValue[]): LabelledFace
     .map((facet) => ({ ...facet, label: categoryLabel(facet.value) }))
     .sort(
       (left, right) =>
-        Number(TRAILING_CATEGORIES.has(left.value)) - Number(TRAILING_CATEGORIES.has(right.value)) ||
+        trailingRank(left.value) - trailingRank(right.value) ||
         right.count - left.count ||
         left.label.localeCompare(right.label),
     );
@@ -184,4 +208,115 @@ export function labelSizeFacets(facets: readonly FacetValue[]): LabelledFacet[] 
 /** A facet group is worth showing only when it can actually narrow the results. */
 export function isUsefulFacet(facets: readonly FacetValue[]): boolean {
   return facets.filter((facet) => facet.count > 0).length >= 2;
+}
+
+/**
+ * The plain name of a licence identifier. arXiv's distribution licence covers the paper, not
+ * code, so it says so; other SPDX identifiers are shown as they are.
+ */
+export function licenceLabel(spdx: string): string {
+  return /^LicenseRef-arXiv/i.test(spdx) ? "arXiv non-exclusive license (paper)" : spdx;
+}
+
+/**
+ * Short forms for the commonest long venue names, matched on the cleaned venue string. The
+ * label replaces the whole string; a venue that names a repository rather than a publication
+ * maps to "" and is not printed.
+ */
+const VENUE_SHORT_FORMS: ReadonlyArray<[RegExp, string]> = [
+  [/Computer Vision and Pattern Recognition Workshops|\(CVPRW\)/i, "CVPR Workshops"],
+  [/Conference on Computer Vision and Pattern Recognition|\(CVPR\)/i, "CVPR"],
+  [/International Conference on Computer Vision Workshops|\(ICCVW\)/i, "ICCV Workshops"],
+  [/International Conference on Computer Vision|\(ICCV\)/i, "ICCV"],
+  [/European Conference on Computer Vision.*Workshops/i, "ECCV Workshops"],
+  [/European Conference on Computer Vision|\(ECCV\)/i, "ECCV"],
+  [/^(Advances in )?neural information processing systems$/i, "NeurIPS"],
+  [/North American Chapter of the Association for Computational Linguistics/i, "NAACL"],
+  [/Annual Meeting of the Association for Computational Linguistics/i, "ACL"],
+  [/Empirical Methods in Natural Language Processing/i, "EMNLP"],
+  [/AAAI Conference on Artificial Intelligence/i, "AAAI"],
+  [/^(Proceedings of the )?International Conference on Machine Learning$/i, "ICML"],
+  [/^International Conference on Learning Representations$/i, "ICLR"],
+  [/Conference on Artificial Intelligence and Statistics/i, "AISTATS"],
+  [/International Conference on Acoustics,? Speech,? and Signal Processing/i, "ICASSP"],
+  [/Medical Image Computing and Computer[- ]Assisted Intervention/i, "MICCAI"],
+  [/Transactions on Pattern Analysis and Machine Intelligence/i, "IEEE TPAMI"],
+  [/^International Journal of Computer Vision$/i, "IJCV"],
+  [/Winter Conference on Applications of Computer Vision/i, "WACV"],
+  [/^British Machine Vision Conference$/i, "BMVC"],
+  [/^arXiv \(Cornell University\)$/i, "arXiv"],
+  [/^Lecture notes in computer science$/i, "Lecture Notes in Computer Science"],
+  // Repositories that hold a copy of the paper, not where it was published.
+  [/^(CaltechAUTHORS|Zenodo)\b/i, ""],
+];
+
+/**
+ * The venue with repeated segments dropped: catalog venues sometimes join the same name twice
+ * ("X/Proceedings - X/Proceedings"). Segments are split on " - " and "/"; a bare "Proceedings"
+ * and any segment already seen (ignoring case and a leading "Proceedings") are dropped.
+ */
+export function dedupeVenue(venue: string): string {
+  const pieces = venue.trim().split(/(\s+-\s+|\/)/);
+  const seen = new Set<string>();
+  let out = "";
+  for (let index = 0; index < pieces.length; index += 2) {
+    const segment = pieces[index].trim();
+    const key = segment.toLowerCase().replace(/^proceedings(\s+of(\s+the)?)?\s*/, "");
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out += out ? `${pieces[index - 1] ?? " - "}${segment}` : segment;
+  }
+  return out;
+}
+
+/**
+ * The venue as the Published row prints it: deduplicated, then shortened when it is one of the
+ * commonest long names. `short` is true when the label is a short form (the caller may append
+ * the year to it, "CVPR 2022"). "" means the venue is not worth printing.
+ */
+export function venueLabel(venue: string): { label: string; short: boolean } {
+  const clean = dedupeVenue(venue);
+  const withoutYear = clean.replace(/^(19|20)\d\d\s+/, "");
+  for (const [pattern, label] of VENUE_SHORT_FORMS) {
+    if (pattern.test(withoutYear)) {
+      return { label, short: label !== "" };
+    }
+  }
+  return { label: clean, short: false };
+}
+
+/**
+ * Where the code comes from, said from its web address when the catalog's own source name is
+ * not a package: "GitHub: owner/repo", "PyPI package", "Hugging Face: org/name", or the host.
+ * Null when the address is not a web address.
+ */
+export function sourceUrlLabel(url: string | null | undefined): string | null {
+  const href = webUrl(url);
+  if (!href) {
+    return null;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(href);
+  } catch {
+    return null;
+  }
+  const host = parsed.hostname.replace(/^www\./, "").toLowerCase();
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (host === "github.com" && parts.length >= 2) {
+    return `GitHub: ${parts[0]}/${parts[1].replace(/\.git$/, "")}`;
+  }
+  if (host === "github.com") {
+    return "GitHub";
+  }
+  if (host === "pypi.org") {
+    return "PyPI package";
+  }
+  if (host === "huggingface.co") {
+    const repo = parts[0] === "spaces" || parts[0] === "datasets" ? parts.slice(1, 3) : parts.slice(0, 2);
+    return repo.length ? `Hugging Face: ${repo.join("/")}` : "Hugging Face";
+  }
+  return host || null;
 }

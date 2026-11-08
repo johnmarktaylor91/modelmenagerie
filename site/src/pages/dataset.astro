@@ -1,12 +1,12 @@
 ---
 import CopyCode from "@/components/CopyCode.astro";
 import BaseLayout from "@/layouts/BaseLayout.astro";
-import { getFunnel, getManifest } from "@/lib/catalog";
-import { datasetColumns, datasetFiles, exportDate, formatDate } from "@/lib/dataset";
+import { getManifest } from "@/lib/catalog";
+import { checkedByVersion, getSiteCounts } from "@/lib/counts";
+import { datasetColumns, datasetFiles, exportDate, formatDate, pythonExample } from "@/lib/dataset";
 import { shareImagePath } from "@/lib/seo";
 import { CONTENT_LICENCE, CREATOR, SITE_NAME, SITE_URL, TORCHLENS, TORCHLENS_BIBTEX, releaseVersion, siteBibtex, siteCitation } from "@/lib/site";
 
-const funnel = getFunnel();
 const manifest = getManifest();
 const number = new Intl.NumberFormat("en");
 const megabytes = new Intl.NumberFormat("en", { maximumFractionDigits: 1 });
@@ -23,29 +23,27 @@ function formatBytes(bytes: number): string {
 const downloads = datasetFiles().map((item) => ({ ...item, size: formatBytes(item.bytes) }));
 const columns = datasetColumns();
 
-const modelCount = manifest.counts.models ?? funnel.rendered;
-const checkedCount = funnel.forward_validated_real + funnel.forward_validated_wrapper;
+// Every count comes from the export's funnel and manifest, dated by its as_of.
+const siteCounts = getSiteCounts();
+const modelCount = manifest.counts.models ?? siteCounts.validated;
 const counts = [
-  { label: "Models", value: modelCount },
-  { label: "Checked by replay", value: checkedCount },
-].filter((item) => item.value > 0);
+  { label: "Models with a checked diagram", value: siteCounts.validated, key: "validated" },
+  { label: "Graph structure only", value: siteCounts.structureOnly, key: "structure" },
+  { label: "Distinct architectures", value: siteCounts.distinctArchitectures },
+  { label: "Entries in the catalog", value: siteCounts.rosterNames, key: "roster" },
+].filter((item): item is { label: string; value: number; key?: string } => (item.value ?? 0) > 0);
+const hasStates = siteCounts.structureOnly !== null;
 
-const csvUrl = new URL("/dataset/catalog.csv", SITE_URL).href;
-const jsonlUrl = new URL("/dataset/models.jsonl", SITE_URL).href;
-const pandasExample = `import pandas as pd
-
-models = pd.read_csv("${csvUrl}")
-print(models[["display_name", "category", "n_ops"]].head())
-
-# Every drawing of every model, with file addresses and checksums:
-records = pd.read_json("${jsonlUrl}", lines=True)`;
+const pandasExample = pythonExample(datasetFiles(), SITE_URL);
+const hasRecordsFile = downloads.some((item) => item.file.startsWith("models.jsonl"));
+const versions = checkedByVersion();
 
 const jsonLd = {
   "@context": "https://schema.org",
   "@type": "Dataset",
   name: `${SITE_NAME} catalog`,
   description:
-    "One record per neural network in the Model Menagerie: name, task, architecture family and operation count, with links to its TorchLens computational graph diagrams and their checksums.",
+    "One record per neural network in Model Menagerie: name, task, architecture family and operation count, with links to its TorchLens computational graph diagrams and their checksums.",
   url: new URL("/dataset/", SITE_URL).href,
   ...(version ? { version } : {}),
   ...(asOf ? { dateModified: asOf } : {}),
@@ -78,8 +76,10 @@ const jsonLd = {
     {version && <p class="chip mb-3">Release {version}</p>}
     <h1 class="text-3xl font-semibold sm:text-4xl">Dataset</h1>
     <p class="lead mt-4 text-secondary">
-      The whole catalog in one file: one record per model with its name, task, family and operation count, and the
-      address, checksum and size of every diagram file.
+      The CSV has one row for each of the {number.format(modelCount)} models with a diagram: its name, task, family,
+      operation count and how it was checked.{hasRecordsFile && (
+        <> The JSON Lines file has each model's full record, with the address, checksum and size of every diagram file.</>
+      )}
     </p>
 
     {
@@ -104,14 +104,14 @@ const jsonLd = {
           counts.map((item) => (
             <div>
               <dt class="text-secondary">{item.label}</dt>
-              <dd>{number.format(item.value)}</dd>
+              <dd data-count={item.key}>{number.format(item.value)}</dd>
             </div>
           ))
         }
         {
           asOf && (
             <div>
-              <dt class="text-secondary">Built</dt>
+              <dt class="text-secondary">Counts as of</dt>
               <dd>
                 <time datetime={asOf}>{formatDate(asOf)}</time>
               </dd>
@@ -121,9 +121,20 @@ const jsonLd = {
       </dl>
       <p class="text-secondary">
         {
-          checkedCount === 0
-            ? "Each record is a model TorchLens built, ran and drew. Whether each capture passed the replay check, and each model's source, licence and paper, come in later releases."
-            : "Each record is a model TorchLens built, ran and drew. Source, licence and paper details fill in with later releases."
+          hasStates ? (
+            <>
+              Each record is a model built from its published code, then traced and drawn with TorchLens. A checked record
+              was replayed operation by operation and passed its check; a structure-only record has the graph's structure
+              without that check. The{" "}
+              <code>validation_state</code> column says which.{versions.length > 1 && (
+                <> Checked records by TorchLens version: {new Intl.ListFormat("en", { type: "conjunction" }).format(versions.map((row) => `${number.format(row.checked)} with ${row.version}`))}; the{" "}
+                <code>torchlens_version</code> column gives each record's version.</>
+              )} The catalog's entry count includes every model collected so far, drawn or not; models without a diagram
+              are not in these files.
+            </>
+          ) : (
+            "Each record is a model built from its published code, then traced and drawn with TorchLens. Source, license and paper details fill in with later releases."
+          )
         }
         {" "}
         <a class="textlink" href="/changelog/">What changed in each release</a>.
@@ -132,13 +143,13 @@ const jsonLd = {
 
     <section aria-labelledby="python">
       <h2 id="python">Load it in Python</h2>
-      <CopyCode code={pandasExample} label="Copy the Python example" name="Python example" />
+      {pandasExample && <CopyCode code={pandasExample} label="Copy the Python example" name="Python example" />}
     </section>
 
     <section aria-labelledby="fields">
       <h2 id="fields">Columns</h2>
       <p class="text-secondary">
-        The CSV has one row per model. The JSON Lines file has the same fields, plus the ones marked JSON Lines only.
+        The CSV has one row per model and no diagram files.{hasRecordsFile && " The JSON Lines file has the same fields, plus the ones marked JSON Lines only."}
         Empty means not recorded yet.
       </p>
       <details class="panel mt-3">
@@ -159,8 +170,8 @@ const jsonLd = {
       </details>
     </section>
 
-    <section aria-labelledby="licence">
-      <h2 id="licence">Licence and reuse</h2>
+    <section aria-labelledby="license">
+      <h2 id="license">License and reuse</h2>
       <p>
         The dataset, the diagrams and the site's text are free to reuse under
         <a class="textlink" href={CONTENT_LICENCE.url} rel="license">{CONTENT_LICENCE.name} ({CONTENT_LICENCE.short})</a>:
@@ -168,8 +179,8 @@ const jsonLd = {
       </p>
       <p class="mt-3">
         Each diagram is this site's drawing of a trace of a model's code. It is not the code or the weights, which stay
-        under their own licences; the <span class="mono">source_license</span> column gives the code's licence where it is
-        recorded. More on the <a class="textlink" href="/legal/">privacy and licences page</a>.
+        under their own licenses; the <span class="mono">source_license</span> column gives the code's license where it is
+        recorded. More on the <a class="textlink" href="/legal/">privacy and licenses page</a>.
       </p>
     </section>
 

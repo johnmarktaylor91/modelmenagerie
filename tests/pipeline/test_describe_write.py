@@ -18,9 +18,11 @@ from menagerie.pipeline import (
     describe_workers,
     describe_write,
     mini_relay,
+    paper_check,
     publish,
     review,
     tick_full,
+    write_json,
 )
 from menagerie.pipeline import drive as drive_mod
 from menagerie.pipeline import store as store_mod
@@ -90,6 +92,7 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(publish, "torchlens_pin", lambda: TL)
     monkeypatch.setenv("MENAGERIE_LANES_DESCRIBE", "1")
     monkeypatch.setattr(tick_full, "hub_slots", lambda: 4)
+    monkeypatch.setattr(paper_check, "matches", lambda *a, **k: True)  # test_paper_check has it
     launches, runs = [], {}
 
     def launch(kind, role, brief, **kw):
@@ -147,6 +150,18 @@ def _earlier_family(data, pin):
     row = {**json.loads(data.ledger("2026-10").read_text()), "id": "m3631", "tl": pin}
     with data.ledger("2026-10").open("a") as handle:
         handle.write(json.dumps(row) + "\n")
+
+
+def test_a_record_that_read_a_retired_text_goes_first(tmp_path, world, monkeypatch):
+    data = _data(tmp_path)
+    _earlier_family(data, "2.35.2")
+    monkeypatch.setenv(describe_write.EARLIER_PINS, "1")
+    assert describe_write.due(None, data=data, tl=TL) == ["f-resnet", "f-beit"]
+    write_json(DescribeRecord(family="f-beit", by="describe", inputs=("s9",),
+                              summary_markdown="A vision transformer.", basis="full"),
+               data.describe("f-beit"))
+    monkeypatch.setattr(describe_write.paper_check, "retired_raw", lambda raw: frozenset({"s9"}))
+    assert describe_write.due(None, data=data, tl=TL) == ["f-beit", "f-resnet"]
 
 
 def test_earlier_pin_families_follow_the_current_pin_only_when_switched_on(tmp_path, world, monkeypatch):
@@ -509,7 +524,10 @@ def test_jev_profile_tracks_the_vocabularies_and_the_prompt_is_short():
     for name in describe_jev.VOCAB_FIELDS:
         assert set(profile["questions"][name]["criteria"]) == set(describe_jev.vocabularies()[name]) | {"unknown"}
     assert profile["questions"]["is_generative"]["type"] == "noul" and profile["name"] == describe_jev.PROFILE
-    assert len(describe_write.PROMPT.read_text().splitlines()) < 80
+    # A creep guard, not a style rule: prompt v2 (decisions.md 2026-11-05, site prose pass) grew the
+    # prompt from 78 to 104 lines with reader-facing wording rules on purpose. Raise it only for a
+    # deliberate rule change; never meet it by rewrapping lines.
+    assert len(describe_write.PROMPT.read_text().splitlines()) < 110
 
 
 def _many(data, monkeypatch, count):
@@ -745,3 +763,16 @@ def test_a_lost_worker_lane_is_returned_like_a_failed_hub_lane(tmp_path, world, 
     assert (row["verdict"], row["run"]) == ("returned", "wrun-2")
     assert row["findings"] == ["the lane wrote no draft"]
     assert started[1]["brief"].name == "BRIEF-r2.md"
+
+
+def test_a_worker_lane_whose_agent_never_started_starts_again_without_the_return(tmp_path, world, monkeypatch):
+    data = _data(tmp_path)
+    started = _on_workers(world, monkeypatch)
+    describe_write.write(None, data=data, store=world["store"])
+    world["runs"]["wrun-1"]["state"] = "TERMINAL"
+    state = mini_relay.state_dir("describe-mini-1")
+    state.mkdir(parents=True)
+    (state / "staged.json").write_text('{"phase": "aborted"}')
+    [row] = describe_write.write(None, data=data, store=world["store"])
+    assert (row["verdict"], row["run"]) == ("relaunched", "wrun-2")
+    assert started[1]["brief"].name == "BRIEF.md" and not (started[1]["brief"].parent / "BRIEF-r2.md").exists()

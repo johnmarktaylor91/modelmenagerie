@@ -362,7 +362,7 @@ def _write_readme(dist_dir: Path, manifest: dict[str, Any]) -> None:
     if manifest.get("full_bundle", {}).get("skipped"):
         bundle_lines.append(f"- menagerie_full.zip: skipped ({manifest['full_bundle']['reason']})")
     lines = [
-        "# TorchLens Menagerie Distribution",
+        "# Model Menagerie Distribution",
         "",
         f"- Dataset schema version: {manifest['dataset_schema_version']}",
         f"- Dataset as-of date: {manifest['dataset_as_of_date']}",

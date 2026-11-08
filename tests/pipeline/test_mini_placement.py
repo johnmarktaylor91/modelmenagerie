@@ -1,12 +1,15 @@
 """Remote recipe placement keeps hub admission and canonical data separate."""
 
+import json
+import re
+from datetime import datetime, timezone
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from menagerie.pipeline import DataLayout, admission, drive, runner, tick, tick_full
+from menagerie.pipeline import DataLayout, admission, drive, pause, runner, tick, tick_full
 
 
 def worker(**changes: Any) -> dict[str, Any]:
@@ -129,6 +132,24 @@ def test_no_slots_while_the_relay_is_down(monkeypatch: pytest.MonkeyPatch) -> No
     assert mini_placement.status(cfg)["worker-a"] == "held: bridge or mini relay not serving"
 
 
+def test_research_and_describe_keep_mini_slots_while_only_the_bridge_is_down(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from menagerie.pipeline import mini_placement, mini_relay
+
+    monkeypatch.setattr(runner, "serving", lambda path: False)  # runner A's host paused
+    monkeypatch.setattr(mini_relay, "serving", lambda: True)
+    monkeypatch.setattr(admission, "lanes", lambda **kw: [])
+    cfg = {"mini_workers": {"worker-a": worker()}}
+    assert mini_placement.slots(cfg) == ["worker-a"]
+    assert mini_placement.ready("2a") and mini_placement.ready("describe")
+    assert not mini_placement.ready("2b")
+    with pytest.raises(admission.Refused, match="relay not serving"):
+        mini_placement._admissible("worker-a", worker(), cfg)  # a 2b lane
+    assert mini_placement._admissible("worker-a", worker(), cfg, kind="2a")["cap"] == 1
+    monkeypatch.setattr(mini_relay, "serving", lambda: False)
+    assert mini_placement.slots(cfg) == [] and not mini_placement.ready("2a")
+
+
 def test_phone_first_mini_refuses_while_its_phone_lock_is_busy(monkeypatch: pytest.MonkeyPatch) -> None:
     import subprocess
 
@@ -216,7 +237,8 @@ def test_guard_applies_to_every_placement(scheduler: Any, monkeypatch: pytest.Mo
     assert result["2b"] == []
     assert result["2b_placements"] == []
     assert result["waiting_2b"] == 4
-    assert set(result["2b_minis"].values()) == {"held: bridge or mini relay not serving"}
+    # the relay still serves, so the minis keep their slots for 2a and describe; only 2b waits
+    assert all(v.endswith("; 2b held: bridge not serving") for v in result["2b_minis"].values())
 
 
 def test_minis_do_not_create_hub_research_slots(scheduler: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -282,8 +304,15 @@ def test_submit_pins_source_and_registers_durable_parent(tmp_path: Path, monkeyp
     assert "--no-fallback" in argv
     # The lane's checkout leaves out the bulk data it never reads (ledger, store index, roster).
     excluded = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--sparse-exclude"]
-    assert excluded == list(mini_placement.LANE_SPARSE_EXCLUDE)
+    assert excluded == list(mini_placement.sparse_exclude("2b"))
     assert "menagerie/data/ledger/" in excluded and "--full" not in argv
+    # A 2b lane also leaves out research packets and the crawler; it keeps the adapters and model
+    # records its agents read. Other lanes keep only the shared list.
+    assert {"menagerie/data/research/", "menagerie/crawler/", "research/"} <= set(excluded)
+    assert not any(p.startswith(("menagerie/data/adapters", "menagerie/data/models",
+                                 "menagerie/classics", "menagerie/pipeline")) for p in excluded)
+    assert mini_placement.sparse_exclude("describe") == mini_placement.LANE_SPARSE_EXCLUDE
+    assert all(re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._/@+=-]*", p) for p in excluded)  # run-on's rule
     # The worker runs the stdlib-only lane file with its system Python, by absolute path so a
     # Homebrew python3 first on the job's PATH never becomes the Mac's privacy subject, and never
     # names the hub.
@@ -623,6 +652,11 @@ def test_trace_host_lanes_use_the_room_a_cannot_reach_when_2b_stays_off_the_hub(
     assert mini_placement.host_cap("linux-a", quarter, {**cfg, "mini_workers": {**minis, "linux-a": quarter}}) == (12, "")
     # With 2b on the hub, A keeps its reservation for the whole 2b cap, as before.
     assert mini_placement.host_cap("linux-a", trace, {**cfg, "2b_on_hub": True})[0] == 3
+    # A hub 2b cap reserves A for those hub lanes on top of the workers' caps.
+    assert mini_placement._reachable_2b("linux-a", {**cfg, "2b_on_hub": {"lanes": 3}}, 4) == 9
+    assert mini_placement._reachable_2b("linux-a", {**cfg, "2b_on_hub": {"lanes": 0}}, 4) == 6
+    assert mini_placement._reachable_2b("linux-a", {**cfg, "2b_on_hub": {"lanes": 4}}, 12) == \
+        admission.lane_cap("2b")
 
 
 def test_trace_host_takes_no_lanes_while_the_big_runner_is_on(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -669,7 +703,8 @@ def test_g_comes_before_the_trace_host_s_lanes_at_night(
         1 for lane in LANES if lane.get("kind") == "2b" and lane.get("placement") == host))
     monkeypatch.setattr(admission, "lanes", lambda **kw: pytest.fail("took the lease lock"))
     asked = []
-    monkeypatch.setattr(mini_placement, "_g_fits", lambda b, freed, **kw: asked.append((b["job"], freed)) or fits)
+    monkeypatch.setattr(mini_placement, "_g_fits", lambda b, freed, **kw: False if freed[0] < 0 else (
+        asked.append((b["job"], freed)) or fits))  # freed < 0 asks for one more lane: no room for it
     monkeypatch.setattr(mini_placement, "_lane_fits", lambda spec: asked.append(spec) or fits)
     assert mini_placement._big_night("zm", SPEC) is held
     assert asked in ([], [("b1", (0.5, 2))], [SPEC])
@@ -683,7 +718,7 @@ def test_the_hold_lasts_while_lanes_drain_and_ends_with_none_left(
     monkeypatch.setattr(tick, "load_state", lambda: {"big_work": 5, "runners": {"B": {"job": "b1"}}})
     monkeypatch.setattr(runner_job, "big_hold_open", lambda now=None: True)
     answers, lanes = [True, False, False, False], [3, 2, 0, 0]
-    monkeypatch.setattr(mini_placement, "_g_fits", lambda b, freed, **kw: answers.pop(0))
+    monkeypatch.setattr(mini_placement, "_g_fits", lambda b, freed, **kw: False if freed[0] < 0 else answers.pop(0))
     monkeypatch.setattr(mini_placement, "_host_lanes", lambda host: lanes.pop(0))
     assert mini_placement._big_night("zm", SPEC) is True    # G fits once the lanes go: hold
     assert mini_placement._big_night("zm", SPEC) is True    # refused with lanes left: still draining
@@ -694,6 +729,34 @@ def test_the_hold_lasts_while_lanes_drain_and_ends_with_none_left(
     (tmp_path / "tick" / mini_placement.HOLD_FILE).write_text("x")
     assert mini_placement._big_night("zm", SPEC) is False   # by day the hold file goes
     assert not (tmp_path / "tick" / mini_placement.HOLD_FILE).exists()
+
+
+def test_lanes_keep_starting_in_a_handover_while_g_fits_beside_them(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from menagerie.pipeline import mini_placement, runner_job, tick
+
+    monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path))
+    monkeypatch.setattr(tick, "load_state", lambda: {"big_work": 5, "runners": {"B": {"job": "b1"}}})
+    monkeypatch.setattr(runner_job, "big_hold_open", lambda now=None: True)
+    monkeypatch.setattr(mini_placement, "_host_lanes", lambda host: 2)
+    asked = []
+    room = {"lane": True}
+    monkeypatch.setattr(mini_placement, "_g_fits", lambda b, freed, **kw: asked.append(freed) or (
+        room["lane"] if freed[0] < 0 else True))
+    assert mini_placement._big_night("zm", SPEC) is False  # G fits beside the live lanes plus one
+    assert asked == [(-0.25, -1)]
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    for i, (kind, where) in enumerate([("2b", "zm"), ("2b", "zm"), ("2a", "zm"), ("2b", "mini")]):
+        (leases / f"l{i}.json").write_text(json.dumps({"kind": kind, "placement": where, "started": now}))
+    (leases / "old.json").write_text(json.dumps({"kind": "2b", "placement": "zm", "started": "2026-10-29T00:00:00Z"}))
+    assert mini_placement._big_night("zm", SPEC) is False
+    assert asked[-1] == (-0.75, -3)  # this pass's two lanes may hold no run-on claim yet: counted
+    assert not (tmp_path / "tick" / mini_placement.HOLD_FILE).exists()
+    room["lane"] = False
+    assert mini_placement._big_night("zm", SPEC) is True  # one more would take G's room: hold
+    assert asked[-1] == (0.5, 2)
 
 
 def test_g_fits_probes_g_with_b_at_night_size_in_place_of_b_less_the_lanes_once_per_pass(
@@ -818,7 +881,7 @@ def test_worker_launch_receives_the_tick_config(scheduler: Any, monkeypatch: pyt
 
 class _Started:
     def __init__(self, family: str) -> None:
-        self.host, self.family = "worker-a", family
+        self.host, self.family, self.lease = "worker-a", family, {"label": "2b-mini-" + family}
 
 
 def test_worker_lane_admissions_are_read_after_every_lane_started(
@@ -828,25 +891,31 @@ def test_worker_lane_admissions_are_read_after_every_lane_started(
     order = []
     monkeypatch.setattr(mini_placement, "start", lambda families, **kw: order.append(
         "start " + families[0]) or _Started(families[0]))
-    monkeypatch.setattr(mini_placement, "finish", lambda started: order.append(
-        "finish " + started.family) or "run-" + started.family)
+    monkeypatch.setattr(mini_placement, "admissions", lambda labels: order.append(
+        "read " + " ".join(labels)) or {label: None for label in labels})
+    monkeypatch.setattr(mini_placement, "finish", lambda started, admitted: order.append(
+        f"finish {started.family} {admitted}") or "run-" + started.family)
     runs = tick_full._launch_2b(["f-a", "f-b", "f-c"], DataLayout(tmp_path),
                                 placements=["worker-a"] * 3, cfg={}, hub_room=0)
     assert runs == ["run-f-a", "run-f-b", "run-f-c"]
-    # The run-on admission waits overlap: no lane's wait holds up the next lane's start.
-    assert order == ["start f-a", "start f-b", "start f-c", "finish f-a", "finish f-b", "finish f-c"]
+    # The run-on admission waits overlap: no lane's wait holds up the next lane's start, and the
+    # admissions are read together.
+    assert order == ["start f-a", "start f-b", "start f-c",
+                     "read 2b-mini-f-a 2b-mini-f-b 2b-mini-f-c",
+                     "finish f-a None", "finish f-b None", "finish f-c None"]
 
 
 def test_a_refusal_read_after_the_starts_still_falls_back_to_the_hub(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from menagerie.pipeline import implement, mini_placement
 
-    def finish(started: Any) -> str:
+    def finish(started: Any, admitted: Any = None) -> str:
         if started.family == "f-a":
             raise admission.Refused("no_admission", "mini worker refused before payload start")
         return "run-" + started.family
 
     monkeypatch.setattr(mini_placement, "start", lambda families, **kw: _Started(families[0]))
+    monkeypatch.setattr(mini_placement, "admissions", lambda labels: {})
     monkeypatch.setattr(mini_placement, "finish", finish)
     monkeypatch.setattr(implement, "launch", lambda family, **kw: "hub-" + family)
     runs = tick_full._launch_2b(["f-a", "f-b"], DataLayout(tmp_path),
@@ -993,6 +1062,66 @@ def test_admitted_keeps_polling_when_run_on_state_prints_no_json(monkeypatch: py
     assert mini_placement._admitted("2b-mini-test") is None
 
 
+def test_admissions_read_every_pending_lane_in_one_call_a_round(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+    import subprocess
+
+    from menagerie.pipeline import mini_placement
+
+    rounds = [{"a": "pending", "b": "admitted", "c": "pending"}, {"a": "admitted", "c": "refused"}]
+    calls, slept = [], []
+
+    def state(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        labels = cmd[2:-1]
+        calls.append(labels)
+        verdicts = rounds[len(calls) - 1]
+        out = "\n".join(_json.dumps({"job": label, "verdict": verdicts[label], "state":
+                                     "TERMINAL" if verdicts[label] == "refused" else "RUNNING"})
+                        for label in labels)
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+    monkeypatch.setattr(mini_placement.admission, "_sh", state)
+    monkeypatch.setattr(mini_placement.time, "sleep", slept.append)
+    read = mini_placement.admissions(["a", "b", "c"])
+    assert calls == [["a", "b", "c"], ["a", "c"]] and slept == [1]
+    assert read["a"] is None and read["b"] is None
+    assert isinstance(read["c"], mini_placement.admission.Refused)
+
+
+def test_admissions_ask_alone_for_lanes_an_older_run_on_left_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+    import subprocess
+
+    from menagerie.pipeline import mini_placement
+
+    calls = []
+
+    def state(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd[2:-1])  # an older run-on reads only its first job
+        return subprocess.CompletedProcess(cmd, 0, _json.dumps(
+            {"job": cmd[2], "verdict": "admitted", "state": "RUNNING"}), "")
+
+    monkeypatch.setattr(mini_placement.admission, "_sh", state)
+    assert mini_placement.admissions(["a", "b"]) == {"a": None, "b": None}
+    assert calls == [["a", "b"], ["b"]]
+
+
+def test_admission_reads_space_out_and_stop_at_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+    import subprocess
+
+    from menagerie.pipeline import mini_placement
+
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(mini_placement.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(mini_placement.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    monkeypatch.setattr(mini_placement.admission, "_sh", lambda cmd: calls.append(clock[0]) or
+                        subprocess.CompletedProcess(cmd, 0, _json.dumps({"verdict": "pending"}), ""))
+    assert mini_placement._admitted("2b-mini-test") is None  # still pending at the deadline
+    assert len(calls) <= 10 and calls[-1] < mini_placement.ADMIT_WAIT_S
+
+
 @pytest.mark.parametrize("b,night,held", [
     ({"job": "b1", "refused_at": "2026-10-29T03:00:00+00:00"}, False, True),  # down, refused: hold
     ({"job": "b2", "submitted_at": "2026-10-29T03:20:00+00:00",
@@ -1061,7 +1190,8 @@ def test_start_describe_leases_a_describe_lane_and_submits_its_batch_layout(
     brief = tmp_path / "work/describe/abcd1234/BRIEF-r2.md"
     started = mini_placement.start_describe(["f-a", "f-b"], brief, role="model-judgment", host="worker-a",
                                             config=worker(account="pool"), cfg={})
-    assert admitted[0][1:] == ("model-judgment", runner.CODE_ROOT, "describe")  # the describe ceiling
+    # The describe ceiling, and the worker host so the hub CPU gate skips the lane.
+    assert admitted[0][1:] == ("model-judgment", runner.CODE_ROOT, "describe", "worker-a")
     lease = json.loads(started.path.read_text())
     assert lease["kind"] == "describe" and lease["keys"] == ["f-a", "f-b"] and lease["placement"] == "worker-a"
     assert lease["label"].startswith("describe-mini-") and lease["run"].startswith("pending:")
@@ -1100,3 +1230,264 @@ def test_top_up_records_describe_room_only_when_switched_on(scheduler: Any, monk
     result = tick_full.top_up(data, on, dry_run=False)
     assert result["2b_placements"] == ["worker-a"] and result["describe_room"] == {"worker-b": 1}
     assert json.loads((work_dir("tick") / describe_workers.ROOM).read_text())["room"] == {"worker-b": 1}
+    paused = {**on, "zmachine_paused": {"for": "TorchLens", "since": "t", "until_note": "done"}}
+    result = tick_full.top_up(data, paused, dry_run=False)  # 2b held for hours: describe takes both
+    assert result["2b_held"].startswith(f"{pause.DEFAULT_HOST} paused") and result["describe_room"] == {
+        "worker-a": 1, "worker-b": 1}
+
+
+def test_start_2a_leases_a_web_lane_with_its_pipeline_command_and_submits_its_layout(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import contextlib
+    import json
+    import subprocess
+
+    from menagerie.pipeline import mini_placement
+
+    monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path / "work"))
+    monkeypatch.setenv("MENAGERIE_STORE", str(tmp_path / "stage"))
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    seen, admitted, events = [], [], []
+    monkeypatch.setattr(mini_placement, "serving", lambda: True)
+    monkeypatch.setattr(admission, "_resolve", lambda role, account, **kw: {"harness": "claude", "model": "m"})
+    monkeypatch.setattr(admission, "_admit", lambda *a: admitted.append(a) or ([], "models"))
+    monkeypatch.setattr(admission, "other_role", lambda role: "model-implementation")
+    monkeypatch.setattr(mini_placement, "_identity", lambda spec, account: None)
+    monkeypatch.setattr(admission, "_lease_lock", lambda: contextlib.nullcontext(leases))
+    monkeypatch.setattr(admission, "gauges", lambda account: {})
+    monkeypatch.setattr(drive, "event", lambda *a, **kw: events.append(a))
+    monkeypatch.setattr(admission, "_sh", lambda argv, **kw: seen.append(argv) or subprocess.CompletedProcess(
+        argv, 0, "abc123\n" if argv[0] == "git" else "run_id=child-2a\n", ""))
+    monkeypatch.setattr(mini_placement, "_admitted", lambda label: None)
+    brief = tmp_path / "work/briefs/2a-tick-1/BRIEF.md"
+    started = mini_placement.start_2a(["f-a", "f-b"], brief, role="model-default", host="worker-a",
+                                      pipe="cd /repo && python3 -m menagerie.pipeline",
+                                      config=worker(account="pool"), cfg={})
+    assert admitted[0][1:] == ("model-default", runner.CODE_ROOT, "2a", "worker-a")
+    lease = json.loads(started.path.read_text())
+    assert lease["kind"] == "2a" and lease["keys"] == ["f-a", "f-b"] and lease["placement"] == "worker-a"
+    assert lease["label"].startswith("2a-mini-") and lease["web"] is True
+    assert lease["pipe"] == "cd /repo && python3 -m menagerie.pipeline"
+    assert lease["store"] == str(tmp_path / "stage")
+    assert mini_placement.finish(started) == "child-2a"
+    lease = json.loads(started.path.read_text())
+    assert lease["result"] == str(brief.with_name("BRIEF.result.md")) and lease["account"] == "models"
+    assert [e[2] for e in events] == ["launch"]
+    argv = seen[-1]
+    assert argv[argv.index("--hard-timeout") + 1] == "120m" and argv[argv.index("--deadline") + 1] == "105m"
+    manifest = json.loads(argv[-1])
+    assert manifest["kind"] == "2a" and manifest["web"] is True
+    assert (manifest["brief"], manifest["result"]) == ("work/2a-tick-1/BRIEF.md",
+                                                       "work/2a-tick-1/BRIEF.result.md")
+    assert str(tmp_path) not in argv[-1] and "/repo" not in argv[-1]  # the pipe stays on the hub
+    with pytest.raises(ValueError, match="safe family keys"):
+        mini_placement.start_2a(["../f-a"], brief, role="model-default", host="worker-a", pipe="p",
+                                config=worker(), cfg={})
+    with pytest.raises(ValueError, match="briefs work root"):
+        mini_placement.start_2a(["f-a"], tmp_path / "work/2b/f-a/BRIEF.md", role="model-default",
+                                host="worker-a", pipe="p", config=worker(), cfg={})
+
+
+def test_2a_takes_the_worker_slots_2b_leaves_only_when_switched_on(
+        scheduler: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from menagerie.pipeline import mini_placement
+
+    data, cfg = scheduler
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 0)
+    monkeypatch.setattr(drive, "next_steps", lambda ids, **kw: [
+        {"id": i, "step": "2b" if i == "m1" else "2a"} for i in ids])
+    monkeypatch.setattr(mini_placement, "slots", lambda cfg: ["worker-a", "worker-a", "worker-b"])
+    cfg = {**cfg, "2b_on_hub": False, "families_per_2a_lane": 1}
+    plan = tick_full.top_up(data, cfg, dry_run=True)
+    assert plan["2b"] == ["f-m1"] and plan["2a"] == [] and "2a_worker_slots" not in plan
+    plan = tick_full.top_up(data, {**cfg, "mini_2a": True}, dry_run=True)
+    assert plan["2b"] == ["f-m1"] and plan["2a_worker_slots"] == 2
+    assert len(plan["2a"]) == 2  # the two worker slots 2b left, with no hub slot free
+
+    launched = []
+    monkeypatch.setattr(tick_full, "_launch_2b", lambda chosen, data, **kw: ["2b-run"])
+    monkeypatch.setattr(tick_full, "_launch_2a", lambda chunks, data, hosts=None: launched.append(
+        (len(chunks), hosts)) or ["2a-run"])
+    tick_full.top_up(data, {**cfg, "mini_2a": True}, dry_run=False)
+    assert launched == [(2, ["worker-a", "worker-b"])]
+
+
+def test_a_2a_worker_reserve_keeps_slots_from_a_deep_2b_queue(
+        scheduler: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from menagerie.pipeline import mini_placement
+
+    data, cfg = scheduler
+    ids = [f"m{i}" for i in range(1, 11)]
+    (tmp_path / "list.txt").write_text("".join(f"{i} r3\n" for i in ids))
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 0)
+    monkeypatch.setattr(tick_full, "_caps", lambda cfg: {"2a": 4, "2b": 8})
+    monkeypatch.setattr(drive, "next_steps", lambda ids, **kw: [
+        {"id": i, "step": "2b" if int(i[1:]) <= 6 else "2a"} for i in ids])
+    monkeypatch.setattr(mini_placement, "slots", lambda cfg: ["worker-a"] * 2 + ["worker-b"] * 2)
+    cfg = {**cfg, "2b_on_hub": False, "families_per_2a_lane": 1, "mini_2a": True,
+           "2b_buffer_families": 100}
+    plan = tick_full.top_up(data, cfg, dry_run=True)
+    assert len(plan["2b"]) == 4 and plan["2a"] == [] and plan["2a_worker_slots"] == 0  # 2b first
+    plan = tick_full.top_up(data, {**cfg, "2a_worker_reserve": 3}, dry_run=True)
+    assert plan["2b_placements"] == ["worker-b"] and plan["2a_worker_reserved"] == 3  # first workers
+    assert [c for chunk in plan["2a"] for c in chunk] == ["m7", "m8", "m9"]
+    # 2a lanes already on workers count against the reserve
+    monkeypatch.setattr(tick_full, "_busy", lambda: (Counter({"2a": 2, "2a-worker": 2}), set()))
+    plan = tick_full.top_up(data, {**cfg, "2a_worker_reserve": 3}, dry_run=True)
+    assert plan["2a_worker_reserved"] == 1 and len(plan["2b"]) == 3
+    # no reserve while no row waits for 2a, and never beyond the 2a cap's room
+    monkeypatch.setattr(tick_full, "_busy", lambda: (Counter({"2a": 4}), set()))
+    assert tick_full.top_up(data, {**cfg, "2a_worker_reserve": 3}, dry_run=True)["2a_worker_reserved"] == 0
+    with pytest.raises(ValueError, match="2a_worker_reserve"):
+        tick_full._worker_reserve({**cfg, "2a_worker_reserve": -1}, [], Counter(), {"2a": 4}, 1)
+
+
+def test_repair_families_keep_out_of_worker_slots_while_their_role_runs_elsewhere(
+        scheduler: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """30 Oct 2026: seven repair families took half the worker placements each pass and were
+    refused every time (the worker runtime serves Claude; their repair role resolved to Codex)."""
+    from menagerie.pipeline import mini_placement
+
+    data, cfg = scheduler
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 0)
+    monkeypatch.setattr(mini_placement, "slots", lambda cfg: ["worker-a", "worker-a", "worker-b"])
+    asked: list[Any] = []
+    monkeypatch.setattr(tick_full, "_repair_families",
+                        lambda families, data: asked.append(families) or ["f-m1"])
+    seat = {"harness": "codex"}
+    monkeypatch.setattr(admission, "_resolve", lambda role, account="pool", **kw: dict(seat))
+    cfg = {**cfg, "2b_on_hub": False}
+    plan = tick_full.top_up(data, cfg, dry_run=True)
+    assert plan["2b"] == ["f-m2", "f-m3", "f-m4"] and plan["2b_repair_seat"] == ["f-m1"]
+    assert plan["waiting_2b"] == 3 and asked == [["f-m1", "f-m2", "f-m3", "f-m4"]]
+    seat["harness"] = "claude"  # the role runs on Claude again: the family is placed
+    plan = tick_full.top_up(data, cfg, dry_run=True)
+    assert plan["2b"] == ["f-m1", "f-m2", "f-m3"] and "2b_repair_seat" not in plan
+    seat["harness"] = "codex"  # 3 Nov 2026: hub 2b capped at N lanes fills the workers first too
+    plan = tick_full.top_up(data, {**cfg, "2b_on_hub": {"lanes": 2}}, dry_run=True)
+    assert plan["2b_repair_seat"] == ["f-m1"] and "f-m1" not in plan["2b"]
+    assert plan["2b_placements"][:3] == ["worker-a", "worker-a", "worker-b"]
+    assert plan["2b_repair_hub"] == "held: no hub slot or 2b cap room for a repair lane"
+    # 3 Nov 2026: repair lanes are hub 2b lanes, so they share the N of {"lanes": N}
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 10)
+    monkeypatch.setattr(admission, "_codex_gate", lambda role, kind: None)
+    monkeypatch.setattr(tick_full, "_repair_families", lambda families, data: ["f-m1", "f-m2", "f-m3"])
+    plan = tick_full.top_up(data, {**cfg, "2b_on_hub": {"lanes": 2}}, dry_run=True)
+    assert plan["2b_repair_hub"] == ["f-m1", "f-m2"] and plan["2b"] == ["f-m4"]
+    assert None not in plan["2b_placements"]
+    monkeypatch.setattr(tick_full, "_repair_families",
+                        lambda families, data: asked.append(families) or ["f-m1"])
+    plan = tick_full.top_up(data, {**cfg, "2b_on_hub": {"lanes": 2}}, dry_run=True)
+    assert plan["2b_repair_hub"] == ["f-m1"] and plan["2b_placements"].count(None) <= 1
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 0)
+    asked.clear()  # on the hub a refused worker placement falls back to a hub lane
+    assert tick_full.top_up(data, {**cfg, "2b_on_hub": True}, dry_run=True)["2b"][0] == "f-m1"
+    assert asked == []
+
+
+def test_held_repair_families_start_on_the_hub_on_their_own_role_only(
+        scheduler: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A repair round runs on the hub when its seat has headroom and a hub slot is free; a
+    refusal is held for the next pass, never queued and never moved to the Claude seat."""
+    from menagerie.pipeline import implement, mini_placement
+
+    data, cfg = scheduler
+    monkeypatch.setattr(tick_full, "_repair_families", lambda families, data: ["f-m1"])
+    monkeypatch.setattr(admission, "_resolve", lambda role, account="pool", **kw: {"harness": "codex"})
+    gate: list[str] = []
+
+    def codex_gate(role: str, kind: str) -> None:
+        if gate:
+            raise admission.Refused("no_admission", gate[0])
+
+    monkeypatch.setattr(admission, "_codex_gate", codex_gate)
+    monkeypatch.setattr(mini_placement, "slots", lambda cfg: ["worker-a", "worker-a"])
+    cfg = {**cfg, "2b_on_hub": False}
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 1)
+    monkeypatch.setattr(mini_placement, "slots", lambda cfg: ["worker-a", "worker-a", "worker-b"])
+    gate.append("no fresh Codex headroom")  # no headroom: the 2b cap's slots stay with the workers
+    plan = tick_full.top_up(data, cfg, dry_run=True)
+    assert plan["2b_repair_hub"] == "held: no fresh Codex headroom"
+    assert plan["2b"] == ["f-m2", "f-m3", "f-m4"]
+    gate.clear()
+    monkeypatch.setattr(mini_placement, "slots", lambda cfg: ["worker-a", "worker-a"])
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 0)  # no free hub slot: it waits
+    assert tick_full.top_up(data, cfg, dry_run=True)["2b_repair_hub"] == (
+        "held: no hub slot or 2b cap room for a repair lane")
+    monkeypatch.setattr(tick_full, "hub_slots", lambda: 1)
+    plan = tick_full.top_up(data, cfg, dry_run=True)
+    assert plan["2b"] == ["f-m2", "f-m3"] and plan["2b_repair_hub"] == ["f-m1"]
+    monkeypatch.setattr(mini_placement, "slots", lambda cfg: ["worker-a", "worker-a", "worker-b"])
+    plan = tick_full.top_up(data, cfg, dry_run=True)  # the repair takes its 2b cap slot first
+    assert plan["2b_repair_hub"] == ["f-m1"] and plan["2b"] == ["f-m2", "f-m3"]
+    monkeypatch.setattr(tick_full, "_busy", lambda: (Counter({"2b": 3}), set()))
+    assert tick_full.top_up(data, cfg, dry_run=True)["2b_repair_hub"] == (  # the 2b cap is full
+        "held: no hub slot or 2b cap room for a repair lane")
+    monkeypatch.setattr(mini_placement, "slots", lambda cfg: ["worker-a", "worker-a"])
+    monkeypatch.setattr(tick_full, "_busy", lambda: (Counter(), {"f-m1"}))  # a live lane holds it
+    assert tick_full.top_up(data, cfg, dry_run=True)["2b_repair_hub"] == []
+    monkeypatch.setattr(tick_full, "_busy", lambda: (Counter(), set()))
+
+    calls: list[tuple[str, str, bool]] = []
+
+    def launch(family: str, *, role: str, data: Any, queue: bool = True, **kw: Any) -> str:
+        calls.append((family, role, queue))
+        if len(calls) > 1:
+            raise admission.Refused("no_admission", "codex: no headroom")
+        return "run-1"
+
+    monkeypatch.setattr(implement, "launch", launch)
+    monkeypatch.setattr(tick_full, "_launch_2b", lambda chosen, data, **kw: ["w1", "w2"])
+    monkeypatch.setattr(tick_full, "_launch_2a", lambda chunks, data, hosts=None: [])
+    assert tick_full.top_up(data, cfg, dry_run=False)["runs"] == ["w1", "w2", "run-1"]
+    assert tick_full.top_up(data, cfg, dry_run=False)["runs"][-1] == "held: codex: no headroom"
+    assert calls == [("f-m1", "model-implementation", False)] * 2
+
+
+def test_left_over_and_research_room() -> None:
+    assert tick_full._left_over(["a", "a", "b"], ["a", None]) == ["a", "b"]
+    assert tick_full._research_room(slots=1, mini_slots=3, batches=1, worker_2a=False) == 1
+    assert tick_full._research_room(slots=1, mini_slots=3, batches=1, worker_2a=True) == 3
+    assert tick_full._research_room(slots=2, mini_slots=1, batches=2, worker_2a=True) == 1
+
+
+GROWN_GIB = 38  # runner A's size 1 (runner_job.DEFAULT_RUNNERS)
+
+
+@pytest.mark.parametrize("a,beside,gone,held", [
+    ({"job": "a", "refused_at": "2026-11-03T03:00:00+00:00"}, True, True, "refused for capacity"),
+    ({"job": "a", "cancelled": "a", "cancelled_for": "resize"}, True, True, "between sizes"),
+    ({"job": "a", "size": 0, "grow_to": 1}, False, True, "wants size 1"),  # lanes are in the way
+    ({"job": "a", "size": 0, "grow_to": 1}, True, True, None),  # fits beside one more lane
+    ({"job": "a", "size": 0, "grow_to": 1}, False, False, None),  # another job holds the room
+    ({"job": "a", "size": 0}, False, True, None),  # no growth wanted
+    ({}, False, True, None),  # no record yet
+])
+def test_the_trace_host_holds_new_lanes_while_runner_a_needs_their_room(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, a: dict[str, Any], beside: bool, gone: bool,
+        held: str | None) -> None:
+    from menagerie.pipeline import mini_placement, runner_job
+
+    monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path))
+    monkeypatch.setattr(tick, "load_state", lambda: {"runners": {"A": a}})
+    monkeypatch.setattr(mini_placement, "_host_lanes", lambda host: 4)
+    monkeypatch.setattr(mini_placement, "_young_lanes", lambda host: 0)
+    asked = []
+
+    def admits(layout: Any, replacing: str | None) -> bool:
+        asked.append((layout.name, layout.memory_gib, replacing))
+        return beside if layout.memory_gib > GROWN_GIB else gone
+
+    monkeypatch.setattr(mini_placement, "_admits", admits)
+    why = mini_placement._a_held_out("linux-a", linux())
+    assert (why is None) if held is None else (held in why)
+    if a.get("grow_to"):
+        assert asked[0] == ("A", GROWN_GIB + 2, "a")  # A grown, beside the lanes plus one (2 GiB)
+    monkeypatch.setattr(mini_placement, "_big_night", lambda host, spec: False)
+    monkeypatch.setattr(mini_placement, "_b_held_out", lambda: False)
+    allowed, reason = mini_placement.host_cap("linux-a", linux(), {"disk_state": "ok"})
+    assert (allowed == 0 and "runner A comes first" in reason) is (held is not None)
+    off = mini_placement.host_cap("linux-a", linux(), {"disk_state": "ok", "a_before_lanes": False})
+    assert "runner A" not in off[1]
+    assert mini_placement.host_cap("linux-a", linux(trace_host=False), {}) == (2, "")  # Mac lanes untouched

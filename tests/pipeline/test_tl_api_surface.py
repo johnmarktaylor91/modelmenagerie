@@ -23,9 +23,11 @@ torch = pytest.importorskip("torch")
 tl = pytest.importorskip("torchlens")
 timm = pytest.importorskip("timm")
 from torch import nn  # noqa: E402
-from torchlens.options import CaptureOptions  # noqa: E402
 
-PIN = "2.36.0"
+from menagerie import tl_compat  # noqa: E402
+from menagerie.pipeline.publish import torchlens_pin  # noqa: E402
+
+PIN = torchlens_pin()
 ANSWERS: dict[str, bool] = {}
 
 
@@ -92,12 +94,12 @@ class Captured:
         self.x = torch.randn(*shape)
         with torch.no_grad():
             self.truth = self.model(self.x)
-        options = CaptureOptions(intervention_ready=True)
+        options = tl_compat.capture_options(intervention_ready=True)
         self.live = probe(name, "trace(intervention_ready=True)", "live",
                           lambda: tl.trace(self.model, self.x, capture=options))
         self.path = root / f"{name}.tlspec"
         probe(name, "save(level=runnable)", "live",
-              lambda: tl.save(self.live, self.path, level="runnable"))
+              lambda: tl_compat.save(self.live, self.path, level="runnable"))
         self.loaded = probe(name, "load", "loaded", lambda: tl.load(self.path))
 
     def trace(self, which: str) -> Any:
@@ -125,7 +127,7 @@ def test_plain_capture_is_refused_runnable(captured: Captured) -> None:
     probe(captured.name, "last_validation_failure", "live", _why_not_valid, required=False)
     target = captured.root / "plain.tlspec"
     probe(captured.name, "save(plain, level=runnable) refuses", "live",
-          lambda: tl.save(plain, target, level="runnable"), required=False)
+          lambda: tl_compat.save(plain, target, level="runnable"), required=False)
     assert not ANSWERS[f"{captured.name}:save(plain, level=runnable) refuses:live"], (
         "a capture without intervention_ready saved runnable; the preflight contract changed"
     )
@@ -144,17 +146,22 @@ def test_validate_forward_pass_and_scope(captured: Captured) -> None:
 
 
 def test_hash_round_trip(captured: Captured) -> None:
-    live = probe(captured.name, "hash.trace", "live", lambda: tl.hash.trace(captured.live))
-    loaded = probe(captured.name, "hash.trace", "loaded", lambda: tl.hash.trace(captured.loaded))
+    live = probe(captured.name, "hash.trace", "live", lambda: tl_compat.skeleton(captured.live))
+    loaded = probe(captured.name, "hash.trace", "loaded",
+                   lambda: tl_compat.skeleton(captured.loaded))
     assert live == loaded and len(live) == 64
 
 
 def test_loaded_runnable_runs(captured: Captured) -> None:
+    import inspect
+
+    legacy = "inputs" in inspect.signature(captured.loaded.run).parameters  # through 2.38
     result = probe(captured.name, "run(inputs, seed)", "loaded",
-                   lambda: captured.loaded.run(inputs=captured.x, seed=0))
+                   lambda: captured.loaded.run(inputs=captured.x, seed=0) if legacy
+                   else captured.loaded.run_transaction(inputs=captured.x, seed=0))
     rerun_hash = probe(captured.name, "hash.trace(run result)", "loaded",
-                       lambda: tl.hash.trace(result.trace))
-    assert rerun_hash == tl.hash.trace(captured.live)
+                       lambda: tl_compat.skeleton(result.trace))
+    assert rerun_hash == tl_compat.skeleton(captured.live)
     probe(captured.name, "run report", "loaded", lambda: str(result.report), required=False)
 
 
@@ -168,11 +175,12 @@ def test_draw_and_exports(captured: Captured, which: str) -> None:
         views.append(("rolled", "none"))
     for vis_mode, collapse in views:
         stem = out / f"{vis_mode}-{collapse}"
-        probe(captured.name, f"draw({vis_mode},{collapse},svg)", which, lambda: trace.draw(
-            vis_mode=vis_mode, collapse=collapse, vis_outpath=str(stem), vis_fileformat="svg",
-            vis_save_only=True), required=required)
-    probe(captured.name, "draw(pdf)", which, lambda: trace.draw(
-        vis_outpath=str(out / "pdf"), vis_fileformat="pdf", vis_save_only=True), required=required)
+        probe(captured.name, f"draw({vis_mode},{collapse},svg)", which, lambda: tl_compat.draw(
+            trace, vis_mode=vis_mode, collapse=collapse, vis_outpath=str(stem),
+            vis_fileformat="svg", vis_save_only=True), required=required)
+    probe(captured.name, "draw(pdf)", which, lambda: tl_compat.draw(
+        trace, vis_outpath=str(out / "pdf"), vis_fileformat="pdf", vis_save_only=True),
+        required=required)
     for kind, suffix in (("html", "html"), ("netron", "json"), ("model_explorer", "json")):
         exporter = getattr(tl.export, kind)
         path = probe(captured.name, f"export.{kind}", which,
@@ -190,9 +198,9 @@ def test_facts_for_fixtures(captured: Captured) -> None:
     from menagerie.pipeline import tree_sha256
 
     facts: dict[str, Any] = {
-        "model": captured.name, "call": "FACTS", "num_ops": getattr(captured.live, "num_ops", None),
-        "loaded_num_ops": getattr(captured.loaded, "num_ops", None),
-        "skeleton": tl.hash.trace(captured.live), "tlspec_sha256": tree_sha256(captured.path),
+        "model": captured.name, "call": "FACTS", "num_ops": tl_compat.num_ops(captured.live),
+        "loaded_num_ops": tl_compat.num_ops(captured.loaded),
+        "skeleton": tl_compat.skeleton(captured.live), "tlspec_sha256": tree_sha256(captured.path),
         "tlspec_files": sum(1 for p in captured.path.rglob("*") if p.is_file()),
         "params": sum(p.numel() for p in captured.model.parameters()),
     }
@@ -219,10 +227,10 @@ def test_portable_save_draws_like_live(captured: Captured, include_outs: bool) -
     from menagerie.pipeline import tree_sha256
 
     path = captured.root / f"portable-{include_outs}.tlspec"
-    tl.save(captured.live, path, level="portable", include_outs=include_outs)
+    tl_compat.save(captured.live, path, level="portable", include_outs=include_outs)
     stem = captured.root / f"portable-{include_outs}"
-    tl.load(path).draw(vis_mode="unrolled", collapse="none", vis_outpath=str(stem),
-                       vis_fileformat="svg", vis_save_only=True)
+    tl_compat.draw(tl.load(path), vis_mode="unrolled", collapse="none", vis_outpath=str(stem),
+                   vis_fileformat="svg", vis_save_only=True)
     live = (captured.root / "live" / "unrolled-none.svg").read_bytes()
     redrawn = Path(f"{stem}.svg").read_bytes()
     size = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
@@ -240,7 +248,7 @@ def test_capture_overhead_of_intervention_ready() -> None:
     tl.trace(model, x)  # warm-up: the first capture of a session wraps torch once
     times: dict[str, list[float]] = {"plain": [], "intervention_ready": []}
     for _ in range(3):
-        for kind, capture in (("plain", None), ("intervention_ready", CaptureOptions(
+        for kind, capture in (("plain", None), ("intervention_ready", tl_compat.capture_options(
                 intervention_ready=True))):
             started = time.perf_counter()
             tl.trace(model, x, capture=capture)
@@ -256,10 +264,10 @@ def test_structure_only_on_meta(tmp_path: Path) -> None:
             model = probe(name, "build on meta", "meta", build)
             x = torch.randn(*shape)
         trace = probe(name, "trace(structure_only=True)", "meta", lambda: tl.trace(
-            model, x, capture=CaptureOptions(structure_only=True)))
-        probe(name, "hash.trace", "meta", lambda: tl.hash.trace(trace))
-        probe(name, "draw(svg)", "meta", lambda: trace.draw(
-            vis_outpath=str(tmp_path / name), vis_fileformat="svg", vis_save_only=True))
+            model, x, capture=tl_compat.capture_options(structure_only=True)))
+        probe(name, "hash.trace", "meta", lambda: tl_compat.skeleton(trace))
+        probe(name, "draw(svg)", "meta", lambda: tl_compat.draw(
+            trace, vis_outpath=str(tmp_path / name), vis_fileformat="svg", vis_save_only=True))
         params = sum(p.numel() for p in model.parameters())
         print("PROBE", json.dumps({"model": name, "call": "geometry params", "value": params}))
         assert params > 0

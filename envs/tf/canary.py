@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import importlib
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the checkout: names that differ by pin
+from menagerie import tl_compat  # noqa: E402
 
 PROMISED = ("tensorflow", "keras", "torch", "torchlens", "numpy", "psutil", "yaml", "pydantic",
             "jsonschema", "referencing", "PIL")
@@ -42,16 +46,17 @@ def main() -> int:
     w, b = tf.constant([[1.0, -1.0], [0.5, 2.0], [-1.5, 0.25]]), tf.constant([0.1, -0.2])
     fn_trace = tl.trace(lambda v: tf.nn.relu(tf.matmul(v, w) + b), [x], backend="tf")
     fn_verdict = state(fn_trace.validate_forward_pass([], validate_metadata=True))
+    mode, fn_mode = (tl_compat.trace_field(t, "module_identity_mode") for t in (trace, fn_trace))
+    replayed, effect, failed = (tl_compat.status_count(status, k) for k in ("replayed", "effect_region", "failed"))
     print(f"canary: python {sys.version.split()[0]}, tensorflow {tf.__version__}, keras "
           f"{keras.__version__}, torch {torch.__version__}, torchlens {tl.__version__}, "
-          f"{trace.num_ops} ops, module mode {trace.module_identity_mode}, validation {verdict} "
-          f"({status.replayed_node_count} replayed, {status.effect_region_node_count} effect "
-          f"regions, {status.failed_node_count} failed); function {fn_trace.num_ops} ops, "
-          f"module mode {fn_trace.module_identity_mode}, validation {fn_verdict}")
+          f"{tl_compat.num_ops(trace)} ops, module mode {mode}, validation {verdict} "
+          f"({replayed} replayed, {effect} effect regions, {failed} failed); function "
+          f"{tl_compat.num_ops(fn_trace)} ops, module mode {fn_mode}, validation {fn_verdict}")
     # At TorchLens 2.35.3 every variable read (ReadVariableOp) is an unverified effect region, so
     # a Keras model is `unverified` at best: the environment is healthy when nothing fails.
-    assert verdict in ("passed", "unverified") and status.failed_node_count == 0, verdict
-    assert status.replayed_node_count > 0 and fn_verdict in ("passed", "unverified"), fn_verdict
+    assert verdict in ("passed", "unverified") and failed == 0, verdict
+    assert replayed > 0 and fn_verdict in ("passed", "unverified"), fn_verdict
     return 0
 
 

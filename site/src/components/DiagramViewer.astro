@@ -3,6 +3,7 @@ import {
   formatBytes,
   getDefaultVariant,
   getDiagramFocus,
+  getDiagramFocusY,
   getStandInShareCount,
   hasUsablePreview,
   isHeavyVariant,
@@ -12,6 +13,7 @@ import {
 } from "@/lib/catalog";
 import { formatNumber } from "@/lib/labels";
 import type { ViewerPayload, ViewerVariant } from "@/scripts/viewer-types";
+import { previewShift } from "@/scripts/preview-shift";
 
 interface Props {
   model: ModelRecord;
@@ -20,19 +22,24 @@ interface Props {
 const { model } = Astro.props;
 const initial = getDefaultVariant(model);
 
-/** Sentence shown before a heavy diagram loads. */
+/** Sentence shown before a heavy diagram loads: its operation count and file size, drawn on request. */
 function heavyNote(variant: ModelVariant): string {
   const size = formatBytes(variant.svg.bytes);
-  const graph = variant.monster && model.n_ops !== null ? `This graph has ${formatNumber(model.n_ops)} operations. The` : "The";
-  return `${graph} full diagram is a ${size} file and can be slow to open on a phone.`;
+  return model.n_ops !== null
+    ? `This diagram has ${formatNumber(model.n_ops)} ${model.n_ops === 1 ? "operation" : "operations"} (${size}) and is drawn when you ask.`
+    : `This diagram is a ${size} file and is drawn when you ask.`;
 }
 
 /** Sentence warning that many unrelated entries share this exact diagram; empty when they do not. */
 function standInNote(variant: ModelVariant): string {
-  const count = getStandInShareCount(variant);
+  const count = getStandInShareCount(variant, model);
   return count > 0
     ? `${formatNumber(count)} models in this catalog share this exact diagram, so it probably shows a small stand-in model rather than ${model.display_name} itself.`
     : "";
+}
+
+function positive(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 function toViewerVariant(variant: ModelVariant): ViewerVariant {
@@ -42,13 +49,19 @@ function toViewerVariant(variant: ModelVariant): ViewerVariant {
     svgUrl: variant.svg.url,
     svgSize: formatBytes(variant.svg.bytes),
     svgFileName: `${model.slug}-${variant.key}.svg`,
-    thumbUrl: hasUsablePreview(variant.thumb.bytes) ? variant.thumb.url : null,
+    // The top crop when the export has one; else the whole-graph thumbnail when it is not near blank.
+    thumbUrl: variant.thumb_crop?.url ?? (hasUsablePreview(variant.thumb.bytes) ? variant.thumb.url : null),
+    previewWidth: variant.thumb_crop ? variant.thumb_crop.width || null : null,
+    previewHeight: variant.thumb_crop ? variant.thumb_crop.height || null : null,
+    svgWidth: positive(variant.svg_width_px),
+    svgHeight: positive(variant.svg_height_px),
     pdfUrl: variant.pdf?.url ?? null,
     pdfSize: variant.pdf ? formatBytes(variant.pdf.bytes) : null,
     heavy: isHeavyVariant(variant),
     heavyNote: heavyNote(variant),
     standInNote: standInNote(variant),
     focusX: getDiagramFocus(variant),
+    focusY: getDiagramFocusY(variant),
   };
 }
 
@@ -57,6 +70,9 @@ const first = variants.find((variant) => variant.key === initial.key) ?? variant
 const payload: ViewerPayload = { modelName: model.display_name, defaultKey: initial.key, variants };
 // Escape "<" so the JSON can never close the script element it sits in.
 const payloadJson = JSON.stringify(payload).replace(/</g, "\\u003c");
+// A short graph gets a shorter stage, sized from the SVG's own height before anything loads.
+const firstShift = previewShift(first.focusX, first.svgWidth, first.previewWidth);
+const stageStyle = first.svgHeight !== null ? `--diagram-h: ${Math.ceil(first.svgHeight)}px` : undefined;
 ---
 
 <section class="viewer panel" data-viewer data-state={first.heavy ? "idle" : "loading"} data-mode="readable">
@@ -77,14 +93,24 @@ const payloadJson = JSON.stringify(payload).replace(/</g, "\\u003c");
       <button class="button" type="button" data-viewer-part="mode">Whole graph</button>
       <button class="button" type="button" data-viewer-part="expand">Full screen</button>
     </div>
-    <p class="viewer-bar-note">Large diagram, not loaded yet</p>
+    <p class="viewer-bar-note"><span class="viewer-note-crop">Showing the top corner; full diagram not loaded yet</span><span class="viewer-note-thumb">Showing a small copy; full diagram not loaded yet</span><span class="viewer-note-bare">Large diagram, not loaded yet</span></p>
     <a class="button viewer-open" href={first.svgUrl} data-asset="svg" target="_blank" rel="noopener">Open SVG</a>
   </div>
   <p class="viewer-stand-in" data-viewer-part="stand-in" hidden={first.standInNote === ""}>{first.standInNote}</p>
   <div class="viewer-frame">
-    <div class="viewer-stage" data-viewer-part="stage" tabindex="0" role="region" aria-label={`${model.display_name} diagram`} aria-describedby="viewer-hint">
+    <div class="viewer-stage" data-viewer-part="stage" style={stageStyle} tabindex="0" role="region" aria-label={`${model.display_name} diagram`} aria-describedby="viewer-hint">
       <div class="viewer-canvas" data-viewer-part="canvas">
-        <img class="viewer-preview" data-viewer-part="preview" src={first.thumbUrl ?? undefined} alt="" decoding="async" hidden={first.thumbUrl === null} />
+        <img
+          class:list={["viewer-preview", { "viewer-preview--crop": first.previewWidth !== null }]}
+          data-viewer-part="preview"
+          style={firstShift !== null ? `--preview-shift: ${firstShift}` : undefined}
+          src={first.thumbUrl ?? undefined}
+          width={first.previewWidth ?? undefined}
+          height={first.previewHeight ?? undefined}
+          alt=""
+          decoding="async"
+          hidden={first.thumbUrl === null}
+        />
         <img
           class="viewer-diagram"
           data-viewer-part="diagram"
@@ -175,6 +201,32 @@ const payloadJson = JSON.stringify(payload).replace(/</g, "\\u003c");
     display: block;
   }
 
+  /*
+   * A heavy diagram waiting for its load button: the stage shrinks to the status card and the
+   * preview under it (or to the card alone when there is no preview) instead of reserving the full
+   * diagram's height, and the zoom hint, which has nothing to act on yet, takes no room.
+   */
+  .viewer[data-state="idle"] .viewer-stage {
+    height: auto;
+    max-height: min(clamp(320px, 72vh, 820px), max(240px, calc(var(--diagram-h, 100000px) + 2 * var(--viewer-pad))));
+  }
+
+  .viewer[data-state="idle"] .viewer-hint {
+    display: none;
+  }
+
+  /* The waiting note says what the picture under the status card is: a top corner, a small copy, or nothing. */
+  .viewer-note-crop,
+  .viewer-note-thumb,
+  .viewer:has(.viewer-preview:not([hidden])) .viewer-note-bare {
+    display: none;
+  }
+
+  .viewer:has(.viewer-preview--crop:not([hidden])) .viewer-note-crop,
+  .viewer:has(.viewer-preview:not(.viewer-preview--crop):not([hidden])) .viewer-note-thumb {
+    display: inline;
+  }
+
   .viewer-variants .button[aria-pressed="true"] {
     border-color: var(--accent);
     color: var(--accent);
@@ -202,8 +254,8 @@ const payloadJson = JSON.stringify(payload).replace(/</g, "\\u003c");
 
   .viewer-readout {
     min-width: 3.4rem;
-    color: var(--secondary);
-    font-size: 0.8rem;
+    color: var(--text);
+    font-size: 0.85rem;
     text-align: center;
   }
 
@@ -226,7 +278,8 @@ const payloadJson = JSON.stringify(payload).replace(/</g, "\\u003c");
   }
 
   .viewer-stage {
-    height: clamp(320px, 72vh, 820px);
+    /* Never taller than the diagram needs at full size (--diagram-h, from the export), so a short graph gets a short stage. */
+    height: min(clamp(320px, 72vh, 820px), max(240px, calc(var(--diagram-h, 100000px) + 2 * var(--viewer-pad))));
     overflow: auto;
     overscroll-behavior: auto;
     background: var(--surface-2);
@@ -246,6 +299,11 @@ const payloadJson = JSON.stringify(payload).replace(/</g, "\\u003c");
   /* Thumbnails are 400 px wide; a fixed width keeps the preview's left edge still while it loads (no layout shift). */
   .viewer-preview {
     width: min(100%, 400px);
+  }
+
+  /* A top crop (800 wide) is drawn at up to its own width; its width and height attributes reserve the box. */
+  .viewer-preview--crop {
+    width: min(100%, 800px);
   }
 
   .viewer-preview,
@@ -302,17 +360,22 @@ const payloadJson = JSON.stringify(payload).replace(/</g, "\\u003c");
     display: none;
   }
 
-  .viewer[data-state="loading"] .viewer-canvas {
-    padding-top: calc(var(--viewer-pad) + 4.5rem);
-  }
-
-  .viewer[data-state="idle"] .viewer-canvas,
-  .viewer[data-state="error"] .viewer-canvas {
+  /*
+   * Every state before the diagram is drawn reserves the room the tallest status card needs (the
+   * error card, with its buttons), so a preview shown while loading stays put if loading fails.
+   */
+  .viewer:not([data-state="ready"]) .viewer-canvas {
     padding-top: calc(var(--viewer-pad) + 10rem);
   }
 
+  /*
+   * Until the diagram is drawn the canvas is exactly the stage's width, so the preview's percentage
+   * width resolves before its picture arrives: the box its width and height attributes reserve is the
+   * box it keeps (no layout shift), and an 800 px crop fits a phone's stage.
+   */
   .viewer:not([data-state="ready"]) .viewer-canvas {
     place-items: start center;
+    width: 100%;
   }
 
   .viewer-card {
@@ -376,7 +439,7 @@ const payloadJson = JSON.stringify(payload).replace(/</g, "\\u003c");
 
   @media (max-width: 640px) {
     .viewer-stage {
-      height: clamp(300px, 62vh, 640px);
+      height: min(clamp(300px, 62vh, 640px), max(240px, calc(var(--diagram-h, 100000px) + 2 * var(--viewer-pad))));
     }
 
     .viewer-variants {
@@ -399,9 +462,26 @@ const payloadJson = JSON.stringify(payload).replace(/</g, "\\u003c");
       min-width: 2.6rem;
     }
 
-    .viewer[data-state="idle"] .viewer-canvas,
-    .viewer[data-state="error"] .viewer-canvas {
+    .viewer:not([data-state="ready"]) .viewer-canvas {
       padding-top: calc(var(--viewer-pad) + 13rem);
+    }
+
+    .viewer[data-state="idle"] .viewer-stage {
+      max-height: min(clamp(300px, 62vh, 640px), max(240px, calc(var(--diagram-h, 100000px) + 2 * var(--viewer-pad))));
+    }
+
+    /*
+     * A phone shows the top corner crop at its own size, clipped to the box, so its labels stay
+     * readable, centred on the diagram's focus when known (preview-shift.ts); 100% and 0px clamp
+     * the window to the crop's right and left edges.
+     */
+    .viewer[data-state="idle"] .viewer-preview--crop {
+      object-fit: none;
+      object-position: left top;
+    }
+
+    .viewer[data-state="idle"] .viewer-preview--crop[style*="--preview-shift"] {
+      object-position: clamp(100%, calc(50% + var(--preview-shift)), 0px) top;
     }
 
     /* On a phone the toolbar keeps to one row; the file links stay in the status card and the Files box. */

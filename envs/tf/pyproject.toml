@@ -9,7 +9,7 @@ dependencies = [
     "tensorflow>=2.16",
     "keras>=3",
     "torch==2.6.*",
-    "torchlens[tf]==2.36.0",
+    "torchlens[tf]==3.0.2",
     # Menagerie's runtime dependencies, so the worker runs here without installing anything.
     "numpy",
     "packaging",

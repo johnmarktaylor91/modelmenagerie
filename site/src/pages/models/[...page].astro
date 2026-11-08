@@ -3,8 +3,12 @@ import type { Page } from "astro";
 import ModelCard from "@/components/ModelCard.astro";
 import BaseLayout from "@/layouts/BaseLayout.astro";
 import { getAllModels, getListingOrder, type ModelRecord } from "@/lib/catalog";
+import { rosterEntryCount } from "@/lib/roster";
+import { recordTier } from "@/lib/shown";
+import { PRIORITY_CARDS } from "@/scripts/CardView";
 import { getListingControls } from "@/lib/modelIndex";
 import { formatNumber } from "@/lib/labels";
+import { SEARCH_PLACEHOLDER } from "@/lib/site";
 import { rangeText, renderPagerHtml } from "@/scripts/ListingPager";
 
 interface Props {
@@ -14,12 +18,14 @@ interface Props {
 const PAGE_SIZE = 48;
 
 export function getStaticPaths({ paginate }: { paginate: (items: ModelRecord[], options: { pageSize: number }) => unknown }) {
-  // Pictures first, then name: the static pages are the default "Pictures first" sort.
+  // Featured first, then pictures, then name: the static pages are the default "Featured first" sort.
   return paginate(getListingOrder(), { pageSize: 48 });
 }
 
-const models = getAllModels();
-const total = models.length;
+// The default listing is the validated models; structure-only records and catalogued models
+// with no diagram yet join it only when the reader ticks "Include models without a checked diagram".
+const total = getListingOrder().length;
+const untracedCount = getAllModels().filter((model) => recordTier(model) === "structure").length + rosterEntryCount();
 const page = Astro.props.page;
 const pageHref = (pageNumber: number) => (pageNumber === 1 ? "/models/" : `/models/${pageNumber}/`);
 const pagerHtml = renderPagerHtml(page.currentPage, page.lastPage, pageHref);
@@ -28,7 +34,6 @@ const countText = rangeText(page.start + 1, page.end + 1, total, { one: "model",
 
 // Facets and sorts come from the fields the catalog actually fills; empty ones stay out.
 const { groups, sorts } = getListingControls();
-const assetBase = import.meta.env.PUBLIC_R2_BASE ?? "";
 ---
 
 <BaseLayout title="Models" description={`Search and filter ${formatNumber(total)} neural network architecture diagrams traced with TorchLens.`}>
@@ -38,7 +43,6 @@ const assetBase = import.meta.env.PUBLIC_R2_BASE ?? "";
     data-page-size={PAGE_SIZE}
     data-static-page={page.currentPage}
     data-last-page={page.lastPage}
-    data-asset-base={assetBase}
   >
     <script is:inline>
       // Apply the Cards or List view before the cards paint: ?view= first, then the remembered
@@ -54,11 +58,11 @@ const assetBase = import.meta.env.PUBLIC_R2_BASE ?? "";
     <div class="listing__head">
       <div>
         <h1 class="listing__title">Models</h1>
-        <p class="listing__lede">{formatNumber(total)} architectures. Search by name or filter by task.</p>
+        <p class="listing__lede"><span data-count="listing">{formatNumber(total)}</span> models with a checked diagram. Search by name or filter by task.</p>
       </div>
       <form class="listing__search" id="listing-search-form" role="search" action="/models/" method="get">
         <label class="sr-only" for="listing-search">Search models</label>
-        <input id="listing-search" name="q" type="search" placeholder="Search, e.g. ResNet-50" autocomplete="off" spellcheck="false" />
+        <input id="listing-search" name="q" type="search" placeholder={SEARCH_PLACEHOLDER} autocomplete="off" spellcheck="false" />
         <button class="button" type="submit">Search</button>
       </form>
     </div>
@@ -67,6 +71,18 @@ const assetBase = import.meta.env.PUBLIC_R2_BASE ?? "";
       <details class="listing__filters" id="listing-filters">
         <summary class="listing__filters-toggle">Filters <span data-filter-count></span></summary>
         <div class="listing__filter-body">
+          {
+            untracedCount > 0 && (
+              <fieldset class="listing__facet">
+                <legend>Coverage</legend>
+                <label class="listing__option">
+                  <input type="checkbox" data-untraced value="1" />
+                  <span class="listing__option-label">Include models without a checked diagram</span>
+                  <span class="listing__option-count">{formatNumber(untracedCount)}</span>
+                </label>
+              </fieldset>
+            )
+          }
           {
             groups.map((group) => (
               <fieldset class="listing__facet">
@@ -107,11 +123,18 @@ const assetBase = import.meta.env.PUBLIC_R2_BASE ?? "";
             <label class="listing__sort">
               <span>Sort</span>
               <select id="listing-sort">
-                {sorts.map((sort) => <option value={sort.key} selected={sort.key === "preview"}>{sort.label}</option>)}
+                {
+                  sorts.map((sort) => (
+                    <option value={sort.key} selected={sort.key === "featured"} hidden={sort.key === "preview"} disabled={sort.key === "preview"}>
+                      {sort.label}
+                    </option>
+                  ))
+                }
               </select>
             </label>
           </div>
         </div>
+        <p class="listing__untraced-note" data-untraced-note hidden>Models without a checked diagram are listed after those with one. Search by name to find one.</p>
         <p id="listing-family" class="listing__active" hidden>
           <span>Family: <strong data-family-name></strong></span>
           <button class="button listing__active-clear" type="button" data-clear-family>Show all families</button>
@@ -122,7 +145,7 @@ const assetBase = import.meta.env.PUBLIC_R2_BASE ?? "";
           <button id="listing-retry" class="button" type="button">Retry</button>
         </div>
         <div id="listing-grid" class="listing__grid">
-          {page.data.map((model: ModelRecord) => <ModelCard model={model} />)}
+          {page.data.map((model: ModelRecord, position: number) => <ModelCard model={model} priority={position < PRIORITY_CARDS} />)}
         </div>
         <div id="listing-empty" class="listing__notice" hidden>
           <p>No models match. Try a shorter search or fewer filters.</p>
@@ -471,6 +494,12 @@ const assetBase = import.meta.env.PUBLIC_R2_BASE ?? "";
   .listing__active[hidden],
   .listing__note[hidden] {
     display: none;
+  }
+
+  .listing__untraced-note {
+    margin: -0.25rem 0 1rem;
+    color: var(--secondary);
+    font-size: 0.9rem;
   }
 
   .listing__note {

@@ -422,7 +422,7 @@ requires-dist = [
     { name = "setuptools" },
     { name = "timm", specifier = "==1.0.30" },
     { name = "torch", specifier = "==2.6.*", index = "https://download.pytorch.org/whl/cu124" },
-    { name = "torchlens", specifier = "==2.36.0" },
+    { name = "torchlens", specifier = "==3.0.2" },
     { name = "torchvision", specifier = "==0.21.*", index = "https://download.pytorch.org/whl/cu124" },
     { name = "tqdm" },
     { name = "transformers" },
@@ -958,7 +958,7 @@ wheels = [
 
 [[package]]
 name = "torchlens"
-version = "2.36.0"
+version = "3.0.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "graphviz" },
@@ -970,9 +970,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a3/fc/4bd0a6079248128d33923bfd2a1f53f02887cd42bd0eda1b6ef037058d71/torchlens-2.36.0.tar.gz", hash = "sha256:3a7c0e54fef6dd700a61990b3b5393e75192a4a36ccef3560168abbcd27004b3", size = 5343162, upload-time = "2026-10-08T02:05:49.47Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c5/9f/30bf13a772a800b1b1e97127b82bd55c45e79101e1b8a508c735fe7ee3b2/torchlens-3.0.2.tar.gz", hash = "sha256:89f0da56e17ff6f6d1e52f87883ad14c86b72add6691284f273d2677d59c5624", size = 7631501, upload-time = "2026-11-07T00:31:35.707Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0e/4c/7610d3b55a8d55a5b433665e0c78852d7be6f94795ad74742421d436ee8e/torchlens-2.36.0-py3-none-any.whl", hash = "sha256:11217356d15309c8befb8687f8a74b424c584d1de626a81f20ac08e934ae5d2c", size = 5964043, upload-time = "2026-10-08T02:05:45.595Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/6c/b368485b08104c2c20f39fb59db4c40f768b2edf7a0fff2c0858a7439440/torchlens-3.0.2-py3-none-any.whl", hash = "sha256:891fa9cf1e456f8b1ae653b56c0e760acef4de6a48de11004c8ab1751ede984d", size = 8732574, upload-time = "2026-11-07T00:31:32.813Z" },
 ]
 
 [[package]]

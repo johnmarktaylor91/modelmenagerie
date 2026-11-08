@@ -11,12 +11,19 @@ The tick runs ``step`` every pass (``tick._step_axon``; config ``axon``, ``CONFI
   ``stage3.projected_peak`` (1.5 times any ``memory_cap`` included): (40, 60] GiB goes in a
   ``cpu`` batch (64 GiB) of up to ``rows.cpu`` rows; only when that band has none ready, (60, 120]
   goes in a ``reviewed`` batch (``giants-128g``, 128 GiB) of up to ``rows.reviewed``, run one after
-  another. A batch is packed in feeding order to ``budget_minutes`` of projected row time
+  another. G's own big rows, (``flow.WORKER_GIB``, ``flow.BIG_GIB``], of a cohort listed in
+  ``big_cohorts`` (Crawler 2026-11-04) also go in the cpu band: the tick passes the open ones
+  (reserved for G and queued in no spool, ``Feed.big``) and holds the batch's rows out of every
+  spool while it runs. Such a row the cluster twice did not finish goes back to G untyped
+  (``to_g`` in the state), never ``timeout:axon_batch``. A batch is packed in feeding order to ``budget_minutes`` of projected row time
   (``minutes``: the band's figure, or ``slow`` for a row whose full trace once timed out on the
   worker); the cluster starts no row in the allocation's last 15 minutes, and a row it did not
   reach goes back once. A row over ``max_gib`` gets one
   typed ``oversized:beyond_allocation`` trace row, which settles it until its recipe or the pin
-  moves, and is listed in the state as waiting. Order: rows back from an unfinished batch, then rows with no passing trace of any
+  moves, and is listed in the state as waiting; a row sized only from peaks measured at an older
+  TorchLens pin (``stage3.Peaks.older``, scaled by ``stage3.OLDER_PIN_FACTOR``) instead gets one
+  real try in a reviewed batch, and a typed row at the pin written from such peaks does not
+  settle it (Lead, decisions.md 2026-11-07). Order: rows back from an unfinished batch, then rows with no passing trace of any
   kind, then structure-only ones, then re-traces at an older pin; named models (a library zoo or
   a cited packet) before anonymous repo variants; smaller need first.
 
@@ -25,6 +32,7 @@ State lives in the tick state under ``axon``. The hub imports neither torch nor 
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -51,6 +59,8 @@ CONFIG: dict[str, Any] = {
     "budget_minutes": 100,
     "envs": ["torch-main"],  # one environment per batch; the cluster builds its lock on glibc 2.17
     "max_gib": 120.0,  # past this a row waits: the reviewed 128 GiB allocation cannot hold it
+    # cohorts whose open G rows (WORKER_GIB, BIG_GIB] also go in cpu batches (Crawler 2026-11-04)
+    "big_cohorts": [],
     "render_cpus": 2,
     "render_memory_gib": 6,
 }
@@ -95,19 +105,24 @@ def _trace_rows(data: DataLayout) -> dict[str, list[LedgerRow]]:
     return found
 
 
-def _settled(rows: Sequence[LedgerRow], rev: str, pin: str) -> bool:
+def _settled(rows: Sequence[LedgerRow], rev: str, pin: str, *, older_only: bool = False) -> bool:
     """A full pass at the revision and pin, or a cluster attempt at the revision that ended in
-    anything but ``memory_cap`` (a ``memory_cap`` raises the need into the next band)."""
+    anything but ``memory_cap`` (a ``memory_cap`` raises the need into the next band). A row
+    typed past the largest allocation at the pin while its peaks were all measured at an older
+    pin (``older_only``) is not settled: it gets one real try at the pin first (Lead, 2026-11-07)."""
 
-    for r in rows:
-        if r.recipe_rev != rev or r.capture not in (None, "full"):
-            continue
-        if r.outcome == "pass" and r.tl == pin:
-            return True
-        if r.host == "cluster" and r.outcome == "fail" and \
-                not (r.cls or "").startswith("memory_cap"):
-            return True
-    return False
+    return any(r.recipe_rev == rev and r.capture in (None, "full") and
+               (r.outcome == "pass" and r.tl == pin or _cluster_settles(r, pin, older_only))
+               for r in rows)
+
+
+def _cluster_settles(r: LedgerRow, pin: str, older_only: bool) -> bool:
+    """A cluster failure other than ``memory_cap``, less a typed oversized row at the pin that
+    only older-pin peaks sized."""
+
+    if r.host != "cluster" or r.outcome != "fail" or (r.cls or "").startswith("memory_cap"):
+        return False
+    return not (older_only and r.cls == OVER_CLASS and r.tl == pin)
 
 
 def _tier(rows: Sequence[LedgerRow]) -> int:
@@ -134,22 +149,25 @@ def _eligible(record: ModelRecord, envs: Iterable[str]) -> bool:
             and recipe.placement not in SKIP_PLACEMENTS)
 
 
-def rows(data: DataLayout, cfg: Mapping[str, Any], *, back: Iterable[str] = ()) -> dict[str, list[Row]]:
-    """The rows past G by band, ``cpu``, ``reviewed`` and ``over``, each in feeding order."""
+def rows(data: DataLayout, cfg: Mapping[str, Any], *, back: Iterable[str] = (),
+         big: Iterable[str] = ()) -> dict[str, list[Row]]:
+    """The rows past G by band, ``cpu``, ``reviewed`` and ``over``, each in feeding order; the
+    ``big`` ids (G's open rows the tick hands over) join the cpu band at their own need."""
 
     from menagerie.pipeline import stage3
     from menagerie.pipeline.publish import torchlens_pin
 
     peaks, families = stage3.Peaks.read(data), stage3._families(data)  # noqa: SLF001
-    traces, pin, back = _trace_rows(data), torchlens_pin(), set(back)
+    traces, pin, back, big = _trace_rows(data), torchlens_pin(), set(back), set(big)
     bands: dict[str, list[Row]] = {"cpu": [], "reviewed": [], "over": []}
     for path in sorted((data.root / "models").glob("*/*.json")):
         record = read_json(ModelRecord, path)
-        mine = traces.get(record.id, [])
-        if not _eligible(record, cfg["envs"]) or _settled(mine, record.recipe.rev, pin):  # type: ignore[union-attr]
+        mine, older = traces.get(record.id, []), record.id in peaks.older
+        if not _eligible(record, cfg["envs"]) or \
+                _settled(mine, record.recipe.rev, pin, older_only=older):  # type: ignore[union-attr]
             continue
         need = stage3.projected_peak(record, peaks, families)
-        band = _band(need, cfg)
+        band = _band(need, cfg, big=record.id in big, tried=not older)
         if band is not None:
             tier = -1 if record.id in back else _tier(mine)
             key = (tier, not _named(record, data), round(need, 1), record.id)  # type: ignore[arg-type]
@@ -164,17 +182,22 @@ def _slow(rows: Sequence[LedgerRow]) -> bool:
     return any((r.cls or "").startswith("timeout") and r.capture in (None, "full") for r in rows)
 
 
-def _band(need: float | None, cfg: Mapping[str, Any]) -> str | None:
+def _band(need: float | None, cfg: Mapping[str, Any], *, big: bool = False,
+          tried: bool = True) -> str | None:
     """``cpu`` (40, 60] GiB, ``reviewed`` up to ``max_gib``, ``over`` past it; ``None`` for G's
-    rows and rows with no projection."""
+    rows and rows with no projection, except G's rows handed over (``big``), which are ``cpu``.
+    A row past ``max_gib`` sized only from older-pin peaks (not ``tried``) is ``reviewed``: one
+    real try at the pin before it is typed oversized."""
 
     from menagerie.pipeline import flow
 
-    if need is None or need <= flow.BIG_GIB:
+    if need is None:
         return None
+    if need <= flow.BIG_GIB:
+        return "cpu" if big and need > flow.WORKER_GIB else None
     if need <= flow.REVIEWED_GIB:
         return "cpu"
-    return "reviewed" if need <= float(cfg["max_gib"]) else "over"
+    return "reviewed" if need <= float(cfg["max_gib"]) or not tried else "over"
 
 
 def choose(bands: Mapping[str, Sequence[Row]], cfg: Mapping[str, Any]) -> tuple[str, list[str]] | None:
@@ -217,6 +240,27 @@ def job_id(answer: str) -> str | None:
     return found[-1] if found else None
 
 
+# axon-submit's refusals when other tasks hold the shared queue (``validate_queue`` in
+# the fleet's axon-submit): normal sharing, so the feeder waits rather than failing the pass.
+CAP_REFUSAL = re.compile(r"(Fleet|Project) Axon queue cap reached")
+
+
+class QueueCapHeld(Exception):
+    """axon-submit refused a batch because the fleet's or the project's queue cap is full."""
+
+
+def holders(rows: Sequence[str]) -> str:
+    """Who holds the queue: ``squeue -r`` rows of ``comment|state``, counted by fleet project."""
+
+    counts: dict[str, int] = {}
+    for line in rows:
+        label = line.split("|", 1)[0].strip()
+        if label:
+            name = label.removeprefix("fleet:")
+            counts[name] = counts.get(name, 0) + 1
+    return ", ".join(f"{name} {n}" for name, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
 class Ops:
     """The feeder's calls out: the cluster's queue and batch verbs, and the worker's render job."""
 
@@ -249,6 +293,24 @@ class Ops:
 
         return cluster.submit(batch)
 
+    def queue_holders(self) -> str:
+        """Every task in the shared cluster queue, counted by fleet project (one squeue)."""
+
+        from menagerie.pipeline import cluster
+
+        return holders(cluster._ssh("squeue -h -r -u \"$(whoami)\" -o '%k|%T'").splitlines())
+
+    def discard(self, batch: Path) -> None:
+        """A batch axon-submit refused: its copy on the cluster and its folder here."""
+
+        from menagerie.pipeline import cluster
+
+        try:
+            root = json.loads((batch / "batch.json").read_text(encoding="utf-8"))["root"]
+            cluster._ssh(f"rm -rf {shlex.quote(root)}/batches/{shlex.quote(batch.name)}")
+        finally:
+            _remove_tree(batch)
+
     def collect(self, batch: Path, data: DataLayout) -> dict[str, Any]:
         from menagerie.pipeline import cluster
 
@@ -274,7 +336,7 @@ class Ops:
         subprocess.run(["rsync", "-a", f"{batch}/back/work/attempts/", f"{host}:{rel}/"],
                        check=True, capture_output=True, timeout=1800)
         mem = int(cfg["render_memory_gib"])
-        argv = ["run-on", "submit", "--project", "menagerie", "--os", "linux", "--ref", "main",
+        argv = ["run-on", "submit", "--project", "menagerie", "--os", "linux", "--ref", _render_ref(batch),
                 "--cpus", str(cfg["render_cpus"]), "--memory-gib", str(mem), "--no-fallback",
                 "--pull", f"{RENDER_LINES},outputs/render.log", "--admit-wait", "60", "--", "env",
                 f"AXON_ATTEMPTS={rel}", f"AXON_IDS={' '.join(ids)}", f"MENAGERIE_MEMORY_GB={mem}",
@@ -323,6 +385,20 @@ class Ops:
                        capture_output=True, timeout=300)
 
 
+def _render_ref(batch: Path) -> str:
+    """The commit a batch's render job runs: ``main``, or the batch's own commit when that pins
+    another TorchLens (a batch traced before the pin moved; ``runner_pin.render_ref``)."""
+
+    from menagerie.pipeline import runner_pin
+    from menagerie.pipeline.publish import torchlens_pin
+
+    try:
+        meta = json.loads((batch / "batch.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "main"
+    return runner_pin.render_ref(meta, torchlens_pin()) if isinstance(meta, dict) else "main"
+
+
 def _worker_attempts(batch: str) -> str:
     return f"scratch/menagerie/axon/{batch}/attempts"  # relative to the worker home
 
@@ -349,6 +425,7 @@ class Feed:
     deadline: float = float("inf")
     held: str = ""  # why ``submit`` is off, for the status line
     clock: Callable[[], str] = now
+    big: Sequence[str] = ()  # G's open rows of ``big_cohorts``, from the tick
 
     def room(self) -> bool:
         return time.monotonic() < self.deadline - STEP_ROOM_S
@@ -374,7 +451,10 @@ def step(feed: Feed) -> dict[str, Any]:
         out["waiting"] = _adopt(feed, queued)
         return out
     if feed.room():
-        out["submitted"] = _submit(feed)
+        try:
+            out["submitted"] = _submit(feed)
+        except QueueCapHeld as cap:
+            out["held"] = str(cap)
     return out
 
 
@@ -390,6 +470,18 @@ def _adopt(feed: Feed, queued: Sequence[tuple[str, str, str]]) -> str:
     return f"the cluster queue holds {', '.join(n for _, n, _ in queued)}"
 
 
+def _cap_note(feed: Feed, refusal: str) -> str:
+    """The held note: which cap, and who holds the queue when squeue answers."""
+
+    reason = CAP_REFUSAL.search(refusal)
+    tail = refusal[reason.start():].splitlines()[0] if reason else refusal
+    try:
+        who = feed.ops.queue_holders()
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        who = ""
+    return f"axon queue cap: {tail}" + (f"; held by {who}" if who else "")
+
+
 def _batches_root() -> Path:
     from menagerie.paths import work_dir
 
@@ -397,7 +489,8 @@ def _batches_root() -> Path:
 
 
 def _submit(feed: Feed) -> dict[str, Any]:
-    bands = rows(feed.data, feed.cfg, back=_back(feed.state))
+    big = _handed_over(feed)
+    bands = rows(feed.data, feed.cfg, back=_back(feed.state), big=big)
     over = [r.id for r in bands["over"]]
     if over:
         _type_over(bands["over"], feed.data, feed.cfg)
@@ -409,14 +502,38 @@ def _submit(feed: Feed) -> dict[str, Any]:
     kind, ids = chosen
     batch = feed.ops.batch(kind, ids, feed.data)
     (batch / "feeder").write_text(feed.clock() + "\n", encoding="utf-8")
-    answer = feed.ops.submit(batch)
+    try:
+        answer = feed.ops.submit(batch)
+    except RuntimeError as exc:
+        if not CAP_REFUSAL.search(str(exc)):
+            raise
+        # The refusal is held even if the cleanup fails; the local folder goes regardless
+        # (Ops.discard), a cluster copy left behind is one small batch folder.
+        with contextlib.suppress(OSError, RuntimeError, ValueError, KeyError,
+                                 subprocess.SubprocessError):
+            feed.ops.discard(batch)
+        raise QueueCapHeld(_cap_note(feed, str(exc))) from exc
     job = job_id(answer)
     if job is None:
         raise RuntimeError(f"axon-submit gave no job id for {batch.name}: {answer[:200]}")
     feed.state["active"] = {"batch": batch.name, "job": job, "kind": kind, "ids": ids,
-                            "submitted": feed.clock()}
+                            "submitted": feed.clock(), **_g_rows(ids, big)}
     return {"batch": batch.name, "job": job, "kind": kind, "rows": len(ids),
             **({"typed_over": over} if over else {})}
+
+
+def _handed_over(feed: Feed) -> list[str]:
+    """G's rows the tick handed over, less those the cluster twice did not finish (``to_g``)."""
+
+    returned = set(feed.state.get("to_g") or ())
+    return [sid for sid in feed.big if sid not in returned]
+
+
+def _g_rows(ids: Sequence[str], big: Sequence[str]) -> dict[str, list[str]]:
+    """The batch's rows that are G's, kept in the active entry so collection can return them."""
+
+    mine = [sid for sid in ids if sid in set(big)]
+    return {"g_rows": mine} if mine else {}
 
 
 def _back(state: Mapping[str, Any]) -> list[str]:
@@ -431,7 +548,7 @@ def _collect(feed: Feed, active: Mapping[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f"{batch.name}: its job left the queue but nothing came back")
     table = {r["stable_id"]: r for r in summary.get("rows") or []}
     passed = [sid for sid in meta["ids"] if _cells(table.get(sid), "trace")[:1] == ["trace:pass"]]
-    typed = _unfinished(feed, meta, table)
+    typed = _unfinished(feed, meta, table, g_rows=active.get("g_rows") or ())
     if passed:
         feed.state.setdefault("renders", []).append({"batch": batch.name, "ids": passed})
     times = feed.ops.times(active["job"])
@@ -448,11 +565,13 @@ def _collect(feed: Feed, active: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _unfinished(feed: Feed, meta: Mapping[str, Any], table: Mapping[str, Any]) -> dict[str, list[str]]:
-    """Rows the batch did not finish go back once; the second time they are typed."""
+def _unfinished(feed: Feed, meta: Mapping[str, Any], table: Mapping[str, Any], *,
+                g_rows: Iterable[str] = ()) -> dict[str, list[str]]:
+    """Rows the batch did not finish go back once; the second time they are typed, except G's
+    rows handed over, which go back to G untyped (``to_g``)."""
 
     tries = feed.state.setdefault("tries", {})
-    back, typed = [], []
+    back, typed, g_rows = [], [], set(g_rows)
     for sid in meta["ids"]:
         row = table.get(sid) or {}
         if not _not_finished(row):
@@ -461,8 +580,11 @@ def _unfinished(feed: Feed, meta: Mapping[str, Any], table: Mapping[str, Any]) -
         key = f"{sid}@{meta['revisions'].get(sid)}"
         tries[key] = tries.get(key, 0) + 1
         if tries[key] >= TRIES:
-            typed.append(sid)
             tries.pop(key)
+            if sid in g_rows:
+                feed.state["to_g"] = sorted({*(feed.state.get("to_g") or []), sid})
+            else:
+                typed.append(sid)
         else:
             back.append(sid)
     if typed:

@@ -2,11 +2,13 @@
 
 Owned by the publish lane. Rung 0 writes the export only; nothing is uploaded or deployed.
 
-The export is the five files ``site/scripts/sync_site_data.py`` copies into ``site/site-data/``
-(``models.jsonl``, ``facets.json``, ``funnel.json``, ``export_manifest.json``, ``catalog.csv``)
-plus ``assets.tsv``, the store blobs the records point at, which ``stage_assets`` copies out
-under their public keys (``<sha256><ext>``). Records follow ``ModelRecord`` in
-``site/src/lib/catalog.ts``.
+The export is the files ``site/scripts/sync_site_data.py`` copies into ``site/site-data/``
+(``models.jsonl``, ``facets.json``, ``funnel.json``, ``export_manifest.json``, ``catalog.csv``,
+and the side lists ``roster-index.jsonl`` and ``families.jsonl`` from ``publish_index``) plus
+``assets.tsv``, the store blobs the records point at, which ``publish_assets.stage`` copies out
+under their public keys (``<sha256><ext>``). ``publish_assets.derive`` then adds the SVG sizes,
+top crops and share images. Records follow ``ModelRecord`` in ``site/src/types/record.ts``; every
+field is listed in ``docs/site-export-schema.md``.
 
 Selection: by default a model is exported when its research packet exists (JMT 2026-10-03:
 research finishes before publishing) and either ``ledger.state`` is ``publishable`` or its
@@ -20,18 +22,17 @@ from __future__ import annotations
 import csv
 import json
 import re
-import shutil
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import Any
 
+from menagerie import tl_compat
 from menagerie.pipeline import (
     DataLayout, StoreLayout, citecheck, hash_harness, now, read_json, read_jsonl,
 )
-from menagerie.pipeline import bib_harvest, standin, trace_metrics
+from menagerie.pipeline import bib_harvest, paper_check, publish_names, standin, trace_metrics
 from menagerie.pipeline.records import (
     Citation,
     CitationLine,
@@ -48,7 +49,10 @@ from menagerie.pipeline.records import (
 )
 
 EXPORT_SCHEMA = "site-export/1"
-DATA_FILES = ("models.jsonl", "facets.json", "funnel.json", "export_manifest.json", "catalog.csv")
+# Beside the export: each blob a record names that the store does not hold, and what was done.
+MISSING_BLOBS_FILE = "missing-blobs.tsv"
+DATA_FILES = ("models.jsonl", "facets.json", "funnel.json", "export_manifest.json", "catalog.csv",
+              "roster-index.jsonl", "families.jsonl")
 # The 23 live categories (`site/site-data/facets.json`), kept so existing URLs and facets survive.
 CATEGORIES = (
     "history", "vision_classification-backbone", "vision_segmentation",
@@ -87,10 +91,12 @@ CATEGORY_KEYWORDS = (
     ("classification", "vision_classification-backbone"),
 )
 HISTORY_BEFORE = 1990
-# Public object-key suffix per render kind; tiles stay in the store until the site shows them.
+# Public object-key suffix per asset kind. A tile set is a directory (``<sha>.tiles/``) that stays
+# in the store until the site shows it; ``crop`` and ``share`` are ``publish_assets`` derivatives.
 EXTENSIONS = {
     "svg": ".svg", "pdf": ".pdf", "thumb": ".webp", "html": ".html",
-    "netron": ".netron.json", "model_explorer": ".model-explorer.json",
+    "netron": ".netron.json", "model_explorer": ".model-explorer.json", "tlspec": ".tlspec",
+    "tiles": ".tiles", "crop": ".webp", "share": ".jpg",
 }
 MONSTER_SVG_BYTES = 5 * 1024 * 1024
 MONSTER_OPS = 2000
@@ -113,10 +119,19 @@ class Current:
 
 
 def export_site(*, data: DataLayout, out_dir: Path, ids: Sequence[str] | None = None,
-                as_of: str | None = None) -> Path:
-    """Write the site export for ``ids`` (default: every publishable model); return its path."""
+                as_of: str | None = None, accept_pins: Sequence[str] = (),
+                no_citations: bool = False, shown_only: bool = False) -> Path:
+    """Write the site export for ``ids`` (default: every publishable model); return its path.
 
-    from menagerie.pipeline import ledger, render, roster
+    ``accept_pins`` names earlier TorchLens pins whose deciding traces stand in, in the order
+    given, for a model with no deciding trace at the current pin (``_current``). An export
+    refuses when ``cite/`` holds no shard (a checkout without it would publish no counts)
+    unless ``no_citations`` says that is intended. ``shown_only`` (the CLI's default, so the
+    publish loop's) keeps only the records the site gives a page (``hidden_reason``) and counts
+    the rest in ``counts.dropped_hidden``; without it every publishable record is written.
+    """
+
+    from menagerie.pipeline import ledger, publish_index, render, roster
 
     as_of = as_of or now()[:10]
     tl, renderer = torchlens_pin(), render.renderer_rev()
@@ -137,7 +152,8 @@ def export_site(*, data: DataLayout, out_dir: Path, ids: Sequence[str] | None = 
         hit = standin.detect(model, standins)
         if hit is not None:
             return f"gave up: standin ({hit[1]})"
-        return _current(model, rows_by_id.get(model.id, []), tl=tl, renderer=renderer)
+        return _current(model, rows_by_id.get(model.id, []), tl=tl, renderer=renderer,
+                        accept_pins=accept_pins)
 
     selected = _explicit(ids, models, current) if ids else {
         m.id: found for m in models.values()
@@ -146,25 +162,61 @@ def export_site(*, data: DataLayout, out_dir: Path, ids: Sequence[str] | None = 
     }
     context = _Context.load(data, models=models,
                            roster={r.stable_id: r for r in roster_rows if r.stable_id})
+    if not context.citations and not no_citations:
+        raise RecordError(f"cannot export: {data.root / 'cite'} holds no citation shard "
+                          "(pass --no-citations to export without citation counts)")
     slugs = assign_slugs(models.values())
     records = [
         site_record(models[i], selected[i], slug=slugs[i], context=context,
                     default=render.default_variant)
         for i in sorted(selected, key=lambda i: slugs[i])
     ]
+    records, missing_blobs = _drop_missing_blobs(records, context.store)
+    # With shown_only the export holds exactly the records the site gives a page
+    # (site/src/lib/shown.ts), so the manifest, the downloads and the page counts describe one
+    # set; a hidden model's roster row is listed as a text entry instead.
+    records, hidden = drop_hidden(records) if shown_only else (records, Counter())
+    publish_index.mark_diagrams(records)
+    selected = {r["stable_id"]: selected[r["stable_id"]] for r in records}
+    listed = publish_index.roster_index(
+        roster_rows, models=models, exported=set(selected), packets=context.packets,
+        source_url=_source_url, paper_url=_paper_url,
+        year=lambda packet, row: _era_fields(packet, row)["year"])
+    family_list = publish_index.families(
+        records, models=models, describes=context.describes, packets=context.packets,
+        citation=_citation, paper_url=_paper_url)
     roster_names = sum(1 for r in roster_rows if r.state == "active")
     funnel, manifest = _counts(records, roster_names=roster_names, as_of=as_of, tl=tl,
                                renderer=renderer, basis=hash_harness.headline_basis(data))
+    manifest["counts"].update(roster_index=len(listed), families=len(family_list),
+                              with_citations=sum(r["citations"] is not None for r in records),
+                              catalog_entries=len(records) + len(listed),
+                              dropped_hidden=dict(sorted(hidden.items())))
+    funnel["catalog_entries"] = len(records) + len(listed)
+    manifest["counts"].update(version_counts(records))
+    # Null when no store was there to check against (``MENAGERIE_STORE`` unset).
+    manifest["counts"]["dropped_missing_blob"] = None if missing_blobs is None else len(
+        {row["stable_id"] for row in missing_blobs if row["action"] == "dropped_record"})
     _write_export(Path(out_dir), records, funnel, manifest)
+    if missing_blobs is not None:
+        _write_tsv(Path(out_dir) / MISSING_BLOBS_FILE, publish_index.MISSING_BLOB_FIELDS,
+                   missing_blobs)
+    _write_jsonl(Path(out_dir) / "roster-index.jsonl", listed)
+    _write_jsonl(Path(out_dir) / "families.jsonl", family_list)
     trace_metrics.write_table(Path(out_dir), [
         trace_metrics.metrics_row(i, selected[i].trace, found) for i in sorted(selected)
         if (found := trace_metrics.summary(selected[i].trace, context.store)) is not None])
     return Path(out_dir)
 
 
-def _current(model: ModelRecord, rows: Sequence[LedgerLine], *, tl: str,
-             renderer: str) -> Current | str:
-    """Return the rows a model's record is built from, or why it has none."""
+def _current(model: ModelRecord, rows: Sequence[LedgerLine], *, tl: str, renderer: str,
+             accept_pins: Sequence[str] = ()) -> Current | str:
+    """Return the rows a model's record is built from, or why it has none.
+
+    The deciding trace is the one at pin ``tl``. When there is none at all, the deciding trace at
+    the first of ``accept_pins`` that has a saved one stands in (a model validated before the pin
+    moved), and the state is read at that trace's own pin.
+    """
 
     from menagerie.pipeline import ledger
 
@@ -177,10 +229,16 @@ def _current(model: ModelRecord, rows: Sequence[LedgerLine], *, tl: str,
             isinstance(r, LedgerRow) and r.outcome == "giveup" and r.recipe_rev == rev
             and (r.cls or "").startswith("standin") for r in rows):
         return "gave up: standin (a stand-in recipe)"
+    if ledger.gave_up(model):  # a give-up is the record's outcome (ledger.validated_record)
+        return f"gave up: {model.give_up.cls}"
     # The full capture that decides the verdict; without a saved one, a structure-only one. A
     # structure-only giant that no save level accepts has no `.tlspec`: its renders were drawn in
     # process and are keyed on its summary sha.
     trace = ledger.deciding_trace(model.id, rows, recipe_rev=rev, tl=tl)
+    if trace is None:
+        trace = next((t for pin in accept_pins if pin != tl
+                      and (t := ledger.deciding_trace(model.id, rows, recipe_rev=rev, tl=pin))
+                      is not None and t.trace is not None), None)
     if trace is None or trace.trace is None:
         trace = _latest(rows, lambda r: isinstance(r, LedgerRow) and r.stage == "trace"
                         and r.capture == "structure_only" and r.recipe_rev == rev
@@ -192,10 +250,76 @@ def _current(model: ModelRecord, rows: Sequence[LedgerLine], *, tl: str,
                          and r.outcome in ("pass", "partial"))
     if render_row is None:
         return "no render of the current trace"
-    state = ledger.state(model.id, rows, recipe_rev=rev, tl=tl, renderer_rev=renderer)
+    state = ledger.state(model.id, rows, recipe_rev=rev, tl=trace.tl or tl,
+                         renderer_rev=renderer)
     review = _latest(rows, lambda r: isinstance(r, LedgerRow) and r.stage == "review"
                      and r.recipe_rev == rev and r.outcome != "infra")
     return Current(trace, render_row, state, review)
+
+
+def _drop_missing_blobs(records: list[dict[str, Any]], store: StoreLayout | None,
+                        ) -> tuple[list[dict[str, Any]], list[dict[str, str]] | None]:
+    """``publish_index.drop_missing_blobs`` against ``store``; ``None`` rows without a store."""
+
+    from menagerie.pipeline import publish_index
+    from menagerie.pipeline import store as store_mod
+
+    if store is None:
+        return records, None
+
+    def present(sha: str) -> bool:  # raw, packed or gzipped: any form ``store.get`` reads
+        return (store.blob(sha).exists() or store_mod.packed_path(sha, store=store).is_file()
+                or store_mod.gzipped_path(sha, store=store).is_file())
+
+    return publish_index.drop_missing_blobs(records, present)
+
+
+def drop_hidden(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], Counter[str]]:
+    """The records the site gives a page, and how many of the rest it hides, by reason."""
+
+    hidden = Counter(why for r in records if (why := hidden_reason(r)))
+    return [r for r in records if hidden_reason(r) is None], hidden
+
+
+def hidden_reason(record: Mapping[str, Any]) -> str | None:
+    """Why the site gives ``record`` no page (``shown.ts``, ``recordTier``), or None.
+
+    A fabricated graph or a diagram that is not the model's own is hidden; a structure-only capture
+    keeps its page; any other record needs a passed, validated capture."""
+
+    if record.get("fidelity") == "fabrication":
+        return "fabrication"
+    if record.get("own_diagram") is False:
+        return "not_own_diagram"
+    if "structure_only" in (record.get("capture"), record.get("validation_state")):
+        return None
+    if "validation_state" not in record:  # an export from before validation fields
+        return None
+    if record.get("forward_validated") and record.get("validation_state") == "passed":
+        return None
+    return "not_validated"
+
+
+def version_counts(records: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, int]]:
+    """Records per TorchLens version: all, checked (validated) and structure-only."""
+
+    def tally(keep: Any) -> dict[str, int]:
+        return dict(sorted(Counter(r["torchlens_version"] for r in records if keep(r)).items()))
+
+    return {
+        "by_torchlens_version": tally(lambda r: True),
+        "validated_by_torchlens_version": tally(
+            lambda r: r["forward_validated"] and r["capture"] != "structure_only"),
+        "structure_only_by_torchlens_version": tally(lambda r: r["capture"] == "structure_only"),
+    }
+
+
+def _write_tsv(path: Path, fields: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fields), delimiter="\t",
+                                lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _explicit(ids: Sequence[str], models: Mapping[str, ModelRecord],
@@ -209,6 +333,24 @@ def _explicit(ids: Sequence[str], models: Mapping[str, ModelRecord],
     return found
 
 
+def _one_value_family(records: Sequence[Mapping[str, Any]], basis: Mapping[str, Any]) -> None:
+    """Refuse a distinct-architecture count over hashes from different TorchLens value families
+    (``tl_compat.FAMILY_BREAKS``): the same architecture hashes differently in each, so a mixed
+    set would count it twice."""
+
+    kind = "architecture" if basis["basis"] == "architecture" else "graph_hash"
+    versions: dict[str | None, str] = {}
+    for r in records:
+        version = r.get("torchlens_version")
+        version = None if version in (None, "", "unknown") else str(version)
+        versions.setdefault(tl_compat.family(kind, version), r.get("stable_id", "?"))
+    if len(versions) > 1:
+        raise RecordError(
+            f"distinct architectures would mix {kind} value families "
+            f"{sorted(map(str, versions))} (for example {sorted(versions.values())}); re-trace the "
+            "older rows at the current TorchLens before counting")
+
+
 def _counts(records: Sequence[Mapping[str, Any]], *, roster_names: int, as_of: str, tl: str,
             renderer: str, basis: Mapping[str, Any] | None = None,
             ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -219,10 +361,13 @@ def _counts(records: Sequence[Mapping[str, Any]], *, roster_names: int, as_of: s
     """
 
     basis = basis or {"basis": "graph_shape_hash", "schema": None, "backends": []}
-    validated = [r for r in records if r["forward_validated"]]
+    # Each record counts once: validated (never structure-only), structure-only, or a preview.
+    validated = [r for r in records if r["forward_validated"] and r["capture"] != "structure_only"]
     structure_only = sum(1 for r in records if r["capture"] == "structure_only")
-    keys = {hash_harness.dedup_key(r["hashes"], r["graph_shape_hash"], basis,
-                                   r.get("backend", "torch")) for r in validated}
+    keyed = {id(r): hash_harness.dedup_key(r["hashes"], r["graph_shape_hash"], basis,
+                                           r.get("backend", "torch")) for r in validated}
+    _one_value_family([r for r in validated if keyed[id(r)]], basis)
+    keys = set(keyed.values())
     funnel = {
         "as_of": as_of,
         "roster_names": roster_names,
@@ -298,6 +443,10 @@ class _Context:
                    for f in families if data.packet(f).exists()}
         describes = {f: read_json(DescribeRecord, data.describe(f))
                      for f in families if data.describe(f).exists()}
+        # A record that read a text retired since (``paper_check``: another family's paper) is
+        # not shown until describe writes it again.
+        describes = {f: d for f, d in describes.items()
+                     if f not in packets or not set(d.inputs) & paper_check.retired(packets[f])}
         citations: dict[str, CitationLine] = {}
         for shard in sorted(data.root.glob("cite/*.jsonl")):
             citations.update((line.family, line) for line in read_jsonl(CitationLine, shard))
@@ -386,6 +535,8 @@ def variants_of(render_row: RenderRow, *, n_ops: int | None) -> list[dict[str, A
             "thumb": asset(thumb.sha256, thumb.kind, thumb.bytes),
             "pdf": asset(kinds["pdf"].sha256, "pdf", kinds["pdf"].bytes)
             if "pdf" in kinds else None,
+            "tiles": asset(kinds["tiles"].sha256, "tiles", kinds["tiles"].bytes)
+            if "tiles" in kinds else None,
             "monster": "tiles" in kinds or svg.bytes > MONSTER_SVG_BYTES
             or (n_ops or 0) > MONSTER_OPS,
         })
@@ -398,17 +549,33 @@ def _variant_order(key: str) -> tuple[int, int, int]:
             ("none", "auto", "max").index(collapse))
 
 
-def recipe_text(model: ModelRecord) -> str:
-    """Render the recipe call as one line of Python."""
+def recipe_text(model: ModelRecord, weights_from: str | None = None) -> str:
+    """Render the recipe call as one line of Python; a recipe with ``weights`` adds a comment
+    naming the pretrained weights loaded into it (``weights_from``, their source URL, else the
+    blob's sha)."""
 
     recipe = model.recipe
     if recipe is None:
         return ""
     if recipe.kind == "library":
         args = [repr(a) for a in recipe.args] + [f"{k}={v!r}" for k, v in recipe.kwargs.items()]
-        return f"{recipe.call}({', '.join(args)})"
-    config = f"VARIANTS[{model.variant!r}]" if model.variant else "{}"
-    return f"{recipe.adapter}: build({config})"
+        text = f"{recipe.call}({', '.join(args)})"
+    else:
+        config = f"VARIANTS[{model.variant!r}]" if model.variant else "{}"
+        text = f"{recipe.adapter}: build({config})"
+    if recipe.weights:
+        text += f"  # then loads pretrained weights: {weights_from or 'sha256 ' + recipe.weights}"
+    return text
+
+
+def _weights_from(model: ModelRecord, context: _Context) -> str | None:
+    """The source URL the store index gives a recipe's weights blob, else ``None``."""
+
+    from menagerie.pipeline import store as store_mod
+
+    sha = model.recipe.weights if model.recipe else None
+    line = store_mod.index_line(sha, data=context.data) if sha else None
+    return line.url if line is not None else None
 
 
 def site_record(model: ModelRecord, current: Current, *, slug: str, context: _Context,
@@ -423,20 +590,21 @@ def site_record(model: ModelRecord, current: Current, *, slug: str, context: _Co
     return {
         "stable_id": model.id,
         "slug": slug,
-        "display_name": model.name,
+        "display_name": publish_names.model_name(slug, model.name),
         "category": category_for(describe, roster_row),
         "family_normalized": packet.identity.canonical if packet else model.family[2:],
         "domain": describe.domain or (roster_row.domain if roster_row else None) or "unknown",
-        "zoo": model.zoo,
-        "source_zoo": _library_label(packet) or model.zoo,
+        "zoo": publish_names.bare_zoo(model.zoo),
+        "source_zoo": publish_names.bare_zoo(_library_label(packet) or model.zoo),
         "source_license": _license(model, packet),
         "source_url": _source_url(model, packet),
         "paper_url": _paper_url(packet),
         "render_status": "rendered",
         "quarantine": False,
-        "recipe_text": recipe_text(model),
+        "recipe_text": recipe_text(model, _weights_from(model, context)),
         "rung": model.source_case,
-        "forward_validated": current.validated,
+        # One predicate for the flag and every count: a structure-only capture is never validated.
+        "forward_validated": current.validated and current.trace.capture != "structure_only",
         "fidelity": current.review.verdict if current.review else None,
         **_trace_fields(model, current, context, default=default),
         **_paper_fields(model, packet, context),
@@ -501,7 +669,7 @@ def _paper_fields(model: ModelRecord, packet: Packet | None,
         "paper_title": citation.title,
         "year": citecheck.year_of(citation.first_public),
         "authors": list(citation.authors),
-        "venue": citation.venue,
+        "venue": publish_names.collapse_repeat(citation.venue),
         "bibtex": _bibtex(model, packet, context),
         "citations": {"count": count, "as_of": cited.at[:10]} if cited and count is not None
         else None,
@@ -535,6 +703,8 @@ def _describe_fields(model: ModelRecord, describe: DescribeRecord) -> dict[str, 
     # the taxonomy and keywords of such a record still do.
     prose = describe.grounding_state != "ungrounded"
     return {
+        "summary_basis": describe.basis,
+        "summary_checked": describe.grounding_state == "grounded",
         "tagline": describe.tagline if prose else None,
         "summary_markdown": describe.summary_markdown if prose else None,
         "key_contribution": describe.key_contribution if prose else None,
@@ -603,8 +773,7 @@ def _tlspec(trace: LedgerRow, context: _Context) -> dict[str, Any] | None:
     size = context.blob_bytes.get(trace.trace or "")
     if size is None:
         return None
-    return {"url": f"/export/assets/{trace.trace}.tlspec", "sha256": trace.trace, "bytes": size,
-            "runnable": trace.runnable == "ready"}
+    return {**asset(trace.trace, "tlspec", size), "runnable": trace.runnable == "ready"}
 
 
 def _bibtex(model: ModelRecord, packet: Packet | None, context: _Context) -> str | None:
@@ -624,7 +793,8 @@ def _bibtex(model: ModelRecord, packet: Packet | None, context: _Context) -> str
         "title": citation.title,
         "author": " and ".join(citation.authors) or None,
         "year": citation.first_public[:4] if citation.first_public else None,
-        "journal": citation.venue or (f"arXiv:{citation.arxiv}" if citation.arxiv else None),
+        "journal": publish_names.collapse_repeat(citation.venue)
+        or (f"arXiv:{citation.arxiv}" if citation.arxiv else None),
         "doi": citation.doi,
         "eprint": citation.arxiv,
     }
@@ -664,16 +834,51 @@ def _facets(records: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, An
     return facets
 
 
-def _assets(records: Sequence[Mapping[str, Any]]) -> list[tuple[str, str, int]]:
-    """Return ``(key, sha256, bytes)`` for every store blob the records point at."""
+RECORD_ASSETS = {"interactive": "html", "netron": "netron", "model_explorer": "model_explorer",
+                 "tlspec": "tlspec", "share_image": "share"}
+VARIANT_ASSETS = ("svg", "thumb", "pdf", "tiles", "thumb_crop")
+
+
+def asset_kind(key: str) -> str:
+    """The asset kind of a public key, from its suffix (a thumbnail and a crop share ``.webp``;
+    ``assets.tsv`` carries the kind, so this only reads files written before it did)."""
+
+    for kind, ext in sorted(EXTENSIONS.items(), key=lambda kv: -len(kv[1])):
+        if key.endswith(ext) and kind not in ("crop",):
+            return kind
+    raise RecordError(f"{key}: no asset kind has this suffix")
+
+
+def assets_of(records: Sequence[Mapping[str, Any]]) -> list[tuple[str, str, int, str]]:
+    """Return ``(key, sha256, bytes, kind)`` for every blob the records point at."""
 
     refs = []
     for record in records:
-        refs += [record[k] for k in ("interactive", "netron", "model_explorer", "tlspec")
-                 if record[k]]
+        refs += [(record[k], kind) for k, kind in RECORD_ASSETS.items() if record.get(k)]
         for variant in record["variants"]:
-            refs += [variant[k] for k in ("svg", "thumb", "pdf") if variant[k]]
-    return sorted({(r["url"].rsplit("/", 1)[1], r["sha256"], r["bytes"]) for r in refs})
+            refs += [(variant[k], "crop" if k == "thumb_crop" else _thumb_kind(variant, k))
+                     for k in VARIANT_ASSETS if variant.get(k)]
+    return sorted({(r["url"].rsplit("/", 1)[1], r["sha256"], r["bytes"], kind)
+                   for r, kind in refs})
+
+
+def _thumb_kind(variant: Mapping[str, Any], key: str) -> str:
+    # A missing thumbnail falls back to the SVG itself (``variants_of``): its kind is ``svg``.
+    return "svg" if key == "thumb" and variant["thumb"]["url"].endswith(".svg") else key
+
+
+def write_assets(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("key\tsha256\tbytes\tkind\n")
+        handle.writelines(f"{key}\t{sha}\t{size}\t{kind}\n"
+                          for key, sha, size, kind in assets_of(records))
+
+
+def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True, separators=(",", ":"),
+                                    ensure_ascii=False) + "\n")
 
 
 def _write_export(out: Path, records: list[dict[str, Any]], funnel: dict[str, Any],
@@ -684,10 +889,7 @@ def _write_export(out: Path, records: list[dict[str, Any]], funnel: dict[str, An
         text = json.dumps(value, indent=2, sort_keys=True)
         (out / name).write_text(text + "\n", encoding="utf-8")
 
-    with (out / "models.jsonl").open("w", encoding="utf-8") as handle:
-        for record in records:
-            line = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            handle.write(line + "\n")
+    _write_jsonl(out / "models.jsonl", records)
     dump("funnel.json", funnel)
     dump("export_manifest.json", manifest)
     dump("facets.json", _facets(records))
@@ -695,34 +897,15 @@ def _write_export(out: Path, records: list[dict[str, Any]], funnel: dict[str, An
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(records)
-    with (out / "assets.tsv").open("w", encoding="utf-8") as handle:
-        handle.write("key\tsha256\tbytes\n")
-        handle.writelines(f"{key}\t{sha}\t{size}\n" for key, sha, size in _assets(records))
+    write_assets(out / "assets.tsv", records)
 
 
 def stage_assets(export_dir: Path, *, store: StoreLayout, dest: Path) -> list[str]:
-    """Copy every blob ``assets.tsv`` names from the store to ``dest/<key>``; return missing keys.
+    """Copy every blob ``assets.tsv`` names to ``dest/<key>``; return the missing keys.
 
-    A ``.tlspec`` blob is a directory in the store and is copied as one; a packed blob is read
-    through its packed form. A blob only the box holds is missing (``store_box restore`` first).
-    """
+    The whole-export form of ``publish_assets.stage`` (every kind the file lists)."""
 
-    from menagerie.pipeline import store as store_mod
+    from menagerie.pipeline import publish_assets
 
-    dest.mkdir(parents=True, exist_ok=True)
-    missing = []
-    with (export_dir / "assets.tsv").open(encoding="utf-8") as handle:
-        for row in csv.DictReader(handle, delimiter="\t"):
-            try:
-                store_mod.read_blob(row["sha256"], partial(_copy_blob, dest / row["key"]),
-                                    store=store)
-            except FileNotFoundError:
-                missing.append(row["key"])
-    return missing
-
-
-def _copy_blob(target: Path, source: Path) -> None:
-    if source.is_dir():
-        shutil.copytree(source, target, dirs_exist_ok=True)
-    elif not target.exists():
-        shutil.copyfile(source, target)
+    report = publish_assets.stage(export_dir, dest, store=store, kinds=None)
+    return list(report["missing"])

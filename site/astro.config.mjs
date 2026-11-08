@@ -4,10 +4,11 @@ import { fileURLToPath } from "node:url";
 import sitemap from "@astrojs/sitemap";
 import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "astro/config";
+import { makeAssetHref } from "./src/lib/asset-href.mjs";
 import { DATASET_FILES, PAGES_MAX_FILE_BYTES, publicDatasetText } from "./src/lib/dataset-files.mjs";
 
-/** Asset base for diagram files (the hosting build sets it). */
-const PUBLIC_R2_BASE = process.env.PUBLIC_R2_BASE ?? "";
+/** Public addresses for diagram files: the hosting build sets PUBLIC_R2_BASE (and may set PUBLIC_ASSET_CACHE_KEY). */
+const assetHref = makeAssetHref(process.env.PUBLIC_R2_BASE, process.env.PUBLIC_ASSET_CACHE_KEY);
 
 /**
  * Copy the committed catalog files into the build so the Dataset page links to same-origin downloads.
@@ -23,7 +24,7 @@ function datasetDownloads() {
         fs.mkdirSync(outDir, { recursive: true });
         for (const name of DATASET_FILES) {
           const source = fileURLToPath(new URL(`./site-data/${name}`, import.meta.url));
-          const text = publicDatasetText(fs.readFileSync(source, "utf-8"), PUBLIC_R2_BASE);
+          const text = publicDatasetText(fs.readFileSync(source, "utf-8"), assetHref);
           const size = Buffer.byteLength(text);
           if (size > PAGES_MAX_FILE_BYTES) {
             logger.warn(`${name} is ${size} bytes, above the hosting limit; not copied.`);

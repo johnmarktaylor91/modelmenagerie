@@ -11,7 +11,7 @@ dependencies = [
     "flax",
     "equinox",
     "torch==2.6.*",
-    "torchlens[jax]==2.36.0",
+    "torchlens[jax]==3.0.2",
     # Menagerie's runtime dependencies, so the worker runs here without installing anything.
     "numpy",
     "packaging",

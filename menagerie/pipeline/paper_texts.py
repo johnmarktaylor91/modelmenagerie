@@ -13,7 +13,14 @@ step's own), ``spdx`` from arXiv's rights link or OpenAlex's location license, e
 Texts are third-party store blobs read only for grounding quotes; nothing republishes them.
 Failures rest ``RETRY_DAYS`` in ``work_dir("paper-texts")/tried.json``.
 
-The tick's trickle fetches a few a pass (``paper_texts``); a backlog runs as its own unit,
+A packet whose citation names an arXiv id or a DOI that no paper source holds (a paper found later,
+by ``identify``) is due the same way, through a paper source ``p-cited`` for that id; these come
+after every other due packet. ``identify`` is the low-priority step before that: a family describe
+typed with no text at all and whose citation has no id gets ``find_paper.find`` (exact title or
+identifier agreement, never a guess from the name); a family it does not resolve rests
+``RETRY_DAYS`` in ``work_dir("paper-texts")/identify.json``.
+
+The tick's trickle fetches a few a pass (``paper_texts``) and then identifies a few (``paper_find``); a backlog runs as its own unit,
 ``python -m menagerie.pipeline.paper_texts`` (``main``), which commits exactly what it wrote
 (``tick_commit``) every ``--commit-every`` packets. Never run both at once: set the trickle's
 ``paper_texts`` to 0 while the unit runs.
@@ -37,12 +44,16 @@ from pathlib import Path
 from typing import Any
 
 from menagerie.paths import work_dir
-from menagerie.pipeline import DataLayout, StoreLayout, fetch, now, read_json, write_json
+from menagerie.pipeline import (
+    DataLayout, StoreLayout, bib_harvest, fetch, now, read_json, read_json_cached, write_json,
+)
 from menagerie.pipeline import store as store_mod
-from menagerie.pipeline import tick_commit, written
+from menagerie.pipeline import paper_check, tick_commit, written
 from menagerie.pipeline.records import Amendment, Packet, Source, StoreIndexLine
 
 BY = "paper-texts"
+FIND_BY = "paper-find"  # find_paper.BY, imported late there
+CITED = "p-cited"
 RETRY_DAYS = 14
 RIGHTS = re.compile(r'href="(https?://(?:creativecommons\.org/(?:licenses|publicdomain)/[^"]+'
                     r'|arxiv\.org/licenses/[^"]+))"', re.I)
@@ -55,12 +66,33 @@ def _pdf_sid(sid: str) -> str:
     return f"{sid}-pdf"
 
 
-def _wanting(packet: Packet) -> list[Source]:
-    """Paper sources with a URL, no saved blob and no fetched ``<sid>-pdf`` sibling."""
+def _cited(packet: Packet) -> Source | None:
+    """A paper source for the citation's arXiv id or DOI when no paper source names it yet."""
 
-    sids = {s.sid for s in packet.sources}
-    return [s for s in packet.sources if s.role == "paper" and s.url and not s.blob
-            and _pdf_sid(s.sid) not in sids]
+    cite = packet.citation
+    if cite is None or not (cite.arxiv or cite.doi) or bib_harvest.citation_held(packet) \
+            or bib_harvest.no_paper(packet) or CITED in {s.sid for s in packet.sources}:
+        return None
+    named = {(fetch._arxiv_id(s.url), fetch._doi(s.url))  # noqa: SLF001
+             for s in packet.sources if s.role == "paper" and s.url}
+    if any((cite.arxiv and arxiv == cite.arxiv) or (cite.doi and doi and doi.lower() == cite.doi.lower())
+           for arxiv, doi in named):
+        return None
+    url = f"https://arxiv.org/abs/{cite.arxiv}" if cite.arxiv else f"https://doi.org/{cite.doi}"
+    return Source(sid=CITED, role="paper", url=url, official=True)
+
+
+def _wanting(packet: Packet) -> list[Source]:
+    """Paper sources with a URL, no saved blob and no fetched ``<sid>-pdf`` sibling, then the
+    citation's own paper when no source names it (``_cited``). Nothing when paper harvest refused
+    the packet's link (``paper_check.refused_link``); never a retired or held source."""
+
+    if paper_check.refused_link(packet):
+        return []
+    sids, gone = {s.sid for s in packet.sources}, paper_check.retired(packet)
+    own = [s for s in packet.sources if s.role == "paper" and s.url and not s.blob
+           and _pdf_sid(s.sid) not in sids and s.sid not in gone]
+    return [*own, *filter(None, (_cited(packet),))]
 
 
 def due(packet: Packet) -> bool:
@@ -70,17 +102,17 @@ def due(packet: Packet) -> bool:
     return not texts and bool(_wanting(packet))
 
 
-def _tried_path() -> Path:
-    return work_dir("paper-texts") / "tried.json"
+def _tried_path(name: str = "tried") -> Path:
+    return work_dir("paper-texts") / f"{name}.json"
 
 
-def _read_tried() -> dict[str, dict[str, str]]:
-    path = _tried_path()
+def _read_tried(name: str = "tried") -> dict[str, dict[str, str]]:
+    path = _tried_path(name)
     return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
 
 
-def _write_tried(tried: Mapping[str, Any]) -> None:
-    path = _tried_path()
+def _write_tried(tried: Mapping[str, Any], name: str = "tried") -> None:
+    path = _tried_path(name)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_text(json.dumps(tried, indent=1, sort_keys=True) + "\n", encoding="utf-8")
@@ -97,22 +129,27 @@ def _resting(entry: Mapping[str, str] | None, at: datetime) -> bool:
 def _due_packets(families: Sequence[str] | None, data: DataLayout,
                  tried: Mapping[str, Mapping[str, str]]) -> list[Packet]:
     """Due packets not resting after a recent failure; families describe has already seen (so
-    validated) first."""
+    validated) first, and packets due only for their citation's paper (``_cited``) last."""
 
     paths = ([data.packet(f) for f in dict.fromkeys(families)] if families is not None
              else sorted(data.root.glob("research/*/*.json")))
     at = datetime.now(timezone.utc)
     found = []
     for path in paths:
-        raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-        if not any(s.get("role") == "paper" and not s.get("blob") for s in raw.get("sources") or ()):
+        if not path.is_file():
             continue
-        if _resting(tried.get(str(raw.get("family"))), at):
+        packet = read_json_cached(Packet, path)
+        cite = packet.citation
+        if not any(s.role == "paper" and not s.blob for s in packet.sources) \
+                and not (cite and (cite.arxiv or cite.doi)):
             continue
-        packet = read_json(Packet, path)
+        if _resting(tried.get(packet.family), at):
+            continue
         if due(packet):
             found.append(packet)
-    return sorted(found, key=lambda p: (not data.describe(p.family).is_file(), p.family))
+    only_cited = {p.family for p in found if [s.sid for s in _wanting(p)] == [CITED]}
+    return sorted(found, key=lambda p: (p.family in only_cited, not data.describe(p.family).is_file(),
+                                        p.family))
 
 
 # --- licenses ------------------------------------------------------------------------------
@@ -215,6 +252,7 @@ def _paper(paper: Source, *, store: StoreLayout, data: DataLayout, taken: set[st
 
 def _one(packet: Packet, *, store: StoreLayout, data: DataLayout) -> dict[str, Any]:
     taken = {s.sid for s in packet.sources}
+    have_sids = set(taken)
     replaced: dict[str, Source] = {}
     added: list[Source] = []
     notes = []
@@ -223,9 +261,11 @@ def _one(packet: Packet, *, store: StoreLayout, data: DataLayout) -> dict[str, A
             got, note = _paper(paper, store=store, data=data, taken=taken)
         except (fetch.FetchError, ValueError, OSError) as exc:
             got, note = [], f"{paper.sid}: {type(exc).__name__}: {exc}"
+        if paper.sid == CITED and got and all(src.sid != CITED for src in got):
+            got = [paper, *got]  # A DOI's PDF lands beside the citation's paper it came from.
         notes.append(note)
         for src in got:
-            if src.sid == paper.sid:
+            if src.sid == paper.sid and src.sid in have_sids:
                 replaced[src.sid] = src
             else:
                 added.append(src)
@@ -241,9 +281,35 @@ def _one(packet: Packet, *, store: StoreLayout, data: DataLayout) -> dict[str, A
                *(s for s in added if s.sid not in have))
     amendment = Amendment(at=now(), why=f"paper texts: {'; '.join(notes)}"[:300],
                           evidence=tuple(texts), changed=("sources",), by=BY)
-    write_json(replace(fresh, sources=sources, amendments=(*fresh.amendments, amendment)),
-               data.packet(packet.family))
-    return {"family": packet.family, "status": "text", "sids": texts}
+    fetched = replace(fresh, sources=sources, amendments=(*fresh.amendments, amendment))
+    with tempfile.TemporaryDirectory(prefix="paper-texts-") as tmp:
+        verdicts = paper_check.check(fetched, data=data, store=store, tmp=Path(tmp))
+    bad = [sid for sid in texts if verdicts.get(sid) == "mismatch"]
+    if bad:
+        fetched = paper_check.retire(fetched, bad, "the fetched paper never names the family")
+    if bad and len(bad) == len(texts):
+        fetched = _undo_find(fetched)
+    write_json(fetched, data.packet(packet.family))
+    if len(bad) == len(texts):
+        return {"family": packet.family, "status": "none",
+                "why": f"title check: {', '.join(bad)} never names the family"}
+    return {"family": packet.family, "status": "text", "sids": [s for s in texts if s not in bad]}
+
+
+def _undo_find(packet: Packet) -> Packet:
+    """When the citation is a paper find's (the latest citation change) and the paper it found
+    never names the family, the find took another family's title (a classics module's docstring
+    names several): its records are retired, the citation cleared and the paper marked not found."""
+
+    find = next((a for a in reversed(packet.amendments) if "citation" in a.changed), None)
+    if find is None or find.by != FIND_BY or packet.citation is None:
+        return packet
+    undo = Amendment(at=now(), by=paper_check.UNDONE, changed=("citation", "availability"),
+                     evidence=find.evidence,
+                     why=f"paper check: undo the paper find of {find.at}: its paper never names the family")
+    undone = replace(packet, citation=None, amendments=(*packet.amendments, undo),
+                     availability=replace(packet.availability, paper="not_found"))
+    return paper_check.retire(undone, find.evidence, "a paper find's records for another family's paper")
 
 
 def texts(families: Sequence[str] | None, *, data: DataLayout, store: StoreLayout,
@@ -274,6 +340,65 @@ def texts(families: Sequence[str] | None, *, data: DataLayout, store: StoreLayou
         else:
             tried[packet.family] = {"at": now(), "why": row["why"]}
         _write_tried(tried)
+    return out
+
+
+def _textless(family: str, data: DataLayout) -> bool:
+    """Describe typed the family with no text at all (``basis`` none, or an old no_text record)."""
+
+    path = data.describe(family)
+    if not path.is_file():
+        return False
+    record = json.loads(path.read_text(encoding="utf-8"))
+    return record.get("basis") == "none" or (
+        not record.get("basis") and record.get("class") == "describe:no_text")
+
+
+def _unidentified(families: Sequence[str] | None, data: DataLayout,
+                  tried: Mapping[str, Mapping[str, str]]) -> list[str]:
+    paths = ([data.packet(f) for f in dict.fromkeys(families)] if families is not None
+             else sorted(data.root.glob("research/*/*.json")))
+    at, todo = datetime.now(timezone.utc), []
+    for path in paths:
+        raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        family, cite = str(raw.get("family")), raw.get("citation") or {}
+        if cite.get("arxiv") or cite.get("doi") or _resting(tried.get(family), at):
+            continue
+        if any(a.get("by") == paper_check.UNDONE and "citation" in a.get("changed", ())
+               for a in raw.get("amendments", ())):
+            continue  # A find here was undone (another family's paper): never found again.
+        if _textless(family, data):
+            todo.append(family)
+    return todo
+
+
+def identify(families: Sequence[str] | None, *, data: DataLayout, store: StoreLayout,
+             limit: int | None = None, write: bool = True, seconds: float | None = None
+             ) -> list[dict[str, Any]]:
+    """``find_paper.find`` for families describe found no text for and whose citation has no id,
+    at most ``limit`` and none started after ``seconds``. A found paper becomes due for ``texts``
+    (``_cited``); anything else rests ``RETRY_DAYS``. Without ``write`` it lists them (``due``)."""
+
+    from menagerie.pipeline import find_paper
+
+    if limit is not None and limit < 0:
+        raise ValueError("paper find limit must be nonnegative")
+    tried = _read_tried("identify")
+    todo = _unidentified(families, data, tried)[:limit]
+    if not write:
+        return [{"family": f, "status": "due"} for f in todo]
+    began, out = time.monotonic(), []
+    for family in todo:
+        if seconds is not None and time.monotonic() - began > seconds:
+            break
+        try:
+            row = find_paper.find([family], data=data, store=store)[0]
+        except Exception as exc:  # noqa: BLE001 -- one family's failure never stops the run
+            row = {"family": family, "status": "error", "reason": f"{type(exc).__name__}: {exc}"[:400]}
+        out.append({**row, "by": "paper-find"})
+        if row["status"] != "found":
+            tried[family] = {"at": now(), "why": str(row.get("reason") or row["status"])[:200]}
+        _write_tried(tried, "identify")
     return out
 
 

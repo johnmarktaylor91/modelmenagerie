@@ -112,3 +112,21 @@ def test_an_unproven_start_holds_the_batch_instead_of_starting_twice(monkeypatch
     monkeypatch.setattr(mini_placement, "start_describe", start)
     with pytest.raises(admission.Refused, match="worker_uncertain"):
         describe_workers.launch(Path("/nonexistent/BRIEF.md"), ["f-a"], role="model-judgment")
+
+
+def test_a_worker_lane_whose_agent_never_started_is_known(tmp_path):
+    lane = {"run": "r1", "placement": "zm", "label": "describe-mini-y"}
+    assert not describe_workers.never_ran({"run": "r0"})  # a hub lane
+    assert not describe_workers.never_ran(lane)  # nothing known: not proven
+    state = mini_relay.state_dir("describe-mini-y")
+    state.mkdir(parents=True)
+    (state / "staged.json").write_text(json.dumps({"phase": "aborted"}))
+    assert describe_workers.never_ran(lane)  # the login delivery failed before READY
+    (state / "staged.json").write_text(json.dumps({"phase": "ready"}))
+    pulled = tmp_path / "pulled"
+    pulled.mkdir()
+    (pulled / "lane.json").write_text("{}")
+    (state / "ingested.json").write_text(json.dumps({"status": "no-result", "pulled": str(pulled)}))
+    assert describe_workers.never_ran(lane)  # it stopped before its agent started
+    (pulled / "agent.log").write_text("ran")
+    assert not describe_workers.never_ran(lane)  # it ran and wrote nothing: a failed lane

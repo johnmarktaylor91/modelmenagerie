@@ -1,16 +1,19 @@
 ---
 import { findDefaultVariant, getStandInShareCount, type ModelRecord } from "@/lib/catalog";
+import { familyDisplayName } from "@/lib/families";
 import { cardDataFromRecord, renderCardHtml } from "@/scripts/CardView";
 
 interface Props {
   model: ModelRecord;
   headingLevel?: 2 | 3;
+  /** First row of a listing: load the picture first. */
+  priority?: boolean;
 }
 
-const { model, headingLevel = 2 } = Astro.props;
+const { model, headingLevel = 2, priority = false } = Astro.props;
 // One renderer for build-time and filtered cards; see src/scripts/CardView.ts.
-const standIn = getStandInShareCount(findDefaultVariant(model)) > 0;
-const html = renderCardHtml(cardDataFromRecord(model, standIn), { headingLevel });
+const standIn = getStandInShareCount(findDefaultVariant(model), model) > 0;
+const html = renderCardHtml(cardDataFromRecord(model, standIn, familyDisplayName(model.family_normalized)), { headingLevel, priority });
 ---
 
 <Fragment set:html={html} />
@@ -75,11 +78,15 @@ const html = renderCardHtml(cardDataFromRecord(model, standIn), { headingLevel }
     height: auto;
   }
 
-  /* A real top crop (800 by 600) fills the box, anchored at the top of the graph. */
-  .model-card__frame--crop img {
-    height: 100%;
-    object-fit: cover;
-    object-position: top center;
+  /* A real top crop (800 wide, up to 600 tall) sits at the top of the box at the box's width. */
+  .model-card__frame--crop {
+    justify-content: flex-start;
+  }
+
+  /* A featured model's chosen window on its SVG: block layout, so the image's percentage margins
+     (set inline from featured-view.ts) resolve against the frame's width. */
+  .model-card__frame--window {
+    display: block;
   }
 
   /* A text card has no picture: its empty frame appears only as the list view's placeholder. */
@@ -90,6 +97,17 @@ const html = renderCardHtml(cardDataFromRecord(model, standIn), { headingLevel }
 
   .model-card__frame--empty::after {
     content: none;
+  }
+
+  /* A catalogued model with no diagram yet: no page, so only its paper and code links are links. */
+  .model-card--listed .model-card__body {
+    padding: 0.75rem 0.85rem;
+  }
+
+  .listed-entry__link {
+    color: var(--link, var(--accent));
+    text-decoration: underline;
+    text-underline-offset: 2px;
   }
 
   .model-card--text {
@@ -164,8 +182,13 @@ const html = renderCardHtml(cardDataFromRecord(model, standIn), { headingLevel }
     font-size: 0.75rem;
   }
 
-  .model-card__chip--verified {
+  .model-card__chip--replay {
     border-color: var(--verified);
     color: var(--verified);
+  }
+
+  .model-card__chip--structure {
+    border-style: dashed;
+    color: var(--text);
   }
 </style>

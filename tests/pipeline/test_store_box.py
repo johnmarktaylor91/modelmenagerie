@@ -242,6 +242,29 @@ def test_a_failed_trim_job_still_commits_its_journal(tmp_path, monkeypatch):
     assert "failed before it finished: pull-outputs failed" in (tmp_path / "daily.log").read_text()
 
 
+def test_a_store_pressure_request_sets_the_next_trims_ceiling_once(tmp_path, monkeypatch):
+    import datetime as dt
+
+    commands = []
+    monkeypatch.setattr(store_box, "reconcile", lambda *a: 0)
+    monkeypatch.setattr(store_box, "sync_catalog", lambda *a: 4)
+    monkeypatch.setattr(store_box, "run_job", lambda repo, host, job, command, **k:
+                        commands.append(command) or ("", f"{job} w DONE rc=0"))
+    now = dt.datetime.now(dt.timezone.utc)
+    store_box.request_ceiling(tmp_path, 12.0, now)
+    state = tmp_path / "outputs" / "store-box-daily"
+    assert store_box.requested_ceiling(state, now) == 12.0
+    assert store_box.trim(tmp_path, "w", "1", "w-hub", state) == 0
+    assert "TRIM_CEILING_GIB=12 bash menagerie/pipeline/store_trim_job.sh apply" in commands[0]
+    assert not (state / store_box.CEILING_REQUEST).exists()  # consumed
+    assert store_box.trim(tmp_path, "w", "2", "w-hub", state) == 0
+    assert "TRIM_CEILING_GIB" not in commands[1]  # the next trim keeps the default target
+    store_box.request_ceiling(tmp_path, 12.0, now - dt.timedelta(hours=7))  # its trim never ran
+    assert store_box.requested_ceiling(state, now) is None
+    (state / store_box.CEILING_REQUEST).write_text("not json")
+    assert store_box.requested_ceiling(state, now) is None
+
+
 def test_trim_gate_needs_a_receipt_for_every_sealed_batch(tmp_path):
     assert store_box.trim_gate([], {}, tmp_path)  # nothing new today: earlier batches still prove
     assert not store_box.trim_gate(["daily-1"], {}, tmp_path)
@@ -279,6 +302,12 @@ def test_commit_placement_appends_the_trim_lines_and_commits_that_file_alone(tmp
     tool.write_text("#!/bin/sh\nexit 1\n")  # a commit that fails leaves the file as committed
     assert store_box.commit_placement(repo, ['{"q": 1}\n'], "202610121402", tmp_path) == -1
     assert shard.read_text() == before and _git(repo, "status", "--porcelain") == " M other.txt\n"
+    tool.write_text("#!/bin/sh\n# -C REPO -m MSG -- PATH\ngit -C \"$2\" -c user.email=t@t -c user.name=t "
+                    "commit -q --only -m \"$4\" -- \"$6\"\n")
+    signed = '{"sha256":"aa","url":"https://e.com/x.pdf?X-Amz-Signature=ab"}\n'  # an older worker's journal
+    assert store_box.commit_placement(repo, [signed], "202610121402", tmp_path) == 1
+    assert shard.read_text().endswith('{"sha256":"aa","url":"https://e.com/x.pdf"}\n')
+    before = shard.read_text()
     shard.write_text(before + "uncommitted\n")  # someone's pending edit: refuse, even with nothing new
     assert store_box.commit_placement(repo, journals, "202610121403", tmp_path) == -1
     assert shard.read_text().endswith("uncommitted\n")

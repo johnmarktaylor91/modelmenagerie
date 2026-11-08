@@ -1,0 +1,6 @@
+# Cloudflare Pages redirects. Old or short model addresses that people link to, sent to the checked page.
+# Each target must be a slug in site-data/models.jsonl; QA's dist check fails a rule whose target is not built.
+/models/gpt2/  /models/gpt2-huggingface/  301
+/models/gpt2   /models/gpt2-huggingface/  301
+/models/vit/   /models/vit-b-16-torchvision/  301
+/models/vit    /models/vit-b-16-torchvision/  301

@@ -4,10 +4,12 @@
  * exists), files, details and related models. Used by /models/<slug>/ and the fixture pages,
  * so a full record and an all-empty one both render through the same markup.
  */
+import { summaryLabel } from "@/lib/summary";
+import CopyCode from "@/components/CopyCode.astro";
 import DiagramViewer from "@/components/DiagramViewer.astro";
 import ModelCard from "@/components/ModelCard.astro";
 import { findDefaultVariant, type ModelRecord } from "@/lib/catalog";
-import { categoryLabel, formatNumber, isPresent } from "@/lib/labels";
+import { formatNumber, isPresent, taskLabel } from "@/lib/labels";
 import { renderSummaryMarkdown } from "@/lib/markdown";
 import { modelDetails, modelFacts, modelFiles, validationTag } from "@/lib/modelFacts";
 
@@ -17,16 +19,16 @@ interface Props {
   family: { name: string; href: string; size: number } | null;
   familyMembers: ModelRecord[];
   sameShape: ModelRecord[];
+  /** Models outside the family whose default diagram is the identical drawing. */
+  sameDiagram?: ModelRecord[];
   prev: ModelRecord | null;
   next: ModelRecord | null;
 }
 
-/** The one-line label shown with every AI-written summary (site plan fork 3, JMT 2026-10-10). */
-const SUMMARY_LABEL = "Summary written from the paper by an AI assistant and checked against it; corrections welcome.";
 
-const { model, family, familyMembers, sameShape, prev, next } = Astro.props;
+const { model, family, familyMembers, sameShape, sameDiagram = [], prev, next } = Astro.props;
 const variant = findDefaultVariant(model);
-const category = categoryLabel(model.category);
+const category = taskLabel(model.category);
 const tag = validationTag(model);
 const facts = modelFacts(model, family);
 const files = modelFiles(model, variant);
@@ -35,8 +37,16 @@ const pdfInSomeVariant = model.variants.some((candidate) => candidate.pdf !== nu
 const summaryHtml = renderSummaryMarkdown(model.summary_markdown);
 const tagline = isPresent(model.tagline) ? model.tagline : null;
 const keyContribution = isPresent(model.key_contribution) ? model.key_contribution : null;
-const keywords = (model.keywords ?? []).filter(isPresent);
+// Keywords deduplicated without regard to case ("CodeGen" and "codegen" show once), first spelling kept.
+const seenKeywords = new Set<string>();
+const keywords = (model.keywords ?? []).filter(isPresent).filter((k) => !seenKeywords.has(k.toLowerCase()) && Boolean(seenKeywords.add(k.toLowerCase())));
 const hasSummary = Boolean(summaryHtml || tagline || keyContribution);
+// BibTeX is shown as text in a copy box (escaped, never rendered as markup).
+// An entry with neither an author nor a year (`@misc{gpt, title = {...}}`) is not worth copying, so it is left out.
+const bibtex = isPresent(model.bibtex) && /\b(author|year)\s*=/i.test(model.bibtex) ? model.bibtex.trim() : null;
+// "adapters/f-resnet.py: build({})" names a capture file that is not published; only a library call a reader can run is shown.
+const recipe = isPresent(model.recipe_text) && !/^adapters\/[^:\s]+\.py: /.test(model.recipe_text) ? model.recipe_text : null;
+const neighbourLabel = category ? `More in ${category}` : "More models";
 const structureOnly = model.capture === "structure_only" || model.validation_state === "structure_only";
 const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} operations` : null].filter(Boolean).join(" · ");
 ---
@@ -45,6 +55,7 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
   <header class="model-head">
     <a href="/models/" class="model-back" data-listing-back>All models</a>
     <h1 class="model-title">{model.display_name}</h1>
+    {tagline && <p class="model-tagline" data-quoted>{tagline}</p>}
     <p class="model-summary">
       {lede}
       {tag && <span class:list={["chip", { "model-verified": !structureOnly }]}>{tag}</span>}
@@ -84,7 +95,7 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
             {facts.map((fact) => (
               <div>
                 <dt>{fact.label}</dt>
-                <dd title={fact.title}>
+                <dd title={fact.title} data-quoted={fact.quoted ? "" : undefined}>
                   {fact.href ? (
                     <a class="textlink" href={fact.href} rel={fact.href.startsWith("http") ? "noopener" : undefined}>
                       {fact.value}
@@ -159,10 +170,10 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
               </div>
             ))}
           </dl>
-          {isPresent(model.recipe_text) && (
+          {recipe && (
             <>
               <p class="model-details-heading">How this diagram was made</p>
-              <pre class="model-recipe mono" tabindex="0" aria-label="How this diagram was made">{model.recipe_text}</pre>
+              <pre class="model-recipe mono" tabindex="0" aria-label="How this diagram was made">{recipe}</pre>
             </>
           )}
         </details>
@@ -173,27 +184,35 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
       hasSummary && (
         <section class="model-about" aria-labelledby="model-about-title">
           <h2 id="model-about-title">What it is</h2>
-          {tagline && <p class="model-tagline">{tagline}</p>}
-          {summaryHtml && <div class="model-prose" set:html={summaryHtml} />}
+          {summaryHtml && <div class="model-prose" data-quoted set:html={summaryHtml} />}
           {keyContribution && (
-            <p class="model-key">
+            <p class="model-key" data-quoted>
               <strong>Key idea.</strong> {keyContribution}
             </p>
           )}
           {keywords.length > 0 && (
-            <ul class="model-keywords" aria-label="Keywords">
+            <ul class="model-keywords" aria-label="Keywords" data-quoted>
               {keywords.map((keyword) => (
                 <li class="chip">{keyword}</li>
               ))}
             </ul>
           )}
-          <p class="model-ai-label">{SUMMARY_LABEL}</p>
+          <p class="model-ai-label">{summaryLabel(model.summary_basis, model.summary_checked === true)}</p>
         </section>
       )
     }
 
     {
-      (familyMembers.length > 0 || sameShape.length > 0 || prev || next) && (
+      bibtex && (
+        <section class="model-cite" aria-labelledby="model-cite-title">
+          <h2 id="model-cite-title">Cite the paper</h2>
+          <CopyCode code={bibtex} label="Copy the BibTeX entry for the paper" name="BibTeX for the paper" />
+        </section>
+      )
+    }
+
+    {
+      (familyMembers.length > 0 || sameShape.length > 0 || sameDiagram.length > 0 || prev || next) && (
         <section class="model-related" aria-labelledby="model-related-title">
           <h2 id="model-related-title">Related models</h2>
           {family && familyMembers.length > 0 && (
@@ -213,6 +232,18 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
               </div>
             </div>
           )}
+          {sameDiagram.length > 0 && (
+            <div class="model-related-group">
+              <div class="model-related-head">
+                <h3>Same diagram</h3>
+              </div>
+              <div class="model-related-grid">
+                {sameDiagram.map((other) => (
+                  <ModelCard model={other} headingLevel={3} />
+                ))}
+              </div>
+            </div>
+          )}
           {sameShape.length > 0 && (
             <div class="model-related-group">
               <div class="model-related-head">
@@ -226,8 +257,8 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
             </div>
           )}
           {(prev || next) && (
-            <nav class="model-neighbours" aria-label={`More in ${category}`}>
-              <p>More in {category}</p>
+            <nav class="model-neighbours" aria-label={neighbourLabel}>
+              <p>{neighbourLabel}</p>
               {prev && (
                 <a class="button" href={`/models/${prev.slug}/`} rel="prev">
                   <span>Previous</span>
@@ -339,11 +370,13 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
     }
 
     .model-about,
+    .model-cite,
     .model-related {
       grid-column: 1 / -1;
     }
 
-    .model-about {
+    .model-about,
+    .model-cite {
       max-width: 46rem;
     }
   }
@@ -355,6 +388,7 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
 
     .model-viewer,
     .model-about,
+    .model-cite,
     .model-related,
     .model-details {
       grid-column: 1 / -1;
@@ -476,14 +510,21 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
   }
 
   .model-about h2,
+  .model-cite h2,
   .model-related h2 {
     margin: 0.5rem 0 0.75rem;
     font-size: 1.35rem;
   }
 
   .model-tagline {
-    margin: 0 0 0.75rem;
+    max-width: 46rem;
+    margin: 0.35rem 0 0.25rem;
     font-size: 1.05rem;
+    line-height: 1.45;
+  }
+
+  .model-cite {
+    min-width: 0;
   }
 
   .model-prose :global(p),

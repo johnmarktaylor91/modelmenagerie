@@ -252,7 +252,8 @@ def serve(*, spool: Path, workers: int | None = None, once: bool = False) -> Non
         for name in [n for n, (t, _) in running.items() if not t.is_alive()]:
             (dirs["claimed"] / f"{name}.json").unlink(missing_ok=True)
             del running[name]
-        if disk_guard.claim_ok(dirs["attempts"]):  # below the job's pause line, claim nothing
+        # below the pause line (the tick's live one, else the job's own), claim nothing
+        if disk_guard.claim_ok(dirs["attempts"], live=Path(spool) / disk_guard.LIVE_PAUSE):
             _start_waiting(dirs, modes, running, workers=workers, budget_mb=budget_mb,
                            threads=threads)
         if once and not running and not any(dirs["new"].glob("*.json")):

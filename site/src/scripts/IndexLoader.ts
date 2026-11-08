@@ -3,10 +3,12 @@
  * timeout. A failure clears the cached request, so Retry fetches again.
  */
 import { decodeModelIndex, parseModelIndex, parseModelThumbs, type IndexEntry, type ModelIndexFile } from "@/scripts/ListingIndex";
+import { decodeRosterIndex, type RosterEntry } from "@/scripts/RosterIndex";
 import { searchFields, type SearchFields } from "@/scripts/SearchMatch";
 
 export const INDEX_URL = "/models-index.json";
 export const THUMBS_URL = "/models-thumbs.json";
+export const ROSTER_URL = "/roster-index.json";
 const TIMEOUT_MS = 20_000;
 
 export interface LoadedIndex {
@@ -48,15 +50,26 @@ function withFields(entries: IndexEntry[]): LoadedIndex {
 }
 
 /** The index without pictures: enough for search suggestions. */
-export const loadSearchIndex = once(async (): Promise<LoadedIndex> => withFields(decodeModelIndex(await loadIndexFile(), "")));
+export const loadSearchIndex = once(async (): Promise<LoadedIndex> => withFields(decodeModelIndex(await loadIndexFile())));
 
 /** The index with picture URLs, for listing cards. */
-export function createListingLoader(assetBase: string): () => Promise<LoadedIndex> {
+export function createListingLoader(): () => Promise<LoadedIndex> {
   return once(async (): Promise<LoadedIndex> => {
     const [file, thumbs] = await Promise.all([loadIndexFile(), fetchJson(THUMBS_URL)]);
-    return withFields(decodeModelIndex(file, assetBase, parseModelThumbs(thumbs, file.rows.length)));
+    return withFields(decodeModelIndex(file, parseModelThumbs(thumbs, file.rows.length)));
   });
 }
+
+export interface LoadedRoster {
+  entries: RosterEntry[];
+  fields: SearchFields[];
+}
+
+/** The models not yet traced, for search suggestions and the listing; fetched only when asked for. */
+export const loadRosterIndex = once(async (): Promise<LoadedRoster> => {
+  const entries = decodeRosterIndex(await fetchJson(ROSTER_URL));
+  return { entries, fields: entries.map((entry) => searchFields(entry.name, "", entry.family, "")) };
+});
 
 /** A visitor-facing sentence for a failed load. */
 export function loadFailureText(error: unknown): string {

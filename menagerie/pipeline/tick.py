@@ -37,7 +37,8 @@ each pass). A dry run writes nothing.
 The disk guard holds top-up, queueing and new runner jobs while paused, and the drain while
 critical. Crawler is woken only by a FACT: a disk guard entry, a runner that will not stay up,
 rows typed ``infra:env_missing`` (``env_missing``) or tick errors two passes in a row (each
-condition at most once a day).
+condition at most once a day), and no lane of any kind started for three hours while work waits
+(``lane_stall``, once a stall).
 
 Everything the tick keeps is in the work root's ``tick/`` folder, never the repository:
 ``state.json`` (the typed state), ``tick.log`` (one JSON line and one disk line a pass),
@@ -70,7 +71,10 @@ from menagerie.pipeline import (
     disk_reclaim,
     lane_reap,
     mini_relay,
+    pause,
     runner_job,
+    store_box,
+    store_pressure,
     tick_commit,
     written,
 )
@@ -93,11 +97,15 @@ REFILL_RESERVE_S = 30  # a refill has no step after top_up: only the admission r
 TRIPWIRES_FRESH_S = 15 * 60  # a refill holds 2b when no full pass checked the tripwires this recently
 BIG_SPOOL = "scratch/menagerie/spool-G"
 DEFAULTS: dict[str, Any] = {
-    "collect_spools": ["scratch/menagerie/spool-B", "scratch/menagerie/spool-Bn",
-                       "scratch/menagerie/spool-A"],
+    "collect_spools": ["scratch/menagerie/spool-B", "scratch/menagerie/spool-A"],
     # one collector per spool: while one of these units is active the tick leaves the spools alone
     "exclusive_with": ["menagerie-catalog-collect.timer"],
     "lane_limits": {},  # lowers admission.lane_cap per kind (2b 14, 2a 4 by default); never raises
+    # {"for", "since", "until_note"}: the trace host is lent out; runners drain and end (``pause``)
+    "zmachine_paused": None,
+    "retrace": {},  # {"enabled": true}: the re-trace feed of retrace/todo.txt into B's idle spool
+    # {"enabled": true, "out": <folder>}: the TorchLens failure corpus, refreshed daily
+    "torchlens_corpus": {},
     "families_per_2a_lane": 8,
     # Speed-up switches (BUILD-PLAN section 1, item 3); these values keep today's behaviour:
     # one family a 2b lane (batches of 4 to 6 after lane A's switch), no per-cohort 2b shares
@@ -113,6 +121,9 @@ DEFAULTS: dict[str, Any] = {
     "third_lab_hold": False,
     "cohort_share": {},
     "big_runner": False,
+    # rows projected past B's 18 GiB slot wait for G even while big_runner is off: on B they pledge
+    # up to its whole declaration and run one at a time (Crawler, 29 Oct: 17 rows an hour against 84)
+    "reserve_big": True,
     "queue_spool": "scratch/menagerie/spool-B",
     "queue_depth": 40,
     "trickle_limit": 20,
@@ -122,6 +133,8 @@ DEFAULTS: dict[str, Any] = {
     "library_docs_seconds": 90,
     "paper_texts": 0,  # packets a pass gives an open-access paper text (paper_texts.texts); 0 off
     "paper_texts_seconds": 90,
+    "paper_find": 0,  # textless families a pass look for their paper (paper_texts.identify); 0 off
+    "paper_find_seconds": 60,
     "disk": {},
     "reclaim": {},  # disk_reclaim.DEFAULTS: below 75 GiB free, once an hour, failed trees after 2 h
     "commit_lanes": True,  # false leaves lane results uncommitted (the ``lanes`` step skips)
@@ -215,6 +228,19 @@ def _send(text: str, timeout: float = SEND_S) -> None:
         raise OSError(f"agent-send failed: {done.stderr.strip()[-200:]}")
 
 
+TL_KEY = "tl-corpus"  # outbox messages for TorchLens's Lead, not Menagerie's Crawler
+
+
+def _send_torchlens(text: str, timeout: float = SEND_S) -> None:
+    from menagerie.pipeline.admission import _tool
+
+    done = subprocess.run([_tool("agent-send"), "Lead", "--project", "torchlens", "--from", "tick",
+                           "--tag", "FACT", text], capture_output=True, text=True, check=False,
+                          timeout=timeout)
+    if done.returncode:
+        raise OSError(f"agent-send failed: {done.stderr.strip()[-200:]}")
+
+
 def _collect_spool(spool: str, data: DataLayout) -> dict[str, Any]:
     from menagerie.pipeline import stage3
 
@@ -296,8 +322,14 @@ class Deps:
     lane_reap: lane_reap.Reap = lane_reap.run_on_reap
     drain: Callable[[DataLayout, bool], dict[str, Any]] = _drain
     send: Callable[..., None] = _send
+    send_torchlens: Callable[..., None] = _send_torchlens  # the ``tl-corpus`` outbox key
     full: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
     demand: Callable[[Sequence[str]], dict[str, int]] = runner_job.live_lanes
+    store_size: Callable[[], float] | None = None  # None: ``du`` on the worker over ssh
+    store_aged: Callable[[], float] | None = None  # None: the worker listing against the index
+    unit_start: Callable[[str], None] = store_pressure.start_unit
+    ceiling_request: Callable[[Path, float, datetime], Path] = store_box.request_ceiling
+    systemctl: Callable[..., subprocess.CompletedProcess[str]] = pause._systemctl
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
 
@@ -345,6 +377,8 @@ def _runner_refused(state: Mapping[str, Any]) -> bool:
 def _step_reclaim(p: Pass) -> dict[str, Any]:
     """Start the worker's own cleanups when its free disk is under the reclaim line (disk_reclaim)."""
 
+    if pause.active(p.cfg):
+        return {"skipped": pause.note(p.cfg)}
     launch = (lambda *_: 0) if p.dry_run else p.deps.reclaim_launch
     new, result = disk_reclaim.step(
         p.state.get("disk_reclaim"), p.guard.free_gib, now=p.started, cfg=p.cfg.get("reclaim"),
@@ -354,19 +388,50 @@ def _step_reclaim(p: Pass) -> dict[str, Any]:
     return result
 
 
+def _step_store_pressure(p: Pass) -> dict[str, Any]:
+    """Start the store trim when the worker store is over its target or free disk is under the
+    resume line and the trim could free at least 1 GiB, at most once every 4 hours
+    (store_pressure)."""
+
+    if pause.active(p.cfg):
+        return {"skipped": pause.note(p.cfg)}
+    gcfg = disk_guard.Config.from_mapping(p.cfg.get("disk"))
+    read = p.deps.store_size or store_pressure.ssh_size(gcfg.host, gcfg.path)
+    aged = p.deps.store_aged or store_pressure.freeable(gcfg.host, gcfg.path, p.data)
+    start = (lambda unit: None) if p.dry_run else p.deps.unit_start
+    repo = p.deps.repo(p.data)
+    request = (lambda gib: None) if p.dry_run else (
+        lambda gib: p.deps.ceiling_request(repo, gib, p.started))
+    new, result = store_pressure.step(
+        p.state.get("store_pressure"), p.guard.free_gib, p.guard.resume_at_gib, now=p.started,
+        cfg=p.cfg.get("store_pressure"), read_store=read, read_aged=aged,
+        active=p.deps.unit_active, start=start, request=request)
+    if not p.dry_run:
+        p.state["store_pressure"] = new
+    return result
+
+
 def _step_runners(p: Pass) -> list[dict[str, Any]]:
     """``runner ensure`` for this pass's runners. A refill pass runs it as the timer's pass would,
     and only while a runner's last start was refused for capacity (``_runner_refused``), so a
     refused runner is retried on every pass and is not beaten to the room by jobs started between
     full passes."""
 
+    ops = p.deps.runner_ops or runner_job.RunOn(ended=work_dir("tick") / runner_job.ENDED_JOBS)
+    why = pause.note(p.cfg)
+    if why:  # every runner drains and ends; none starts (``pause``)
+        out = runner_job.pause(why, ops=ops, state=p.state, dry_run=p.dry_run)
+        p.state["runners"] = {**p.state.get("runners", {}),
+                              **{r["runner"]: r.pop("record") for r in out}}
+        for r in out:
+            r.pop("messages")
+        return out
     mode = p.mode
     if mode == REFILL:
         if not _runner_refused(p.state):
             return []
         mode = read_mode()
     kinds = sorted({r.demand for r in runner_job.runners() if r.demand and mode in r.modes})
-    ops = p.deps.runner_ops or runner_job.RunOn(ended=work_dir("tick") / runner_job.ENDED_JOBS)
     out = runner_job.ensure(dry_run=p.dry_run, ops=ops, state=p.state,
                             hold_submit=p.guard.held("runner_submit"),
                             pause_gib=p.guard.pause_below_gib, now=p.started, mode=mode,
@@ -509,7 +574,7 @@ def _step_drain(p: Pass) -> dict[str, Any]:
     return p.deps.drain(p.data, p.dry_run)
 
 
-def _full_call(p: Pass, name: str, held: str | None) -> Any:
+def _full_call(p: Pass, name: str, held: str | None, cfg: Mapping[str, Any] | None = None) -> Any:
     if name in ("top_up", "stage3_queue") and "tripwires" in p.errors:
         return {"held": "cohort tripwires could not be checked"}
     if held and p.guard.held(held):
@@ -517,7 +582,7 @@ def _full_call(p: Pass, name: str, held: str | None) -> Any:
     from menagerie.pipeline import tick_full
 
     call = p.deps.full.get(name) or getattr(tick_full, name)
-    return call(p.data, p.cfg, dry_run=p.dry_run)
+    return call(p.data, p.cfg if cfg is None else cfg, dry_run=p.dry_run)
 
 
 def _tries_summary(p: Pass) -> dict[str, Any] | None:
@@ -598,6 +663,21 @@ def _step_trickle(p: Pass) -> Any:
     return {"harvest": harvested, **({"commit": commit} if commit else {})}
 
 
+def _step_disputed(p: Pass) -> Any:
+    """``review_disputed.reopen`` (``tick_full.disputed``), then commit exactly the files it
+    rewrote; a pass that writes nothing commits nothing."""
+
+    if p.dry_run:
+        return _full_call(p, "disputed", None)
+    repo = p.deps.repo(p.data)
+    with _owning(p, repo, keep=_in_data(p, repo)):
+        out = _full_call(p, "disputed", None)
+    reopened = out.get("reopened") if isinstance(out, dict) else None
+    commit = _commit_owned(p, repo, f"data: tick reopened {len(reopened or [])} review_disputed or "
+                           "review_no_seat rows (their records and the no-seat list)")
+    return {**out, **({"commit": commit} if commit else {})}
+
+
 def _latest_traces(ledger_dir: Path, since: str) -> dict[str, dict[str, Any]]:
     """Each id's latest trace row at or after ``since`` (UTC, to the second) in the last two
     shards. Only lines naming a trace are parsed: ``ledger.read_all`` would parse every row of
@@ -635,10 +715,59 @@ def _step_env_missing(p: Pass) -> dict[str, list[str]]:
 def _step_stage3_queue(p: Pass) -> Any:
     """``stage3_queue``; with the big runner on, it also keeps ``big_work`` (rows reserved for G
     plus spool-G's waiting jobs) in the state, which decides whether G runs tonight."""
-    out = _full_call(p, "stage3_queue", "stage3_queue")
+    behind = _runners_behind_pin(p)
+    if behind:
+        return {"held": behind}
+    holds = ((p.state.get("axon") or {}).get("active") or {}).get("ids") or []
+    # rows in the axon batch in flight stay out of every spool (axon_feed ``big_cohorts``)
+    out = _full_call(p, "stage3_queue", "stage3_queue",
+                     cfg={**p.cfg, "axon_holds": list(holds)} if holds else None)
     big = out.get("big") if isinstance(out, dict) else None
     if isinstance(big, dict) and "held" not in big and "reserved" in big:
         p.state["big_work"] = len(big["reserved"]) + int(big.get("waiting") or 0)
+    return out
+
+
+def _runners_behind_pin(p: Pass) -> str | None:
+    """Why stage 3 queues nothing this pass: a running runner (B or G) started on a commit that pins
+    another TorchLens than ``main`` would trace the queued rows at its old pin (``runner_pin``). The
+    hold also stops the re-trace feed; it ends when that runner next starts on the new commit."""
+
+    from menagerie.pipeline import runner_pin
+    from menagerie.pipeline.publish import torchlens_pin
+
+    pin = torchlens_pin()
+    calls = p.deps.full.get("runner_pin_behind") or runner_pin.behind
+    behind = calls(p.results.get("runners") or [], pin)
+    if not behind:
+        return None
+    named = ", ".join(f"runner {name} runs TorchLens {old}" for name, old in sorted(behind.items()))
+    return f"{named}, the pin is {pin}: stage 3 queues nothing until it next starts"
+
+
+def _step_retrace(p: Pass) -> Any:
+    """The low-priority re-trace feed (``retrace``), after ``stage3_queue`` so live rows go first."""
+
+    from menagerie.pipeline import retrace
+
+    why = retrace.hold(p.cfg, p.results, paused=pause.note(p.cfg),
+                       disk_held=p.guard.held("stage3_queue"))
+    if why:
+        return {"held": why}
+    call = p.deps.full.get("retrace") or retrace.feed
+    return call(p.data, p.cfg, dry_run=p.dry_run)
+
+
+def _step_torchlens_corpus(p: Pass) -> dict[str, Any]:
+    """The TorchLens failure corpus (``tl_corpus_step``): refreshed at most daily, a FACT to
+    TorchLens's Lead only for new clusters, and its rows listed for a re-trace at a new pin."""
+
+    from menagerie.pipeline import tl_corpus_step
+
+    call = p.deps.full.get("torchlens_corpus") or tl_corpus_step.step
+    out, facts = call(p.data, p.cfg, p.state, now=p.started, dry_run=p.dry_run,
+                      deadline=p.deadline)
+    p.messages += [(TL_KEY, text) for text in facts]
     return out
 
 
@@ -664,6 +793,20 @@ def _step_lanes(p: Pass) -> dict[str, Any]:
     return out
 
 
+def _step_lane_stall(p: Pass) -> dict[str, Any]:
+    """One FACT per stall when no lane of any kind has started for three hours while work waits
+    (``lane_stall``), with this pass's holds as the reasons."""
+
+    from menagerie.pipeline import lane_stall
+
+    lanes = work_dir("lanes")
+    text = lane_stall.check(p.state, p.results, lanes, p.started.astimezone(timezone.utc))
+    if text:
+        p.messages.append(("lane-stall", text))
+    start = lane_stall.last_start(lanes)
+    return {"last_start": start.isoformat() if start else None, "sent": bool(text)}
+
+
 def _step_lane_reap(p: Pass) -> dict[str, Any]:
     """Reap the run-on checkouts of 2b lanes whose outputs the hub has ingested, whose lane
     results the ``lanes`` step has committed and which run-on holds for its failed grace
@@ -682,6 +825,22 @@ def _step_lane_reap(p: Pass) -> dict[str, Any]:
                           dry_run=p.dry_run)
 
 
+def _axon_big(p: Pass, cfg: Mapping[str, Any]) -> list[str]:
+    """G's open big rows of ``axon.big_cohorts`` (Crawler 2026-11-04): this pass's rows reserved
+    for G (``stage3_queue``) that no spool holds, for the axon feeder's cpu band."""
+
+    cohorts = set(cfg.get("big_cohorts") or ())
+    queued = p.results.get("stage3_queue")
+    big = queued.get("big") if isinstance(queued, dict) else None
+    reserved = big.get("reserved") if isinstance(big, dict) else None
+    if not cohorts or not reserved:
+        return []
+    from menagerie.pipeline import tick_full
+
+    member = tick_full._cohorts(p.cfg)  # noqa: SLF001
+    return tick_full._not_pending([s for s in reserved if member.get(s) in cohorts], p.data)  # noqa: SLF001
+
+
 def _step_axon(p: Pass) -> dict[str, Any]:
     """The axon feeder (``axon_feed``): collect the cluster batch and its renders in any mode,
     submit the next only in a full pass with the disk guard clear; commit exactly the lines it
@@ -696,10 +855,11 @@ def _step_axon(p: Pass) -> dict[str, Any]:
         return {"active": state.get("active"), "renders": state.get("renders"),
                 "ready": state.get("ready")}
     repo = p.deps.repo(p.data)
-    held = f"disk {p.guard.state}" if p.guard.held("cluster") else \
-        "" if p.mode == "full" else f"{p.mode} mode"
+    held = pause.note(p.cfg) or (f"disk {p.guard.state}" if p.guard.held("cluster") else
+                                 "" if p.mode == "full" else f"{p.mode} mode")
     feed = axon_feed.Feed(state, p.data, cfg, p.deps.axon_ops or axon_feed.Ops(), repo,
-                          submit=not held, deadline=p.deadline, held=held)
+                          submit=not held, deadline=p.deadline, held=held,
+                          big=_axon_big(p, cfg) if not held else ())
     try:
         with _owning(p, repo, keep=_shard_path(p, repo), lines_only=True):
             out = axon_feed.step(feed)
@@ -710,9 +870,22 @@ def _step_axon(p: Pass) -> dict[str, Any]:
     return {**out, **({"own_lines": lines} if lines else {})}
 
 
+def _step_pause(p: Pass) -> dict[str, Any]:
+    """The worker pause's timers (``pause.timers``): held while it is set, started once cleared."""
+
+    paused = pause.active(p.cfg) is not None
+    held, changed = pause.timers(paused, p.state.get("paused_timers"), dry_run=p.dry_run,
+                                 run=p.deps.systemctl)
+    if not p.dry_run:
+        p.state["paused_timers"] = held
+    return {**({"pause": pause.note(p.cfg)} if paused else {}), **changed} or {"pause": None}
+
+
 STEPS: tuple[tuple[str, tuple[str, ...], Callable[[Pass], Any]], ...] = (
+    ("pause", (*MODES, REFILL), _step_pause),
     ("disk", (*MODES, REFILL), _step_disk),
     ("reclaim", MODES, _step_reclaim),
+    ("store_pressure", MODES, _step_store_pressure),
     ("runners", (*MODES, REFILL), _step_runners),
     ("collect", MODES, _step_collect),
     ("drain", MODES, _step_drain),
@@ -720,10 +893,14 @@ STEPS: tuple[tuple[str, tuple[str, ...], Callable[[Pass], Any]], ...] = (
     ("tripwires", ("full",), _step_tripwires),
     ("requeue", ("full",), lambda p: _full_call(p, "requeue", "top_up")),
     ("stage3_queue", ("full",), _step_stage3_queue),
+    ("retrace", ("full",), _step_retrace),
     ("top_up", ("full", REFILL), _step_top_up),
     ("trickle", ("full",), _step_trickle),
     ("reviews", ("full",), lambda p: _full_call(p, "reviews", None)),
+    ("review_disputed", ("full",), _step_disputed),
     ("describes", ("full",), lambda p: _full_call(p, "describes", None)),
+    ("torchlens_corpus", ("full",), _step_torchlens_corpus),
+    ("lane_stall", ("full",), _step_lane_stall),
     ("lanes", MODES, _step_lanes),
     ("lane_reap", MODES, _step_lane_reap),
     ("axon", MODES, _step_axon),
@@ -791,7 +968,8 @@ def _send_outbox(p: Pass, finish_by: float) -> list[str]:
             left.append([key, text])
             continue
         try:
-            p.deps.send(text, timeout=min(SEND_S, room))
+            send = p.deps.send_torchlens if key.startswith(TL_KEY) else p.deps.send
+            send(text, timeout=min(SEND_S, room))
             sent.append(key)
         except (OSError, subprocess.TimeoutExpired) as exc:
             p.errors[f"send-{key}"] = str(exc)[:200]
@@ -806,16 +984,35 @@ def _where_2b(p: Pass) -> list[str]:
     return [f"- 2b: {top['2b_where']}"] if isinstance(top, dict) and top.get("2b_where") else []
 
 
+STATUS_KEYS, STATUS_TEXT = 20, 200  # status.md: a larger mapping is counted, a longer string cut
+
+
+def _counted(value: Any) -> Any:
+    """A result for ``status.md``: every list as its length, a mapping of more than ``STATUS_KEYS``
+    keys (ids) as its size, a string cut to ``STATUS_TEXT``, so each line stays whole JSON (a cut
+    line was not, 29 Oct); ``tick.log`` keeps the full result."""
+
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    if isinstance(value, dict):
+        return len(value) if len(value) > STATUS_KEYS else {k: _counted(v) for k, v in value.items()}
+    if isinstance(value, str) and len(value) > STATUS_TEXT:
+        return value[:STATUS_TEXT] + "..."
+    return value
+
+
 def _status_md(p: Pass) -> str:
     gline = p.results.get("disk", {}).get("line", "disk: not read")
-    rows = [f"# Menagerie tick: {_iso(p.started)} ({p.mode}{', dry run' if p.dry_run else ''})", "",
-            f"- {gline}", *_where_2b(p)]
+    rows = [f"# Menagerie tick: {_iso(p.started)} ({p.mode}{', dry run' if p.dry_run else ''})", ""]
+    if p.results.get("pause", {}).get("pause"):
+        rows.append(f"- PAUSE: {p.results['pause']['pause']}")
+    rows += [f"- {gline}", *_where_2b(p)]
     for r in p.results.get("runners", []) or []:
         rows.append(f"- runner {r['runner']}: {r['action']} ({r['job']}, {r['job_state']}, "
                     f"heartbeat {r['heartbeat_age_s']} s) {r['detail']}")
     for name, value in p.results.items():
-        if name not in ("disk", "runners"):
-            rows.append(f"- {name}: {json.dumps(value, default=str)[:600]}")
+        if name not in ("disk", "runners", "pause"):
+            rows.append(f"- {name}: {json.dumps(_counted(value), default=str)}")
     for cohort, counts in p.results.get("tripwires", {}).get("cohorts", {}).items():
         stopped = cohort in p.results["tripwires"].get("stopped", [])
         rows.append(f"- cohort {cohort}: {counts['validated']}/{counts['settled']} validated/settled "

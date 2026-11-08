@@ -53,6 +53,18 @@ FAILURE_CLASSES = frozenset(
         # (`degenerate_forward:constant`; Lead, 2026-10-29): never validated, so the worker types
         # it before any capture.
         "degenerate_forward",
+        # A deferred give-up (decisions.md 2026-11-03): a provisional fabrication still disputed
+        # after its one repair round, typed at the rung's tail; it settles the row and is taken
+        # back once a main seat passes calibration (`review_disputed.reopen`).
+        "review_disputed",
+        # A deferred give-up (decisions.md 2026-11-03): a recipe no counting seat may review (every
+        # seat that counts is from its author's lab), typed at the rung 4 tail; it settles the row
+        # and is taken back once a seat for it counts (`review_disputed.reopen`).
+        "review_no_seat",
+        # A deferred give-up (Lead 2026-11-04): a big row (projected past the worker's bound) that
+        # neither runner G nor an axon batch reached by its cohort's close, typed at the rung 4 tail;
+        # it settles the row and is taken back once G has room (`big_deferred.reopen`).
+        "big_row_deferred",
     }
 )
 CLASS_PATTERN = r"(" + "|".join(sorted(FAILURE_CLASSES)) + r")(:\S+)?"
@@ -579,6 +591,10 @@ class Recipe(Record):
     # as mamba_ssm or flash-attention), staged with ``vendor`` wherever the store is copied. ``None``
     # rather than empty, so records and requests without it read the same to older readers.
     code: tuple[str, ...] | None = spec(None, pattern=SHA256)
+    # Store sha of one ``.safetensors`` state dict the worker loads into the model after its seeded
+    # random build (``harvest_build.load_weights``); ``None`` (every recipe but a pretrained-weights
+    # one, decisions.md 2026-11-05) keeps random weights and the recipe's revision unchanged.
+    weights: str | None = spec(None, pattern=SHA256)
     modes: Modes | None = None
     memory_gib: float | None = None
     placement: Placement | None = None
@@ -624,6 +640,9 @@ class ModelRecord(Record):
     hf: HFRef | None = None
     recipe: Recipe | None = None
     give_up: GiveUp | None = None
+    # One line about a validated forward that looks degenerate and is not (a collapse only at a
+    # discrete output step, decisions.md 2026-10-29); never part of the recipe's revision.
+    note: str | None = None
 
 
 # --- Stage 3 and review: ledger rows -------------------------------------------------
@@ -697,6 +716,10 @@ class LedgerRow(Record):
     summary: str | None = spec(None, pattern=SHA256)
     evidence: str | None = spec(None, pattern=SHA256)
     msg: str | None = None
+    # A failure's innermost traceback frames, innermost last, each ``<path>:<line> <function>``
+    # with the path from its package (``torchlens/...``, ``torch/...``) or the repository root:
+    # the evidence the TorchLens failure corpus attributes on (``tl_attribution``).
+    frames: tuple[str, ...] | None = None
     offenses: tuple[Offense, ...] | None = None
     verdict: Literal["faithful", "minor", "fabrication", "cannot_judge"] | None = None
     findings: str | None = spec(None, pattern=SHA256)

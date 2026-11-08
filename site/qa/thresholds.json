@@ -12,6 +12,7 @@
   "axe_violations": 0,
   "axe_allow": [],
   "copy_hits": 0,
+  "typed_counts": 0,
   "lighthouse": {
     "performance": 90,
     "total_blocking_time_ms": 200,

@@ -1,5 +1,6 @@
 import type { ViewMode, ViewerVariant } from "./viewer-types";
 import { getViewerElements, type ViewerElements } from "./viewer-elements";
+import { previewShift } from "./preview-shift";
 
 /** The view a diagram opens in. "readable" opens legible at the top; "whole" opens fitted (overview first). */
 export const DEFAULT_VIEW_MODE: ViewMode = "readable";
@@ -8,10 +9,16 @@ export const DEFAULT_VIEW_MODE: ViewMode = "readable";
 const LEGIBLE_MIN_SCALE = 0.6;
 const MAX_SCALE = 3;
 /**
- * A graph wider than this at readable scale cannot be scanned by scrolling (the content is a needle
- * in a haystack of paper), so it opens on the whole graph, where a click zooms into the spot.
+ * A graph wider than this at readable scale is hard to scan by scrolling, so it opens on the whole
+ * graph, where a click zooms into the spot, provided the whole graph is still legible (below).
  */
 const WIDE_GRAPH_READABLE_PX = 4000;
+/**
+ * Below this whole-graph scale the nodes are specks on a blank sheet (ACDNet fits at about 1%), so
+ * the diagram opens at reading scale where its drawing starts instead (top of the graph, at the
+ * stored focus), and "Whole graph" stays one click away as the overview.
+ */
+const LEGIBLE_OVERVIEW_SCALE = 0.15;
 const ZOOM_STEP = 1.25;
 const WHEEL_COMMIT_MS = 200;
 const BUTTON_COMMIT_MS = 250;
@@ -108,7 +115,8 @@ export class DiagramViewer {
     this.el.loadButton.textContent = `Load full diagram (${variant.svgSize})`;
     this.el.standIn.textContent = variant.standInNote;
     this.el.standIn.hidden = variant.standInNote === "";
-    this.showPreview(variant.thumbUrl, this.token);
+    this.reserve(variant);
+    this.showPreview(variant, this.token);
     if (variant.heavy) {
       this.el.diagram.removeAttribute("src");
       this.setState("idle", variant.heavyNote);
@@ -137,8 +145,8 @@ export class DiagramViewer {
       return;
     }
     this.natural = {
-      width: this.el.diagram.naturalWidth || this.el.stage.clientWidth,
-      height: this.el.diagram.naturalHeight || this.el.stage.clientHeight,
+      width: variant.svgWidth ?? (this.el.diagram.naturalWidth || this.el.stage.clientWidth),
+      height: variant.svgHeight ?? (this.el.diagram.naturalHeight || this.el.stage.clientHeight),
     };
     this.el.diagram.hidden = false;
     this.el.preview.hidden = true;
@@ -154,8 +162,36 @@ export class DiagramViewer {
       : "The full diagram did not load. The picture shown is a small preview.";
   }
 
-  private showPreview(url: string | null, token: number): void {
+  /**
+   * Size the stage and the scale from the SVG's own size (from the export) before anything loads,
+   * so the page does not move when the diagram arrives.
+   */
+  private reserve(variant: ViewerVariant): void {
+    if (variant.svgHeight !== null) {
+      this.el.stage.style.setProperty("--diagram-h", `${Math.ceil(variant.svgHeight)}px`);
+    } else {
+      this.el.stage.style.removeProperty("--diagram-h");
+    }
+    if (variant.svgWidth !== null && variant.svgHeight !== null) {
+      this.natural = { width: variant.svgWidth, height: variant.svgHeight };
+      this.computeFit();
+    }
+  }
+
+  private showPreview(variant: ViewerVariant, token: number): void {
+    const url = variant.thumbUrl;
     const preview = this.el.preview;
+    preview.classList.toggle("viewer-preview--crop", variant.previewWidth !== null);
+    const shift = previewShift(variant.focusX, variant.svgWidth, variant.previewWidth);
+    if (shift !== null) preview.style.setProperty("--preview-shift", shift);
+    else preview.style.removeProperty("--preview-shift");
+    if (variant.previewWidth !== null && variant.previewHeight !== null) {
+      preview.width = variant.previewWidth;
+      preview.height = variant.previewHeight;
+    } else {
+      preview.removeAttribute("width");
+      preview.removeAttribute("height");
+    }
     preview.hidden = url === null;
     if (url === null) {
       preview.removeAttribute("src");
@@ -190,7 +226,8 @@ export class DiagramViewer {
 
   private initialMode(): ViewMode {
     const readableWidth = this.natural.width * this.fit.readable;
-    return DEFAULT_VIEW_MODE === "readable" && readableWidth > WIDE_GRAPH_READABLE_PX ? "whole" : DEFAULT_VIEW_MODE;
+    const overviewLegible = this.fit.whole >= LEGIBLE_OVERVIEW_SCALE;
+    return DEFAULT_VIEW_MODE === "readable" && readableWidth > WIDE_GRAPH_READABLE_PX && overviewLegible ? "whole" : DEFAULT_VIEW_MODE;
   }
 
   private computeFit(): void {
@@ -232,7 +269,25 @@ export class DiagramViewer {
     const stage = this.el.stage;
     stage.scrollTop = 0;
     stage.scrollLeft = this.openingScrollLeft();
+    stage.scrollTop = mode === "readable" ? this.openingScrollTop() : 0;
     this.syncModeButton();
+  }
+
+  /**
+   * Vertical scroll for a fresh readable view: the top of the first node in the window it opens on,
+   * when that window starts with blank paper (gpt2's grouped drawing has one output node far right
+   * at the top). Only when the graph is wider than the stage: a graph shown full width starts at its top.
+   */
+  private openingScrollTop(): number {
+    const stage = this.el.stage;
+    const focus = this.variant?.focusY;
+    if (focus === null || focus === undefined || stage.scrollWidth - stage.clientWidth <= 0) {
+      return 0;
+    }
+    const image = this.el.diagram.getBoundingClientRect();
+    const box = stage.getBoundingClientRect();
+    const focusPx = image.top - box.top - stage.clientTop + stage.scrollTop + focus * image.height;
+    return clamp(focusPx, 0, Math.max(0, stage.scrollHeight - stage.clientHeight));
   }
 
   /**
@@ -253,7 +308,10 @@ export class DiagramViewer {
     const image = this.el.diagram.getBoundingClientRect();
     const box = stage.getBoundingClientRect();
     const focusPx = image.left - box.left - stage.clientLeft + stage.scrollLeft + focus * image.width;
-    return clamp(focusPx - stage.clientWidth / 2, 0, overflow);
+    const left = clamp(focusPx - stage.clientWidth / 2, 0, overflow);
+    // A start within a tenth of the stage of either edge snaps to it, so the title is not clipped by a sliver.
+    const snap = stage.clientWidth / 10;
+    return left < snap ? 0 : overflow - left < snap ? overflow : left;
   }
 
   private syncModeButton(): void {

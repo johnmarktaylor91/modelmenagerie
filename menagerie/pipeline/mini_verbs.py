@@ -29,7 +29,9 @@ SCHEMA: dict[str, tuple[int, dict[str, bool]]] = {
     "done": (1, {"--rewrite-family": False}),
 }
 REPEATABLE = {"--with"}
-CLASS = re.compile(r"[a-z][a-z0-9_]{0,63}")
+# a give-up class: a lowercase head, and the detail some heads need (`degenerate_forward:constant`,
+# `needs_env:tf@fcc82f70`); the hub checks the pair (``records.check_class``)
+CLASS = re.compile(r"[a-z][a-z0-9_]{0,63}(?::[a-z0-9][a-z0-9_.@-]{0,63})?")
 PACKAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-\[\],=<>!~]{0,199}")
 
 
@@ -203,7 +205,7 @@ def _targets(verb: str, positional: Sequence[str], options: Mapping[str, Sequenc
     if verb in ("try", "giveup") and positional[0] not in scope.members:
         raise ValueError(f"{positional[0]} is not a member of this lane's families")
     if verb == "giveup" and not CLASS.fullmatch(positional[1]):
-        raise ValueError("a give-up class is a lowercase word")
+        raise ValueError("a give-up class is a lowercase word, with :detail where its head needs one")
     if any(m not in scope.members for m in options.get("--member", ())):
         raise ValueError("--member must be a member of this lane's families")
     if any(not PACKAGE.fullmatch(p) for p in options.get("--with", ())):

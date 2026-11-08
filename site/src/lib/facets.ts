@@ -12,6 +12,7 @@ import {
   frameworkLabel,
   isPresent,
   isUsefulFacet,
+  licenceLabel,
   labelCategoryFacets,
   labelSizeFacets,
   paramBucket,
@@ -68,7 +69,7 @@ export const FACETS: Readonly<Record<FacetKey, FacetDefinition>> = {
   params: { legend: "Parameters", value: (fields) => paramBucket(fields.paramCount), arrange: inOrder(PARAM_BUCKETS) },
   year: { legend: "Year", value: (fields) => yearBucket(fields.year), arrange: inOrder(YEAR_BUCKETS) },
   framework: { legend: "Framework", value: (fields) => fields.backend, arrange: largestFirst(frameworkLabel) },
-  licence: { legend: "Licence", value: (fields) => fields.licence, arrange: largestFirst((value) => value) },
+  licence: { legend: "License", value: (fields) => fields.licence, arrange: largestFirst(licenceLabel) },
   paper: {
     legend: "Paper",
     value: (fields) => (fields.hasPaper ? "yes" : "no"),
@@ -113,13 +114,15 @@ export function matchesFacets(fields: FacetFields, selected: Readonly<Partial<Re
   });
 }
 
-export const SORT_KEYS = ["match", "preview", "name", "ops-desc", "ops-asc", "params-desc", "params-asc", "year-desc", "year-asc", "citations-desc"] as const;
+export const SORT_KEYS = ["match", "featured", "preview", "name", "ops-desc", "ops-asc", "params-desc", "params-asc", "year-desc", "year-asc", "citations-desc"] as const;
 export type SortKey = (typeof SORT_KEYS)[number];
 
 /** Sort choices; one whose field no model has stays out of the menu. */
 export const SORT_OPTIONS: ReadonlyArray<{ key: SortKey; label: string; needs?: (fields: FacetFields) => boolean }> = [
   { key: "match", label: "Best match" },
-  { key: "preview", label: "Pictures first" },
+  { key: "featured", label: "Featured first" },
+  // Offered only while models with no diagram are listed (the listing hides it otherwise).
+  { key: "preview", label: "Diagrams first" },
   { key: "name", label: "Name" },
   { key: "ops-desc", label: "Most operations", needs: (fields) => fields.nOps !== null },
   { key: "ops-asc", label: "Fewest operations", needs: (fields) => fields.nOps !== null },

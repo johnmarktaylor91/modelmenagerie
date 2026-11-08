@@ -14,13 +14,15 @@ only be built inside the sandbox, without network, where a failure is ``compiled
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import os
 import re
 import shutil
 import subprocess
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
 from menagerie.pipeline import overlay_cache
@@ -231,12 +233,31 @@ def overlay(name: str, extras: Sequence[str], *, root: Path) -> Path:
     wheel_hashes = [sdist.digest(w) for w in wheels]
     key = hashlib.sha256("\n".join([*sorted(extras), *wheel_hashes]).encode()).hexdigest()[:8]
     target = Path(root) / "overlays" / f"{lock_id(name).replace('@', '-')}-{key}"
-    if (target / BUILT_MARKER).is_file():
-        os.utime(target / BUILT_MARKER)  # the marker's mtime is the overlay's last use (prune_overlays)
-        return target / "bin" / "python"
+    with _one_builder(target):
+        if (target / BUILT_MARKER).is_file():
+            os.utime(target / BUILT_MARKER)  # the marker's mtime is the overlay's last use (prune_overlays)
+            return target / "bin" / "python"
+        return _build_overlay(target, name, extras, wheels, pins, root=root)
+
+
+@contextlib.contextmanager
+def _one_builder(target: Path) -> Iterator[None]:
+    """Hold ``target``'s build lock: two runs needing one overlay at once would otherwise each
+    remove the other's half-built tree. The lock is a file beside the overlay, never a folder
+    (``prune_overlays`` reads every folder as an overlay)."""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target.parent / f".{target.name}.build-lock", "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def _build_overlay(target: Path, name: str, extras: Sequence[str], wheels: Sequence[Path], pins: str, *,
+                   root: Path) -> Path:
+    """Build the overlay at ``target`` (its build lock held) and return its interpreter."""
+
     if target.exists():
         shutil.rmtree(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(["cp", "-al", str(prefix(name, root=root)), str(target)], check=True)
     (target / BUILT_MARKER).unlink()
     constraints = target / ".base-pins.txt"
@@ -280,13 +301,18 @@ def prune_overlays(root: Path, *, keep_days: float, cap_gib: float, now: float |
     for used, path, built in _overlays(Path(root) / "overlays"):
         report["overlays"] += 1
         idle = now - used
-        if built and (path / BUILT_MARKER).read_text().strip() in needed:
-            report["kept_needed"] += 1  # outside the cap too
-        elif idle >= OVERLAY_IN_USE_S and (not built or idle > keep_days * 86400):
-            report["freed_bytes"] += _remove_overlay(path)
-            report["removed_age" if built else "removed_halfbuilt"] += 1
-        else:
-            kept.append((used, path, _overlay_bytes(path, bases) if built else 0))  # never walk a build
+        try:
+            if built and (path / BUILT_MARKER).read_text().strip() in needed:
+                report["kept_needed"] += 1  # outside the cap too
+            elif idle >= OVERLAY_IN_USE_S and (not built or idle > keep_days * 86400):
+                freed = _remove_overlay(path)
+                if freed is not None:
+                    report["freed_bytes"] += freed
+                    report["removed_age" if built else "removed_halfbuilt"] += 1
+            else:
+                kept.append((used, path, _overlay_bytes(path, bases) if built else 0))  # never walk a build
+        except FileNotFoundError:  # another prune removed it meanwhile
+            continue
     removed, freed, total = _evict_to_cap(kept, int(cap_gib * 2**30), now)
     report.update(removed_cap=removed, kept=len(kept) - removed, kept_bytes=total)
     trimmed = overlay_cache.trim(root, env=_environ())
@@ -306,8 +332,11 @@ def _evict_to_cap(kept: list[tuple[float, Path, int]], cap: int, now: float) -> 
         if total <= cap:
             break
         if now - used >= OVERLAY_IN_USE_S:
+            got = _remove_overlay(path)
+            if got is None:
+                continue
             total -= size
-            freed += _remove_overlay(path)
+            freed += got
             removed += 1
     return removed, freed, total
 
@@ -348,12 +377,21 @@ def _unique_bytes(path: Path) -> int:
     return total
 
 
-def _remove_overlay(path: Path) -> int:
-    """Remove the overlay; return what that alone frees (its extras go with the cache trim)."""
+def _remove_overlay(path: Path) -> int | None:
+    """Remove the overlay under its build lock; return what that alone frees (its extras go with
+    the cache trim), or ``None`` when a run is building it or another prune already removed it
+    (a runner start and the tick's reclaim can prune at once)."""
 
-    size = _unique_bytes(path)
-    shutil.rmtree(path)
-    return size
+    with open(path.parent / f".{path.name}.build-lock", "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        if not path.is_dir():
+            return None
+        size = _unique_bytes(path)
+        shutil.rmtree(path)
+        return size
 
 
 def _environ() -> dict[str, str]:

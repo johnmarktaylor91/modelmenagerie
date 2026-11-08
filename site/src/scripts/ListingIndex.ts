@@ -5,10 +5,11 @@
  *
  * Shared by the build-time endpoints (encode side) and the browser (decode side).
  */
+import { assetHref } from "@/lib/assets";
 import type { FacetFields } from "@/lib/facets";
-import { distinctFamily, type CardData } from "@/scripts/CardView";
+import { CROP_HEIGHT, CROP_WIDTH, familyChip, type CardData } from "@/scripts/CardView";
 
-export const MODEL_INDEX_VERSION = 3;
+export const MODEL_INDEX_VERSION = 6;
 
 /**
  * One row: slug ("" when it is `slugFromName(name)`), display name, category index, family
@@ -33,12 +34,22 @@ export interface ModelIndexFile {
   version: number;
   categories: string[];
   families: string[];
+  /** Chip labels aligned with `families`: "" for no chip, "=" for the family value itself, else the display name. */
+  familyLabels: string[];
   frameworks: string[];
   licences: string[];
   rows: ModelIndexRow[];
+  /** Row positions of the featured models, in the order the browse page opens on. */
+  featured?: number[];
+  /** Featured cards' picture windows on their SVG (`featured-view.ts`): row, width, left, top. */
+  windows?: Array<[number, number, number, number]>;
 }
 
-/** Picture keys in index row order: "" for none, ".webp" left off. */
+/**
+ * Picture keys in index row order: "" for none, ".webp" left off. A crop that is not the full
+ * 800 by 600 box carries its size after a tilde ("abc123~800x412"), so its card reserves the
+ * right height.
+ */
 export interface ModelThumbsFile {
   version: number;
   keys: string[];
@@ -47,8 +58,12 @@ export interface ModelThumbsFile {
 export const FLAG_VERIFIED = 1;
 export const FLAG_PAPER = 2;
 export const FLAG_PICTURE = 4;
-/** The picture is a real 4:3 top crop, not the whole-graph strip. */
+/** The picture is a real top crop, not the whole-graph strip. */
 export const FLAG_CROP = 8;
+/** A structure-only record: it has a page but is listed only when the reader asks for untraced entries. */
+export const FLAG_STRUCTURE = 16;
+/** Checked by replay on a non-PyTorch framework (the card's "Replay checked" chip). */
+export const FLAG_REPLAY = 32;
 
 /** One decoded index entry: card data plus the fields the filters and sorts read. */
 export interface IndexEntry {
@@ -59,6 +74,10 @@ export interface IndexEntry {
   /** Catalog order, which is also the static pages' name order. */
   order: number;
   hasPicture: boolean;
+  /** True for a structure-only record (see `FLAG_STRUCTURE`). */
+  structure: boolean;
+  /** Position in the featured list, or -1 when the model is not featured. */
+  featured: number;
 }
 
 /** The slug a display name gives when it is lower-cased and joined by hyphens. */
@@ -69,17 +88,26 @@ export function slugFromName(name: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-/** Return the thumbnail key stored for an asset key, without the common extension. */
-export function encodeThumbKey(key: string): string {
-  return key.endsWith(".webp") ? key.slice(0, -".webp".length) : key;
+/** Return the thumbnail key stored for an asset key, without the common extension, plus a crop's size when it is not 800 by 600. */
+export function encodeThumbKey(key: string, crop: { width?: number; height?: number } | null = null): string {
+  const base = key.endsWith(".webp") ? key.slice(0, -".webp".length) : key;
+  const width = crop?.width ?? CROP_WIDTH;
+  const height = crop?.height ?? CROP_HEIGHT;
+  return crop && base && (width !== CROP_WIDTH || height !== CROP_HEIGHT) ? `${base}~${width}x${height}` : base;
 }
 
-function imageUrl(assetBase: string, storedKey: string): string {
-  if (!storedKey) {
+/** Split a stored key into its asset key and an optional crop size. */
+export function decodeThumbKey(stored: string): { key: string; width?: number; height?: number } {
+  const [key, size = ""] = stored.split("~");
+  const match = /^(\d+)x(\d+)$/.exec(size);
+  return match ? { key, width: Number(match[1]), height: Number(match[2]) } : { key };
+}
+
+function imageUrl(key: string): string {
+  if (!key) {
     return "";
   }
-  const key = storedKey.includes(".") ? storedKey : `${storedKey}.webp`;
-  return assetBase ? `${assetBase}/${key}` : `/assets/${key}`;
+  return assetHref(key.includes(".") ? key : `${key}.webp`);
 }
 
 /** Drop trailing values that decode to the defaults, so most rows stay short. */
@@ -96,6 +124,12 @@ export function trimRow(row: ModelIndexRow): ModelIndexRow {
   return values as ModelIndexRow;
 }
 
+/** The display name the index stores for a family position ("=" stands for the family value itself). */
+function familyLabel(file: ModelIndexFile, familyIndex: number): string {
+  const label = file.familyLabels[familyIndex] ?? "";
+  return label === "=" ? (file.families[familyIndex] ?? "") : label;
+}
+
 /** Validate the fetched index; throws on anything unexpected so the page can offer a retry. */
 export function parseModelIndex(value: unknown): ModelIndexFile {
   const file = value as Partial<ModelIndexFile> | null;
@@ -104,6 +138,7 @@ export function parseModelIndex(value: unknown): ModelIndexFile {
     file.version !== MODEL_INDEX_VERSION ||
     !Array.isArray(file.categories) ||
     !Array.isArray(file.families) ||
+    !Array.isArray(file.familyLabels) ||
     !Array.isArray(file.frameworks) ||
     !Array.isArray(file.licences) ||
     !Array.isArray(file.rows)
@@ -123,22 +158,30 @@ export function parseModelThumbs(value: unknown, rows: number): ModelThumbsFile 
 }
 
 /** Decode index rows into entries; picture URLs come from the thumbs file when given. */
-export function decodeModelIndex(file: ModelIndexFile, assetBase: string, thumbs: ModelThumbsFile | null = null): IndexEntry[] {
+export function decodeModelIndex(file: ModelIndexFile, thumbs: ModelThumbsFile | null = null): IndexEntry[] {
+  const featured = new Map((Array.isArray(file.featured) ? file.featured : []).map((row, rank) => [row, rank]));
+  const windows = new Map((Array.isArray(file.windows) ? file.windows : []).map(([row, width, left, top]) => [row, { width, left, top }]));
   return file.rows.map((row, order) => {
     const [slug, name, categoryIndex, familyIndex = -1, nOps = null, paramCount = null, flags = 0, year = null, framework = -1, licence = -1, citations = null] = row;
     const category = file.categories[categoryIndex] ?? "";
     const familyName = file.families[familyIndex] ?? "";
+    const crop = (flags & FLAG_CROP) !== 0;
+    const thumb = decodeThumbKey(thumbs?.keys[order] ?? "");
+    const pictureWindow = thumbs && thumb.key ? windows.get(order) : undefined;
     return {
       card: {
         slug: slug || slugFromName(name),
         name,
         category,
-        family: distinctFamily(familyName, name),
+        family: familyChip(familyName, familyLabel(file, familyIndex), name),
         nOps,
         paramCount,
         verified: (flags & FLAG_VERIFIED) !== 0,
-        imageUrl: thumbs ? imageUrl(assetBase, thumbs.keys[order] ?? "") : "",
-        crop: (flags & FLAG_CROP) !== 0,
+        status: (flags & FLAG_STRUCTURE) !== 0 ? "structure" : (flags & FLAG_REPLAY) !== 0 ? "replay" : "",
+        imageUrl: thumbs ? imageUrl(thumb.key) : "",
+        crop,
+        ...(crop ? { cropWidth: thumb.width ?? CROP_WIDTH, cropHeight: thumb.height ?? CROP_HEIGHT } : {}),
+        ...(pictureWindow ? { window: pictureWindow } : {}),
       },
       facets: {
         category,
@@ -153,6 +196,8 @@ export function decodeModelIndex(file: ModelIndexFile, assetBase: string, thumbs
       familyName,
       order,
       hasPicture: (flags & FLAG_PICTURE) !== 0,
+      structure: (flags & FLAG_STRUCTURE) !== 0,
+      featured: featured.get(order) ?? -1,
     };
   });
 }

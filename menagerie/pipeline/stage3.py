@@ -274,12 +274,19 @@ def _job(record: ModelRecord, data: DataLayout, lane: str | None, *, timeout_s: 
             "memory_gib": memory_gib, "sizing": sizing_fields}
 
 
-def _pending(model_id: str, rev: str) -> str | None:
-    """A sent, not yet collected job for the same member at the same revision."""
+def open_jobs() -> list[str]:
+    """The names of sent, not yet collected jobs, sorted: one listing of each folder, which a
+    caller checking many members passes to ``_pending``."""
 
     collected = {p.name for p in _local("collected").glob("*.json")}
-    found = sorted(p.stem for p in _local("sent").glob(f"{model_id}-{rev}-*.json")
-                   if p.name not in collected)
+    return sorted(p.stem for p in _local("sent").glob("*.json") if p.name not in collected)
+
+
+def _pending(model_id: str, rev: str, open_: Sequence[str] | None = None) -> str | None:
+    """A sent, not yet collected job for the same member at the same revision."""
+
+    prefix = f"{model_id}-{rev}-"
+    found = [name for name in (open_jobs() if open_ is None else open_) if name.startswith(prefix)]
     return found[-1] if found else None
 
 
@@ -311,29 +318,62 @@ def _skip(record: ModelRecord, data: DataLayout, traced: set[tuple[str, str]]) -
     return f"already queued as {pending}" if pending else None
 
 
+# A trace peak measured at an older TorchLens pin sizes a trace at the current pin at this
+# factor, when the row has no peak measured at the pin (Lead, decisions.md 2026-11-07: 3.0.2
+# peaked at a median 0.55x of 2.x on 41 rows run under both). The memory_cap ladder is the backstop.
+OLDER_PIN_FACTOR = 0.6
+
+
 @dataclass
 class Peaks:
     """Measured peaks in MB from the ledger, by stable id (eval rows, any revision, not infra):
     forward peaks, passing full trace peaks and ``memory_cap`` full trace peaks, with the time of
-    each member's latest passing and ``memory_cap`` trace."""
+    each member's latest passing and ``memory_cap`` trace. A member's trace peaks come from the
+    TorchLens pin alone when it has one there; else its older-pin peaks, scaled by
+    ``OLDER_PIN_FACTOR``, stand in and the member is in ``older``. A row with no ``tl`` counts as
+    the pin's."""
 
     forward: dict[str, int]
     passed: dict[str, int]
     capped: dict[str, int]
     passed_at: dict[str, datetime] = field(default_factory=dict)
     capped_at: dict[str, datetime] = field(default_factory=dict)
+    older: set[str] = field(default_factory=set)
 
     @classmethod
-    def read(cls, data: DataLayout) -> Peaks:
+    def read(cls, data: DataLayout, *, pin: str | None = None) -> Peaks:
         from menagerie.pipeline import ledger
+        from menagerie.pipeline.publish import torchlens_pin
         from menagerie.pipeline.records import LedgerRow
 
-        found = cls({}, {}, {})
+        pin = pin or torchlens_pin()
+        found, before = cls({}, {}, {}), cls({}, {}, {})
         rows = ledger.read_all(data=data) if (data.root / "ledger").is_dir() else []
         for row in rows:
             if isinstance(row, LedgerRow) and row.outcome != "infra" and row.mode != "train":
-                found._take(row)
+                at_pin = row.stage != "trace" or row.tl in (None, pin)
+                (found if at_pin else before)._take(row)
+        found._stand_in(before)
         return found
+
+    def _stand_in(self, before: Peaks) -> None:
+        """Older-pin trace peaks, scaled, for the members with none at the pin."""
+
+        measured = self.passed.keys() | self.capped.keys()
+        for sid in (before.passed.keys() | before.capped.keys()) - measured:
+            for into, times, old, old_times in ((self.passed, self.passed_at, before.passed,
+                                                 before.passed_at),
+                                                (self.capped, self.capped_at, before.capped,
+                                                 before.capped_at)):
+                if sid in old:
+                    into[sid] = round(old[sid] * OLDER_PIN_FACTOR)
+                    times[sid] = old_times[sid]
+            self.older.add(sid)
+
+    def measured_at_pin(self, sid: str) -> bool:
+        """Whether the member's trace peaks were measured at the TorchLens pin."""
+
+        return (sid in self.passed or sid in self.capped) and sid not in self.older
 
     def _take(self, row: Any) -> None:
         if row.stage == "forward":
@@ -397,17 +437,18 @@ def sizing(record: ModelRecord, peaks: Peaks, families: dict[str, list[str]], *,
     sid, gib = record.id, 1 / 1024
     ratio = peaks.ratio(families.get(record.family) or [sid])
     floor = flow.ROW_FLOOR_GIB if per_row_floor else flow.TRACE_FLOOR_GIB
+    older = f" (older TorchLens pin x {OLDER_PIN_FACTOR})" if sid in peaks.older else ""
     if sid in peaks.passed and not peaks.outgrown(sid):
         measured = round(peaks.passed[sid] * gib * runner.PEAK_HEADROOM, 2)
         return flow.Sizing(measured_gib=measured, basis=f"its measured trace peak "
-                           f"{peaks.passed[sid] * gib:.1f} GiB x {runner.PEAK_HEADROOM}",
+                           f"{peaks.passed[sid] * gib:.1f} GiB{older} x {runner.PEAK_HEADROOM}",
                            floor_gib=floor)
     capped = peaks.capped.get(sid)
     at_least = round(capped * gib * flow.MEMORY_CAP_STEP, 2) if capped else None
     basis = (f"{record.family}'s measured ratio {ratio}" if ratio else
              f"{flow.TRACE_PEAK_RATIO}") + " x the forward's measured peak"
     if at_least:
-        basis += f", at least {flow.MEMORY_CAP_STEP} x its memory_cap at {capped * gib:.1f} GiB"
+        basis += f", at least {flow.MEMORY_CAP_STEP} x its memory_cap at {capped * gib:.1f} GiB{older}"
     return flow.Sizing(ratio=ratio or flow.TRACE_PEAK_RATIO, at_least_gib=at_least, basis=basis,
                        floor_gib=floor)
 
@@ -823,7 +864,8 @@ def _start(dirs: dict[str, Path], seen: dict[str, dict[str, Any]],
         del running[name]
     # no runner: wait for it; below the disk guard's pause line (jobs the tick started): idle;
     # drained by the tick before a resize: the claimed jobs finish, nothing new starts
-    ready = runner.serving(spool) and disk_guard.claim_ok(store.root) and not (
+    ready = runner.serving(spool) and disk_guard.claim_ok(
+        store.root, live=Path(spool) / disk_guard.LIVE_PAUSE) and not (
         Path(spool) / runner_job.DRAIN).exists()
     free = workers - len(running) if ready else 0
     for path in _claim(dirs, seen)[:free] if free > 0 else ():
@@ -876,6 +918,7 @@ def _append_lines(results: Sequence[dict[str, Any]], data: DataLayout) -> dict[s
     """Append every result's lines, one locked append per shard: ledger lines unless the same
     line is there, store-index lines unless their sha is already indexed."""
 
+    from menagerie.pipeline import store
     from menagerie.pipeline.records import parse_ledger_line
 
     ledger = [line for done in results for line in done.get("ledger") or ()]
@@ -884,7 +927,7 @@ def _append_lines(results: Sequence[dict[str, Any]], data: DataLayout) -> dict[s
     added = {f"ledger/{month}": _append_new(data.ledger(month), batch, lambda s: s)
              for month, batch in sorted(_by_month(ledger, "at").items())}
     known = _indexed(data)
-    fresh = [line for done in results for line in done.get("store_index") or ()
+    fresh = [store.public_line(line) for done in results for line in done.get("store_index") or ()
              if json.loads(line)["sha256"] not in known]
     for month, batch in sorted(_by_month(fresh, "fetched").items()):
         added[f"store-index/{month}"] = _append_new(

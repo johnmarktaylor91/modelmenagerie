@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from menagerie.pipeline import DataLayout, StoreLayout, calibration, ledger, read_json, review
+from menagerie.pipeline import DataLayout, StoreLayout, calibration, ledger, read_json, review, write_json
 from menagerie.pipeline import store as store_mod
-from menagerie.pipeline.records import LedgerRow, ModelRecord, RecordError
+from menagerie.pipeline.records import Amendment, LedgerRow, ModelRecord, Packet, RecordError
 
 FIXTURES = Path(__file__).parent / "fixtures"
 HARNESS = {"model-design-review": "codex", "model-default": "claude",
@@ -84,8 +84,13 @@ def test_a_held_third_lab_seat_is_never_picked(lab, data, monkeypatch):
     assert review.pick_reviewer("claude-run", data=data) == "model-design-review"
 
 def _seat(data: DataLayout, role: str, agree: tuple[int, ...], cases: int = 20) -> None:
-    """Calibration rows for ``role`` at the current prompt: one run per entry of ``agree``."""
+    """Calibration rows for ``role`` at the current prompt: one run per entry of ``agree`` (for
+    a voting seat, its base role's runs, each entry ``votes`` times)."""
 
+    if role in review.ENSEMBLES:
+        base, votes = review.ENSEMBLES[role]
+        _seat(data, base, tuple(a for a in agree for _ in range(votes)), cases)
+        return
     path = data.root / "review" / "calibration-cases.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     counted = [{"case": f"k{i}", "expected": "not_fabrication"} for i in range(cases)]
@@ -163,7 +168,7 @@ def test_record_appends_a_review_row_with_the_findings_blob(data, tmp_path, monk
     row = review.record("m8839", path, data=data, store=store)
     assert (row.stage, row.verdict, row.recipe_rev, row.env, row.reviewer) == (
         "review", "fabrication", "457cba223fe9", "review:model-default", "model-default")
-    assert row.msg == f"prompt {review.prompt_version()}" and not review.needs_second_review(row)
+    assert row.msg == f"prompt {review.prompt_version()}; case 1" and not review.needs_second_review(row)
     assert store_mod.get(row.findings, store=store).read_bytes() == path.read_bytes()
     assert ledger.read_all(data=data) == [row]
     event = json.loads((tmp_path / "work/lanes/review-lane-1/events.jsonl").read_text())
@@ -192,6 +197,23 @@ def test_record_refuses_an_uncalibrated_seat_and_a_changed_prompt(data, tmp_path
     row = review.record("m8839", path, data=data, store=store)
     assert review.needs_second_review(row)
     assert ledger.read_all(data=data) == [row]
+
+
+def test_record_stamps_the_source_digest_its_case_was_built_with(data, tmp_path, monkeypatch):
+    monkeypatch.delenv("FLEET_RUN_ID", raising=False)
+    monkeypatch.setattr(store_mod, "materialize", lambda sha, dest, *, store: dest)
+    lane = tmp_path / "lane"
+    (lane / "out").mkdir(parents=True)
+    digest = review._model_case("m8839", lane / "cases" / "m8839", data,
+                                StoreLayout(tmp_path / "store"), [])
+    assert digest == review.source_digest(read_json(Packet, data.packet("f-resnet")))
+    (lane / "sources.json").write_text(json.dumps({"m8839": digest}))
+    path = lane / "out" / "m8839.json"
+    path.write_text(json.dumps(_review()))
+    _seat(data, "model-default", (19, 18, 20))
+    row = review.record("m8839", path, data=data, store=StoreLayout(tmp_path / "store"))
+    assert row.msg.endswith(f"; case 1; src {digest}")
+    assert not review.stale(row, read_json(Packet, data.packet("f-resnet")))
 
 
 @pytest.mark.parametrize("delta", ["", "C3 fully connected, plain linear output"])
@@ -346,7 +368,7 @@ def test_the_stage_calibrates_and_holds_until_a_seat_counts(data, tmp_path, monk
     for role in review.REVIEWER_ROLES:  # every seat calibrated: no new calibration
         _seat(data, role, (10, 10, 10))
     out = review.stage(["m8839"], data=data, room=2, held=set(), dry_run=False)
-    assert len(called) == 3 and "calibration" not in out and "held" in out
+    assert len(called) == len(review.REVIEWER_ROLES) and "calibration" not in out and "held" in out
 
 
 def test_the_stage_starts_one_role_batches_up_to_its_room(lab, data, tmp_path, monkeypatch):
@@ -401,6 +423,54 @@ def test_a_case_that_cannot_be_built_leaves_no_lane_folder(lab, data, tmp_path, 
     assert not list((tmp_path / "work" / "review" / "lanes").glob("review-*"))
 
 
+def test_a_refused_launch_leaves_no_folder_and_holds_no_row(lab, data, tmp_path, monkeypatch):
+    """2 Nov 2026: a batch refused at launch kept its case folders, and each held its 5 rows a
+    day, so 226 of the 231 rows at review waited with no lane on them."""
+    monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path / "work"))
+    monkeypatch.setenv("MENAGERIE_STORE", str(tmp_path / "store"))
+    monkeypatch.setattr(review, "_model_case", lambda m, folder, *a: folder.mkdir(parents=True) or "d")
+
+    def refused(*args, **kwargs):
+        raise review.drive.Refused("no_admission", "role model-judgment: no eligible seat")
+
+    monkeypatch.setattr(review, "_start", refused)
+    with pytest.raises(review.drive.Refused):
+        review.launch(["m8839"], data=data, roles={"m8839": "model-default"})
+    lanes = tmp_path / "work" / "review" / "lanes"
+    assert not list(lanes.glob("review-*"))
+    (lanes / "review-m8839-1-old" / "cases" / "m8839").mkdir(parents=True)  # one left before
+    assert review._taken_up(data) == set()
+
+
+def test_a_refused_seat_does_not_hold_another_seats_batch(data, tmp_path, monkeypatch):
+    monkeypatch.setenv("MENAGERIE_STORE", str(tmp_path / "store"))
+    monkeypatch.setattr(review, "seats", lambda data: {"model-design-review": "passed"})
+    monkeypatch.setattr(review, "settle", lambda **kw: {})
+    monkeypatch.setattr(review, "plan", lambda ids, **kw: (
+        [("model-judgment-3vote", ["m1", "m2"]), ("model-judgment-3vote", ["m3"]),
+         ("model-design-review", ["m4"])], {}))
+    tried = []
+
+    def launch(batch, *, data, roles):
+        tried.append(list(batch))
+        if "model-judgment-3vote" in roles.values():
+            raise review.drive.Refused("no_admission", "no eligible seat")
+        return ["run1"]
+
+    monkeypatch.setattr(review, "launch", launch)
+    out = review.stage(["m1", "m2", "m3", "m4"], data=data, room=2, held=set(), dry_run=False)
+    assert tried == [["m1", "m2"], ["m4"]] and out["launched"] == ["run1"]
+    assert "no eligible seat" in out["refused"]
+
+
+def test_an_adapter_case_carries_the_classics_it_imports(tmp_path):
+    adapter = tmp_path / "f-x.py"
+    adapter.write_text("from menagerie.classics.CrossFormer import build\n")
+    review._copy_classics(adapter, tmp_path)
+    assert (tmp_path / "CrossFormer.py").read_bytes() == (
+        review.CLASSICS / "CrossFormer.py").read_bytes()
+
+
 def test_a_batch_whose_case_cannot_be_built_skips_only_that_batch(lab, data, tmp_path,
                                                                   monkeypatch):
     monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path / "work"))
@@ -442,6 +512,90 @@ def test_a_provisional_fabrication_waits_for_a_different_seat(lab, data, tmp_pat
     assert batches == [("model-default", ["m8839"])] and left["second"] == 0
 
 
+def test_a_confirm_only_seat_takes_a_claude_built_provisional_fabrication_once(
+        lab, data, tmp_path, monkeypatch):
+    monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path / "work"))
+    monkeypatch.setattr(review.admission, "third_lab_held", lambda: True)
+    monkeypatch.setattr(review, "_authors", lambda: {"f-resnet": "claude-run"})
+    model = read_json(ModelRecord, data.model("m8839"))
+    first = LedgerRow(id="m8839", stage="review", at="2026-10-29T03:45:00Z", host="hub",
+                      env="review:model-design-review", recipe_rev=model.recipe.rev,
+                      outcome="pass", msg=f"prompt p; {review.PROVISIONAL}",
+                      verdict="fabrication", reviewer="model-design-review")
+    ledger.append([first], data=data)
+    _seat(data, "model-design-review", (17, 18, 17))
+    _seat(data, "model-judgment", (19, 19, 19))
+    batches, left = review.plan(["m8839"], data=data, held=set())
+    assert batches == [("model-judgment", ["m8839"])]  # the own-lab seat may only confirm
+    no = LedgerRow(id="m8839", stage="review", at="2026-10-29T05:00:00Z", host="hub",
+                   env="review:model-judgment", recipe_rev=model.recipe.rev, outcome="pass",
+                   msg="prompt p", verdict="minor", reviewer="model-judgment")
+    ledger.append([no], data=data)
+    batches, left = review.plan(["m8839"], data=data, held=set())
+    assert batches == [] and left["second"] == 1  # never asked twice; the row waits
+    packet = read_json(Packet, data.packet("f-resnet"))
+    retired = Amendment(at="2026-10-29T06:00:00Z", why="paper check", evidence=("s1",),
+                        changed=("sources",), by="paper-rejected")
+    write_json(replace(packet, amendments=(*packet.amendments, retired)), data.packet("f-resnet"))
+    batches, left = review.plan(["m8839"], data=data, held=set())
+    assert left["second"] == 0 and ("model-judgment", ["m8839"]) not in batches  # a first review anew
+
+
+def test_a_taken_row_is_free_once_its_review_is_recorded(data, tmp_path, monkeypatch):
+    monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path / "work"))
+    _lane("review-m8839-1-x", review.prompt_version(), {"m8839": _review()})
+    assert review._taken_up(data) == {"m8839"}  # a lane took it up today
+    model = read_json(ModelRecord, data.model("m8839"))
+    earlier = LedgerRow(id="m8839", stage="review", at="2020-01-01T00:00:00Z", host="hub",
+                        env="review:model-default", recipe_rev=model.recipe.rev, outcome="pass",
+                        msg="prompt p", verdict="minor", reviewer="model-default")
+    ledger.append([earlier], data=data)
+    assert review._taken_up(data) == {"m8839"}  # a verdict from before the case is not its answer
+    ledger.append([replace(earlier, at="2999-01-01T00:00:00Z")], data=data)
+    assert review._taken_up(data) == set()
+
+
+def test_a_voting_seat_confirms_only_on_a_majority_of_its_votes(data, tmp_path, monkeypatch):
+    monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path / "work"))
+    monkeypatch.setenv("MENAGERIE_STORE", str(tmp_path / "store"))
+    monkeypatch.delenv("FLEET_RUN_ID", raising=False)
+    assert review.majority(["fabrication", "minor", "fabrication"]) == "fabrication"
+    assert review.majority(["fabrication", "minor", "faithful", "minor"]) == "minor"
+    assert review.majority(["fabrication", None, None]) is None
+    role = "model-judgment-3vote"
+    folder = review.work_root() / "lanes" / "review-m8839-1-x"
+    (folder / "cases" / "m8839").mkdir(parents=True)
+    (folder / "cases" / "m8839" / "run.json").write_text("{}")
+    started = []
+    monkeypatch.setattr(review.drive, "launch", lambda kind, r, brief, **kw: started.append(
+        (r, brief, kw["keys"])) or f"run-{len(started)}")
+    run = review._start(role, review._brief(role, folder, ["m8839"]), ["m8839"], "review-m8839-1")
+    assert run == "run-1" and [(r, tuple(k)) for r, _, k in started] == [
+        ("model-judgment", ("m8839",)), ("model-judgment", ()), ("model-judgment", ())]
+    assert all(b.parent.name == f"v{k}" and (b.parent / "cases/m8839/run.json").is_file()
+               for k, (_, b, _) in enumerate(started, 1))
+    lane = json.loads((folder / "lane.json").read_text())
+    assert (lane["harness"], lane["runs"], lane["role"]) == ("votes", ["run-1", "run-2", "run-3"], role)
+    for k, verdict in enumerate(("fabrication", "minor", "fabrication"), 1):
+        body = _review() if verdict == "fabrication" else {**_review(), "verdict": verdict}
+        (folder / f"v{k}" / "out" / "m8839.json").write_text(json.dumps(
+            {**body, "reviewer": "model-judgment", "summary": f"vote {k}"}))
+    _seat(data, role, (19, 19, 19))
+    monkeypatch.setattr(review, "lane_state", lambda f: ("run-1", "TERMINAL"))
+    out = review.settle(data=data, store=StoreLayout(tmp_path / "store"))
+    assert out["recorded"] == ["m8839"] and not out["refused"]
+    (row,) = ledger.read_all(data=data)
+    assert (row.reviewer, row.verdict) == (role, "fabrication")
+    tallied = json.loads((folder / "out" / "m8839.json").read_text())
+    assert tallied["votes"] == ["fabrication", "minor", "fabrication"] and tallied["summary"] == "vote 1"
+
+
+def test_a_voting_seats_calibration_runs_are_its_base_runs_in_threes(data):
+    _seat(data, "model-judgment", (19, 20, 18, 20, 20, 20, 17, 17, 20))
+    seat = calibration.standing("model-judgment-3vote", review.prompt_version(), data=data)
+    assert seat["runs"] == 3 and seat["agree"] == [19, 20, 17]  # majority of each three, per case
+
+
 def test_settle_records_what_an_ended_lane_left_once(data, tmp_path, monkeypatch):
     monkeypatch.setenv("MENAGERIE_WORK_ROOT", str(tmp_path / "work"))
     monkeypatch.setenv("MENAGERIE_STORE", str(tmp_path / "store"))
@@ -471,3 +625,9 @@ def test_the_tick_step_runs_only_when_enabled(data, tmp_path, monkeypatch):
     monkeypatch.setattr(review, "stage", lambda ids, **kw: seen.update(ids=ids, **kw) or {})
     tick_full.reviews(data, cfg, dry_run=True)
     assert seen["ids"] == ["m8839"] and seen["room"] == 1 and seen["held"] == {"k"}
+    (tmp_path / "worklist.txt").write_text("m8839 r3\nm1 r4\n")  # a push puts r4 first
+    monkeypatch.setattr(tick_full, "_steps", lambda ids, data, cfg: dict.fromkeys(ids, "review"))
+    tick_full.reviews(data, {**cfg, "reviews": {**cfg["reviews"], "cohort_first": "r4"}}, dry_run=True)
+    assert seen["ids"] == ["m1", "m8839"]
+    with pytest.raises(ValueError, match="cohort_first"):
+        tick_full.reviews(data, {**cfg, "reviews": {"enabled": True, "cohort_first": 4}}, dry_run=True)

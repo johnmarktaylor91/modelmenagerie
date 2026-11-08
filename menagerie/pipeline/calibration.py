@@ -25,11 +25,12 @@ import json
 import math
 import os
 import shutil
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from menagerie.pipeline import DataLayout, StoreLayout, now
+from menagerie.pipeline import CACHE_RACY_S, DataLayout, StoreLayout, now
 from menagerie.pipeline import review as review_mod
 
 RUNS = 3
@@ -98,20 +99,54 @@ def _blind(counted: Sequence[dict[str, Any]], key: str) -> dict[str, str]:
 # --- scores and standing -------------------------------------------------------------------
 
 
+_ROWS: dict[Path, tuple[tuple[int, int, int], list[dict[str, Any]]]] = {}
+
+
 def rows(data: DataLayout) -> list[dict[str, Any]]:
+    """The calibration rows, parsed once per change of the file (review planning asks for every
+    seat's standing, each a read of the whole file). Callers must not modify the rows."""
+
     path = data.root / "review" / "calibration.jsonl"
     if not path.is_file():
         return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    st = path.stat()
+    stamp = (st.st_size, st.st_mtime_ns, st.st_ino)
+    hit = _ROWS.get(path)
+    if hit is None or hit[0] != stamp:
+        parsed = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+        if time.time() - st.st_mtime_ns / 1e9 <= CACHE_RACY_S:
+            return parsed
+        hit = _ROWS[path] = (stamp, parsed)
+    return list(hit[1])
 
 
 def _seat_runs(role: str, prompt: str, sid: str, data: DataLayout) -> dict[int, dict[str, Any]]:
-    """The seat's scored runs: run number to ``{case: row}``."""
+    """The seat's scored runs: run number to ``{case: row}``. A voting seat's run is its base
+    role's runs taken ``votes`` at a time (``_voted``)."""
 
+    if role in review_mod.ENSEMBLES:
+        base, votes = review_mod.ENSEMBLES[role]
+        return _voted(_seat_runs(base, prompt, sid, data), votes)
     runs: dict[int, dict[str, Any]] = {}
     for row in rows(data):
         if (row["role"], row["prompt"], row.get("set")) == (role, prompt, sid):
             runs.setdefault(row["run"], {})[row["case"]] = row
+    return runs
+
+
+def _voted(base: dict[int, dict[str, Any]], votes: int) -> dict[int, dict[str, Any]]:
+    """Voting runs from base runs 1..n in consecutive groups of ``votes``: per case the call is
+    ``fabrication`` when a strict majority of the votes is (``review.majority``)."""
+
+    runs: dict[int, dict[str, Any]] = {}
+    for k in range(1, len(base) // votes + 1):
+        group = [base.get(n) for n in range((k - 1) * votes + 1, k * votes + 1)]
+        if any(g is None for g in group):
+            break
+        for case, row in group[0].items():
+            given = review_mod.majority([g.get(case, {}).get("given") for g in group])
+            agree = given is not None and (given == "fabrication") == (row["expected"] == "fabrication")
+            runs.setdefault(k, {})[case] = {**row, "run": k, "given": given, "agree": agree}
     return runs
 
 
@@ -272,6 +307,13 @@ def calibrate(*, role: str, data: DataLayout, runs: int = RUNS) -> dict[str, Any
 
     if role not in review_mod.REVIEWER_ROLES:
         raise review_mod.ReviewError(f"{role!r} is not a reviewer role")
+    if role in review_mod.ENSEMBLES:  # its runs are its base role's, ``votes`` per run
+        base, votes = review_mod.ENSEMBLES[role]
+        under = calibrate(role=base, data=data, runs=votes * (runs or RUNS))
+        seat = standing(role, review_mod.prompt_version(), data=data)
+        live = under["state"] in ("launched", "running")
+        return {**seat, "state": under["state"] if live else seat["state"], "at": now(),
+                "run_reports": under["run_reports"]}
     counted, prompt = cases(data), review_mod.prompt_version()
     if not counted:
         raise review_mod.ReviewError(f"no calibration cases under {data.root / 'review'}")

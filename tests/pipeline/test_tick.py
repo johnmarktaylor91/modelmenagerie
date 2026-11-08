@@ -9,6 +9,7 @@ from __future__ import annotations
 import fcntl
 import json
 import subprocess
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -22,6 +23,7 @@ from menagerie.pipeline import (
     DataLayout, append_jsonl, cli, disk_guard, runner_job, stage3, tick, tick_commit, tick_full,
     write_json,
 )
+from menagerie.pipeline import pause as pause_mod
 from menagerie.pipeline.records import StoreIndexLine, dumps
 from menagerie.pipeline.disk_guard import GIB, Config, Reading, State, decide
 
@@ -126,6 +128,25 @@ def test_the_worker_claim_check_idles_below_the_job_pause_line(monkeypatch: pyte
     monkeypatch.setenv(disk_guard.PAUSE_ENV, "62")
     assert not disk_guard.claim_ok("/x", statvfs=fake(61.5))
     assert disk_guard.claim_ok("/x", statvfs=fake(62.5))
+
+
+def test_the_worker_claim_check_follows_the_ticks_live_pause_line(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake(free: float):
+        return lambda _: SimpleNamespace(f_bavail=int(free * GIB) // 4096, f_frsize=4096)
+
+    live = tmp_path / disk_guard.LIVE_PAUSE
+    monkeypatch.setenv(disk_guard.PAUSE_ENV, "62")
+    assert not disk_guard.claim_ok("/x", statvfs=fake(61), live=live)  # no file yet: the job's line
+    live.write_text("58\n")  # the tick lowered the line after the job started
+    assert disk_guard.claim_ok("/x", statvfs=fake(61), live=live)
+    assert not disk_guard.claim_ok("/x", statvfs=fake(57.5), live=live)
+    live.write_text("64")  # raised: the live line holds too
+    assert not disk_guard.claim_ok("/x", statvfs=fake(63), live=live)
+    live.write_text("garbled")
+    assert not disk_guard.claim_ok("/x", statvfs=fake(61), live=live)  # unreadable: the job's line
+    monkeypatch.delenv(disk_guard.PAUSE_ENV)
+    assert disk_guard.claim_ok("/x", statvfs=fake(1), live=live)  # a job started before the guard
 
 
 def test_log_line_matches_the_store_gate_format() -> None:
@@ -527,12 +548,32 @@ class World:
     launched: list[tuple[str, Path]] = field(default_factory=list)  # reclaim scripts started
     reaped: list[str] = field(default_factory=list)  # lane checkouts run-on was asked to reap
     held: set[str] = field(default_factory=set)  # jobs run-on keeps for their failed grace
+    store_gib: float = 12.0  # the worker store's size (under its 20 GiB target)
+    aged_gib: float = 9.0  # what the ceiling could offload now
+    aged_reads: int = 0
+    units: list[str] = field(default_factory=list)  # units the tick started
+    ceilings: list[float] = field(default_factory=list)  # dipped trim targets the tick requested
+    timers: dict[str, str] = field(default_factory=dict)  # timer: "active" or "inactive" (enabled)
+    systemd: list[tuple[str, ...]] = field(default_factory=list)  # systemctl stops and starts
+
+    def systemctl(self, *args: str) -> subprocess.CompletedProcess[str]:
+        verb, unit = args
+        if verb in ("stop", "start"):
+            self.systemd.append(args)
+            self.timers[unit] = "inactive" if verb == "stop" else "active"
+        out = {"is-active": self.timers.get(unit, "inactive"),
+               "is-enabled": "enabled" if unit in self.timers else "not-found"}.get(verb, "")
+        return subprocess.CompletedProcess(args, 0, out + "\n", "")
 
     def read(self) -> Reading:
         value = self.free.pop(0) if len(self.free) > 1 else self.free[0]
         if value is None:
             raise OSError("ssh: timed out")
         return _gib(value)
+
+    def aged(self) -> float:
+        self.aged_reads += 1
+        return self.aged_gib
 
     def changed(self, data: DataLayout) -> list[str]:
         self.calls += 1
@@ -580,6 +621,9 @@ class World:
                          reclaim_launch=lambda script, log, repo: self.launched.append((script, repo)) or 1,
                          lane_reap=lambda label: self.reaped.append(label) or (0, f"REAPED\t{label}\t1\tfailed-ttl"),
                          lane_held=lambda: set(self.held),
+                         store_size=lambda: self.store_gib, store_aged=self.aged,
+                         unit_start=self.units.append, systemctl=self.systemctl,
+                         ceiling_request=lambda repo, gib, at: self.ceilings.append(gib) or repo,
                          now=lambda: now)
 
 
@@ -600,20 +644,27 @@ def _state_with_job(job: str = "j") -> dict[str, Any]:
 def test_a_collect_pass_runs_its_steps_and_writes_state_log_status_and_heartbeat(work: Path) -> None:
     world = World(after={"menagerie/data/ledger/2026-10.jsonl", "menagerie/data/models/m1.json"})
     out = _tick(world, state=_state_with_job())
-    assert set(out["results"]) == {"disk", "reclaim", "runners", "collect", "drain", "env_missing",
-                                   "lanes", "lane_reap", "axon", "status"}
+    assert set(out["results"]) == {"pause", "disk", "reclaim", "store_pressure", "runners", "collect", "drain",
+                                   "env_missing", "lanes", "lane_reap", "axon", "status"}
     assert not out["errors"] and out["results"]["env_missing"] == {}
-    assert world.collected == ["scratch/menagerie/spool-B", "scratch/menagerie/spool-Bn",
-                               "scratch/menagerie/spool-A"]
+    assert world.collected == ["scratch/menagerie/spool-B", "scratch/menagerie/spool-A"]
     assert world.commits == [["menagerie/data/ledger/2026-10.jsonl"]]  # models/ is not the tick's
     assert world.full_calls == [] and world.drained == 1 and world.sent == []
     for name in ("state.json", "tick.log", "status.md", "heartbeat"):
         assert (work / name).is_file()
     log = (work / "tick.log").read_text().splitlines()
     assert json.loads(log[0])["mode"] == "collect" and log[1].startswith("disk worker free=88.0GiB")
-    assert set(json.loads(log[0])["step_seconds"]) == {"disk", "reclaim", "runners", "collect", "drain",
-                                                       "env_missing", "lanes", "lane_reap", "axon"}
+    assert set(json.loads(log[0])["step_seconds"]) == {"pause", "disk", "reclaim", "store_pressure", "runners",
+                                                       "collect", "drain", "env_missing", "lanes", "lane_reap", "axon"}
     assert "runner B: ok" in (work / "status.md").read_text()
+
+
+def test_status_lines_count_lists_and_stay_whole_json() -> None:
+    queue = {"eligible": 686, "waiting": 39, "queued": [], "held_by_lane": {f"m{i}": "lane" for i in range(30)},
+             "big": {"reserved": [f"m{i}" for i in range(300)], "note": "x" * 500}}
+    line = json.loads(json.dumps(tick._counted(queue)))
+    assert line == {"eligible": 686, "waiting": 39, "queued": 0, "held_by_lane": 30,
+                    "big": {"reserved": 300, "note": "x" * tick.STATUS_TEXT + "..."}}
 
 
 def _trace(model_id: str, at: datetime, cls: str | None, env: str = "paddle@d485c924") -> str:
@@ -679,10 +730,10 @@ def test_one_collector_per_spool(work: Path) -> None:
     assert "another collector owns" in out["results"]["collect"]["skipped"] and not world.collected
     world.active.clear()
     work.mkdir(parents=True, exist_ok=True)
-    with open(work / "collect-spool-Bn.lock", "a") as held:
+    with open(work / "collect-spool-A.lock", "a") as held:
         fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
         out = _tick(world, now=T0 + timedelta(minutes=10))
-    assert world.collected == ["scratch/menagerie/spool-B", "scratch/menagerie/spool-A"]
+    assert world.collected == ["scratch/menagerie/spool-B"]
     assert out["results"]["collect"]["spools"][1]["skipped"] == "another collector holds its lock"
 
 
@@ -696,6 +747,96 @@ def test_a_paused_disk_holds_queueing_top_up_and_new_runners_while_the_rest_runs
     assert world.drained == 1 and len(world.sent) == 1 and "disk paused" in world.sent[0]
     _tick(world, "full", now=T0 + timedelta(minutes=10))
     assert len(world.sent) == 1  # no second FACT
+
+
+PAUSE = {"for": "TorchLens", "since": "2026-10-29T19:20:00Z", "until_note": "until torchlens/Lead says done"}
+
+
+def test_a_worker_pause_drains_each_runner_then_ends_it_and_its_return_is_no_restart(work: Path) -> None:
+    ops = FakeOps(states={"jb": "RUNNING"}, is_idle=False, age=None)
+    state = {"runners": {"B": runner_job.Record(job="jb", size=1).to_mapping()}}
+    first = {r["runner"]: r for r in runner_job.pause("paused", ops=ops, state=state)}
+    assert first["B"]["action"] == "held-pause" and ops.drains == [True] and not ops.cancelled
+    assert {first["A"]["action"], first["G"]["action"]} == {"off"} and not ops.submitted
+    ops.is_idle = True
+    state = {"runners": {n: r["record"] for n, r in first.items()}}
+    second = {r["runner"]: r for r in runner_job.pause("paused", ops=ops, state=state)}
+    assert second["B"]["action"] == "pause" and ops.cancelled == ["jb"] and ops.drains == [True]
+    record = runner_job.Record.from_mapping(second["B"]["record"])
+    assert record.cancelled_for == "pause"
+    third = runner_job.pause("paused", ops=ops, state={"runners": {"B": second["B"]["record"]}})
+    assert {r["action"] for r in third} == {"off"} and not ops.submitted
+    back = _ensure(ops, record)  # the pause is cleared: B starts again, and that is no restart
+    assert back.action == "restart" and back.record.restarts == record.restarts
+
+
+def test_a_paused_pass_starts_nothing_on_the_worker_and_clearing_it_restores_everything(work: Path) -> None:
+    from menagerie.pipeline import mini_placement, tick_full
+
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "config.json").write_text(json.dumps({"zmachine_paused": PAUSE}))
+    world = World(ops=FakeOps(states={"j": "FAILED"}, age=None),
+                  timers={"menagerie-counts.timer": "active", "menagerie-store-box-daily.timer": "inactive"})
+    out = _tick(world, "full", state=_state_with_job())
+    assert {r["action"] for r in out["results"]["runners"]} == {"off"} and not world.ops.submitted
+    assert out["results"]["reclaim"]["skipped"].startswith(f"{pause_mod.DEFAULT_HOST} paused for TorchLens")
+    assert out["results"]["store_pressure"]["skipped"].startswith(f"{pause_mod.DEFAULT_HOST} paused")
+    assert world.launched == [] and world.units == []
+    assert world.systemd == [("stop", "menagerie-counts.timer")]
+    assert f"- PAUSE: {pause_mod.DEFAULT_HOST} paused for TorchLens since 2026-10-29T19:20:00Z" in (work / "status.md").read_text()
+    assert world.collected and world.drained == 1  # collect and drain still run
+    cfg = tick.config()
+    assert mini_placement.host_cap(pause_mod.DEFAULT_HOST, {"cap": 12}, cfg) == (
+        0, f"held: {pause_mod.note(cfg)}")
+    assert tick_full._held_2b(cfg) == pause_mod.note(cfg)
+    _tick(world, "full", now=T0 + timedelta(minutes=10))
+    assert world.systemd == [("stop", "menagerie-counts.timer")] and not world.ops.submitted
+    (work / "config.json").write_text(json.dumps({"zmachine_paused": None}))
+    out = _tick(world, "full", now=T0 + timedelta(minutes=20))
+    # The store-box timer was already stopped when the pause began: clearing leaves it stopped.
+    assert world.systemd[1:] == [("start", "menagerie-counts.timer")]
+    assert world.ops.submitted and tick.load_state()["paused_timers"] is None
+    assert "PAUSE" not in (work / "status.md").read_text()
+
+
+def test_clearing_a_pause_never_starts_a_timer_disabled_meanwhile_or_a_retired_one(work: Path) -> None:
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "config.json").write_text(json.dumps({"zmachine_paused": PAUSE}))
+    world = World(ops=FakeOps(states={"j": "FAILED"}, age=None),
+                  timers={"menagerie-counts.timer": "active", "menagerie-store-box-daily.timer": "active",
+                          "menagerie-night-boost.timer": "active"})
+    _tick(world, "full", state=_state_with_job())
+    assert sorted(world.systemd) == [("stop", "menagerie-counts.timer"),
+                                     ("stop", "menagerie-store-box-daily.timer")]
+    del world.timers["menagerie-store-box-daily.timer"]  # disabled (retired) during the pause
+    (work / "config.json").write_text(json.dumps({"zmachine_paused": None}))
+    out = _tick(world, "full", now=T0 + timedelta(minutes=10))
+    assert world.systemd[2:] == [("start", "menagerie-counts.timer")]
+    assert out["results"]["pause"] == {"started": ["menagerie-counts.timer"],
+                                       "left_disabled": ["menagerie-store-box-daily.timer"]}
+    assert "menagerie-night-boost.timer" not in pause_mod.TIMERS
+
+
+def test_the_retrace_feed_runs_after_live_queueing_and_holds_under_a_pause(work: Path) -> None:
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "config.json").write_text(json.dumps({"retrace": {"enabled": True}}))
+    world = World()
+    tick.save_state(_state_with_job())
+    deps = world.deps()
+    deps.full = {**deps.full, "retrace": world.full("retrace")}
+    out = tick.tick("full", data=DATA, deps=deps, bound_s=None)
+    assert world.full_calls.index("retrace") == world.full_calls.index("stage3_queue") + 1
+    assert out["results"]["retrace"] == {"ran": "retrace"}
+    (work / "config.json").write_text(json.dumps({"retrace": {"enabled": True}, "zmachine_paused": PAUSE}))
+    out = tick.tick("full", data=DATA, deps=world.deps(T0 + timedelta(minutes=10)), bound_s=None)
+    assert out["results"]["retrace"]["held"].startswith(f"{pause_mod.DEFAULT_HOST} paused for TorchLens")
+
+
+def test_a_malformed_pause_is_refused() -> None:
+    for bad in ({"for": "TorchLens"}, True, "yes"):
+        with pytest.raises(ValueError, match="zmachine_paused"):
+            pause_mod.active({"zmachine_paused": bad})
+    assert pause_mod.active({"zmachine_paused": None}) is None
 
 
 def test_a_critical_disk_holds_the_drain(work: Path) -> None:
@@ -774,7 +915,7 @@ def _refill(world: World, work: Path, *, now: datetime = REFILL_AT, a: dict[str,
 def test_a_refill_tops_up_2b_only_with_runner_a_s_saved_declaration_and_clears_the_want(work: Path) -> None:
     world = World()
     out, cfg = _refill(world, work)
-    assert set(out["results"]) == {"disk", "runners", "top_up"} and not out["errors"]
+    assert set(out["results"]) == {"pause", "disk", "runners", "top_up"} and not out["errors"]
     assert out["results"]["runners"] == [] and world.ops.submitted == []  # no runner was refused
     assert world.full_calls == [] and world.collected == [] and world.drained == 0  # no tripwires either
     assert cfg["lane_limits"] == {"2a": 0} and cfg["runner_declaration"] == runner_job.tries_declaration(
@@ -847,6 +988,12 @@ def test_a_failed_send_waits_in_the_outbox_and_a_repeated_message_goes_once_a_da
     assert len(world.sent) == 2  # the next day, once more
 
 
+# The stage 3 spool's shell uses GNU ``mv -t`` and ``xargs -r``; spools live on the Linux runner hosts.
+GNU_SPOOL = pytest.mark.skipif(sys.platform == "darwin",
+                               reason="stage 3 spool shell needs GNU mv -t and xargs -r (Linux runner hosts)")
+
+
+@GNU_SPOOL
 def test_a_real_temp_spool_is_collected_once(work: Path, tmp_path: Path) -> None:
     spool = tmp_path / "spool-T"
     (spool / "stage3" / "done").mkdir(parents=True)
@@ -957,6 +1104,7 @@ def test_a_failed_trickle_commit_is_kept_and_made_by_the_next_pass(work: Path,
     assert FOREIGN_LINE not in _git(repo, "show", f"HEAD:{SHARD}")
 
 
+@GNU_SPOOL
 def test_collect_commits_its_own_lines_in_a_store_index_another_writer_left_dirty(
         work: Path, checkout: DataLayout, tmp_path: Path) -> None:
     repo = checkout.root.parents[1]
@@ -982,6 +1130,7 @@ def test_collect_commits_its_own_lines_in_a_store_index_another_writer_left_dirt
     assert (repo / SHARD).read_text() == BASE_LINE + FOREIGN_LINE + index + "\n"
 
 
+@GNU_SPOOL
 def test_collect_never_commits_a_line_another_writer_appends_during_the_pass(
         work: Path, checkout: DataLayout, tmp_path: Path) -> None:
     repo = checkout.root.parents[1]
@@ -1126,13 +1275,13 @@ def test_top_up_at_the_default_cap_and_with_no_hub_room(work: Path, monkeypatch:
     assert out["2b"] == [] and out["2a"] == [] and launched == [[], []]
 
 
-def test_lane_caps_default_to_14_2b_lanes_and_never_pass_16(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lane_caps_default_to_14_2b_lanes_and_never_pass_20(monkeypatch: pytest.MonkeyPatch) -> None:
     from menagerie.pipeline import admission, drive
 
     monkeypatch.delenv("MENAGERIE_LANES_2B", raising=False)
     assert admission.lane_cap("2b") == 14 and drive.lane_cap is admission.lane_cap
-    monkeypatch.setenv("MENAGERIE_LANES_2B", "20")
-    assert admission.lane_cap("2b") == 16
+    monkeypatch.setenv("MENAGERIE_LANES_2B", "24")
+    assert admission.lane_cap("2b") == 20
     monkeypatch.setenv("MENAGERIE_LANES_2B", "12")
     assert admission.lane_cap("2b") == 12
     assert tick_full._caps({"lane_limits": {"2b": 40, "2a": 1}}) == {"2a": 1, "2b": 12}
@@ -1548,12 +1697,35 @@ def test_big_runner_adds_spool_g_to_collection_and_keeps_big_work(monkeypatch: p
     answers = iter([{"big": {"reserved": ["m1", "m2"], "waiting": 3}},
                     {"big": {"reserved": [], "held": "unavailable"}},
                     {"skipped": "no worklist"}])
-    monkeypatch.setattr(tick, "_full_call", lambda p, name, held: next(answers))
+    monkeypatch.setattr(tick, "_full_call", lambda p, name, held, cfg=None: next(answers))
+    monkeypatch.setattr(tick, "_runners_behind_pin", lambda p: None)
     tick._step_stage3_queue(p)
     assert p.state["big_work"] == 5
     tick._step_stage3_queue(p)  # a held count keeps the last one
     tick._step_stage3_queue(p)
     assert p.state["big_work"] == 5
+
+
+def test_axon_takes_open_g_rows_of_its_cohorts_and_its_batch_is_held_from_spools(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from menagerie.pipeline import tick_full
+
+    monkeypatch.setattr(tick_full, "_cohorts", lambda cfg: {"m1": "r4-github", "m2": "r3",
+                                                            "m3": "r4-github"})
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: [i for i in ids if i != "m3"])
+    p = SimpleNamespace(cfg={}, data=None, state={},
+                        results={"stage3_queue": {"big": {"reserved": ["m1", "m2", "m3"]}}})
+    assert tick._axon_big(p, {"big_cohorts": ["r4-github"]}) == ["m1"]
+    assert tick._axon_big(p, {"big_cohorts": []}) == []
+    p.results = {"stage3_queue": {"held": "disk"}}
+    assert tick._axon_big(p, {"big_cohorts": ["r4-github"]}) == []
+    seen: list[Any] = []
+    monkeypatch.setattr(tick, "_full_call", lambda p, name, held, cfg=None: seen.append(cfg) or {})
+    monkeypatch.setattr(tick, "_runners_behind_pin", lambda p: None)
+    tick._step_stage3_queue(p)
+    p.state = {"axon": {"active": {"ids": ["m1", "m9"]}}}
+    tick._step_stage3_queue(p)
+    assert seen[0] is None and seen[1]["axon_holds"] == ["m1", "m9"]
 
 
 def test_reclaim_starts_below_its_line_once_an_hour_and_never_in_a_dry_run(work: Path, tmp_path: Path) -> None:
@@ -1572,6 +1744,95 @@ def test_reclaim_starts_below_its_line_once_an_hour_and_never_in_a_dry_run(work:
     later = replace(world.deps(T0 + timedelta(minutes=30)), repo=lambda d: repo)
     assert "skipped" in tick.tick("collect", dry_run=False, data=DATA, deps=later, bound_s=None)["results"]["reclaim"]
     assert len(world.launched) == 1
+
+
+def test_store_pressure_starts_the_trim_once_in_four_hours(work: Path) -> None:
+    world = World(free=[80.0], store_gib=26.0)
+    tick.tick("collect", dry_run=True, data=DATA, deps=world.deps(), bound_s=None)
+    assert world.units == []
+    out = tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(), bound_s=None)
+    assert out["results"]["store_pressure"]["started"]["why"] == ["store 26.0 GiB over its 20 GiB target"]
+    assert world.units == ["menagerie-store-box-daily.service"]
+    world.free = [64.0]
+    tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(T0 + timedelta(hours=3)), bound_s=None)
+    assert len(world.units) == 1  # once in four hours
+    out = tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(T0 + timedelta(hours=4)), bound_s=None)
+    assert out["results"]["store_pressure"]["started"]["why"] == [
+        "store 26.0 GiB over its 20 GiB target", "free 64.0 GiB under the resume line 72"]
+    assert len(world.units) == 2
+    assert world.ceilings == [12.0]  # free 8 GiB short: the 20 GiB target dips to 12 for this trim
+
+
+def test_store_pressure_waits_while_the_trim_could_free_under_a_gib(work: Path) -> None:
+    world = World(free=[70.0], store_gib=26.0, aged_gib=0.6)
+    out = tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(), bound_s=None)
+    assert "the trim could free only 0.6 GiB" in out["results"]["store_pressure"]["skipped"]
+    tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(T0 + timedelta(minutes=30)), bound_s=None)
+    assert world.units == [] and world.aged_reads == 1  # the estimate is reused for an hour
+    world.aged_gib = 8.0
+    tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(T0 + timedelta(minutes=60)), bound_s=None)
+    assert world.units == ["menagerie-store-box-daily.service"] and world.aged_reads == 2
+    world = World(free=[71.6], store_gib=20.0)  # 0.4 GiB short of the resume line, store at target
+    out = tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(T0 + timedelta(hours=5)), bound_s=None)
+    assert "could free only 0.4 GiB to a 19.6 GiB target" in out["results"]["store_pressure"]["skipped"]
+    assert world.units == [] and world.ceilings == []
+
+
+def test_store_pressure_dips_under_the_target_by_the_shortfall_down_to_the_floor(work: Path) -> None:
+    world = World(free=[64.0], store_gib=20.0, aged_gib=4.2)  # at target, 8 GiB short of resume
+    tick.tick("collect", dry_run=True, data=DATA, deps=world.deps(), bound_s=None)
+    assert world.units == [] and world.ceilings == []  # a dry run requests nothing
+    out = tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(), bound_s=None)
+    started = out["results"]["store_pressure"]["started"]
+    assert started["target_gib"] == 12.0 and started["checked"]["can_gib"] == 4.2
+    assert world.units == ["menagerie-store-box-daily.service"] and world.ceilings == [12.0]
+    world = World(free=[50.0], store_gib=20.0)  # 22 GiB short: the floor holds at 12
+    out = tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(T0 + timedelta(hours=4)), bound_s=None)
+    assert out["results"]["store_pressure"]["started"]["target_gib"] == 12.0 and world.ceilings == [12.0]
+    world = World(free=[80.0], store_gib=26.0)  # no shortfall: the configured target, no request
+    out = tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(T0 + timedelta(hours=8)), bound_s=None)
+    assert out["results"]["store_pressure"]["started"]["target_gib"] == 20.0 and world.ceilings == []
+
+
+def test_dip_target_stays_between_the_floor_and_the_target() -> None:
+    from menagerie.pipeline.store_pressure import dip_target
+
+    assert dip_target(20.0, 70.0, 72.0, 12.0) == 18.0
+    assert dip_target(20.0, 40.0, 72.0, 12.0) == 12.0
+    assert dip_target(20.0, 75.0, 72.0, 12.0) == 20.0
+    assert dip_target(20.0, None, 72.0, 12.0) == dip_target(20.0, 60.0, None, 12.0) == 20.0
+    assert dip_target(10.0, 60.0, 72.0, 12.0) == 10.0  # a target under the floor never rises
+
+
+def test_a_worker_listing_counts_the_ceilings_candidates_only() -> None:
+    from menagerie.pipeline import store_ceiling, store_pressure
+
+    a, b, c, d = "a" * 64, "b" * 64, "c" * 64, "d" * 64
+    local, keep = store_pressure.parse_listing(
+        f"aa/{a}.tar.gz 2097152\naa/{a}.gz 8\nbb/{b} 2097152\ncc/.{c}.part 99\ncc/{c} 2097152\n"
+        f"dd/{d} 2097152\nkeep {d}\n")
+    assert local == {a: (2097152 + 8) * 512, b: 2097152 * 512, c: 2097152 * 512, d: 2097152 * 512}
+    assert keep == {d}
+
+    def line(sha: str, mime: str, fetched: str = "2026-10-01T00:00:00Z") -> StoreIndexLine:
+        return StoreIndexLine(sha256=sha, bytes=1, mime=mime, fetched=fetched, license_class="derived")
+
+    index = store_ceiling.Index({a: line(a, store_ceiling.TRACE), b: line(b, "image/png"),
+                                 c: line(c, store_ceiling.TRACE, "2026-10-29T00:00:00Z"),
+                                 d: line(d, store_ceiling.TRACE)}, set())
+    now = datetime(2026, 10, 29, 12, tzinfo=timezone.utc).timestamp()
+    assert store_pressure.aged_gib(local, keep, index, now=now) == (2097152 + 8) * 512 / 2**30
+    # b is a view file, c is under a day old, d is in the working set
+
+
+def test_store_pressure_waits_while_the_unit_runs_or_nothing_presses(work: Path) -> None:
+    world = World(free=[80.0], store_gib=26.0, active={"menagerie-store-box-daily.service"})
+    out = tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(), bound_s=None)
+    assert out["results"]["store_pressure"] == {"skipped": "menagerie-store-box-daily.service is running"}
+    world = World(free=[80.0])
+    out = tick.tick("collect", dry_run=False, data=DATA, deps=world.deps(), bound_s=None)
+    assert out["results"]["store_pressure"] == {"skipped": "store 12.0 GiB, free 80.0 GiB"}
+    assert world.units == []
 
 
 def test_reclaim_waits_above_its_line(work: Path, tmp_path: Path) -> None:

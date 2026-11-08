@@ -1,14 +1,19 @@
 /**
  * Search suggestions for a `SiteSearch` box (ARIA combobox with a listbox). The compact index
  * loads on first focus; each keystroke ranks it in the browser, so suggestions need no server.
+ * Catalogued models with no diagram yet follow as text entries with their status, from a second
+ * index fetched once the visitor starts typing.
  */
-import { categoryLabel } from "@/lib/labels";
+import { taskLabel } from "@/lib/labels";
 import { escapeHtml } from "@/scripts/CardView";
-import { loadFailureText, loadSearchIndex, type LoadedIndex } from "@/scripts/IndexLoader";
+import { loadFailureText, loadRosterIndex, loadSearchIndex, type LoadedIndex, type LoadedRoster } from "@/scripts/IndexLoader";
 import type { IndexEntry } from "@/scripts/ListingIndex";
+import { STATUS_PHRASES, type RosterEntry } from "@/scripts/RosterIndex";
 import { parseQuery, scoreMatch } from "@/scripts/SearchMatch";
 
 export const SUGGESTIONS_SHOWN = 8;
+/** At most this many models with no diagram yet follow the suggestions. */
+export const ROSTER_SUGGESTIONS_SHOWN = 3;
 const DEBOUNCE_MS = 60;
 
 /** The best matches for a query, best first; ties go to the shorter name, then catalog order. */
@@ -44,8 +49,31 @@ export function suggestClosest(index: LoadedIndex, raw: string, limit = SUGGESTI
   return { entries: [], used: raw.trim() };
 }
 
+/** The best roster matches for a query (exact and prefix matches first, then shorter names). */
+export function suggestRoster(roster: LoadedRoster, raw: string, limit = ROSTER_SUGGESTIONS_SHOWN): RosterEntry[] {
+  const query = parseQuery(raw);
+  if (!query) {
+    return [];
+  }
+  const scored: Array<{ entry: RosterEntry; score: number; order: number }> = [];
+  roster.entries.forEach((entry, order) => {
+    const score = scoreMatch(roster.fields[order], query);
+    if (score !== null) {
+      scored.push({ entry, score, order });
+    }
+  });
+  scored.sort((left, right) => left.score - right.score || left.entry.name.length - right.entry.name.length || left.order - right.order);
+  return scored.slice(0, limit).map(({ entry }) => entry);
+}
+
+function rosterOptionHtml(id: string, entry: RosterEntry): string {
+  const href = `/models/?q=${encodeURIComponent(entry.name)}&untraced=1`;
+  const meta = [STATUS_PHRASES[entry.status], entry.family].filter(Boolean).join(" · ");
+  return `<li class="site-search__option site-search__option--listed" id="${id}" role="option" aria-selected="false" data-href="${escapeHtml(href)}"><span class="site-search__option-name">${escapeHtml(entry.name)}</span><span class="site-search__option-meta">${escapeHtml(meta)}</span></li>`;
+}
+
 function optionHtml(id: string, entry: IndexEntry): string {
-  const meta = [categoryLabel(entry.card.category), entry.card.family].filter(Boolean).join(" · ");
+  const meta = [taskLabel(entry.card.category), entry.card.family].filter(Boolean).join(" · ");
   return `<li class="site-search__option" id="${id}" role="option" aria-selected="false" data-href="/models/${encodeURIComponent(entry.card.slug)}/"><span class="site-search__option-name">${escapeHtml(entry.card.name)}</span><span class="site-search__option-meta">${escapeHtml(meta)}</span></li>`;
 }
 
@@ -129,12 +157,26 @@ export function initSiteSearch(form: HTMLFormElement): void {
       return;
     }
     const { entries: matches, used } = suggestClosest(index, raw);
-    list.innerHTML = matches.length
-      ? [...matches.map((entry, position) => optionHtml(`${idBase}-${position}`, entry)), allResultsHtml(`${idBase}-all`, used)].join("")
-      : "";
-    showMessage(!matches.length ? "No models match. Try a shorter name." : used !== raw ? `Nothing matches all of that. Showing matches for "${used}".` : "");
-    setOpen(true);
-    setActive(-1);
+    const render = (listed: RosterEntry[]) => {
+      const options = [
+        ...matches.map((entry, position) => optionHtml(`${idBase}-${position}`, entry)),
+        ...listed.map((entry, position) => rosterOptionHtml(`${idBase}-listed-${position}`, entry)),
+      ];
+      list.innerHTML = options.length ? [...options, allResultsHtml(`${idBase}-all`, matches.length ? used : raw)].join("") : "";
+      const message = !options.length ? "No models match. Try a shorter name." : matches.length && used !== raw ? `Nothing matches all of that. Showing matches for "${used}".` : "";
+      showMessage(message);
+      setOpen(true);
+      setActive(-1);
+    };
+    render([]);
+    // Models with no diagram yet: fetched once, on the first keystroke; a failure only drops them.
+    const roster = await loadRosterIndex().catch(() => null);
+    if (roster && mine === token) {
+      const listed = suggestRoster(roster, raw);
+      if (listed.length) {
+        render(listed);
+      }
+    }
   }
 
   function go(option: HTMLElement): void {
@@ -150,6 +192,7 @@ export function initSiteSearch(form: HTMLFormElement): void {
   });
   input.addEventListener("focus", () => {
     void loadSearchIndex().catch(() => undefined);
+    // The list of models with no diagram yet waits for the first keystroke (see refresh).
     if (input.value.trim() && list.childElementCount) {
       setOpen(true);
     }

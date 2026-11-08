@@ -2,6 +2,11 @@
 import BaseLayout from "@/layouts/BaseLayout.astro";
 import { SITE_CHANGES } from "@/lib/changelog";
 import { formatDate } from "@/lib/dataset";
+import { releaseChange } from "@/lib/releaseChange";
+
+// The current release's entry (dated by the export) comes first, then the hand-kept list.
+const release = releaseChange();
+const changes = release ? [release, ...SITE_CHANGES] : SITE_CHANGES;
 ---
 
 <BaseLayout title="Changes" description="What has changed on the Model Menagerie site and in its dataset, newest first.">
@@ -10,7 +15,7 @@ import { formatDate } from "@/lib/dataset";
     <p class="lead mt-4 text-secondary">What has changed on the site and in its dataset, newest first.</p>
     <ol class="change-list" reversed>
       {
-        SITE_CHANGES.map((change) => (
+        changes.map((change) => (
           <li>
             <h2>
               <time datetime={change.date}>{formatDate(change.date)}</time>

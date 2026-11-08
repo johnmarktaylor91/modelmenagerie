@@ -5,13 +5,14 @@
 import fs from "node:fs";
 
 import { checkCopy, dataNames } from "./lib/copy.mjs";
+import { modelRoutes } from "./lib/routes.mjs";
 
 const [base, out, maxArg] = process.argv.slice(2);
 const MAX_PAGES = Number(maxArg ?? 400);
 const origin = new URL(base).origin;
 // Run from site/, so the catalog names are at hand when checking a deployed copy of this branch.
 const exempt = dataNames("site-data/models.jsonl");
-const SEEDS = ["/", "/models/", "/models/2/", "/about/", "/dataset/", "/legal/", "/changelog/", "/models/resnet18/", "/models/gpt2/"];
+const SEEDS = ["/", "/models/", "/models/2/", "/about/", "/dataset/", "/legal/", "/changelog/", ...Object.values(modelRoutes()).filter(Boolean)];
 
 function internalTargets(html, pageUrl) {
   const body = html.replace(/<script\b[\s\S]*?<\/script>/gi, "").replace(/<style\b[\s\S]*?<\/style>/gi, "");

@@ -14,9 +14,9 @@ export function getStaticPaths() {
 }
 
 const { family, fixture } = Astro.props as { family: Family; fixture: boolean };
-const description = `${formatNumber(family.members.length)} models in the ${family.name} family, each with its architecture diagram traced with TorchLens.`;
+const description = `${formatNumber(family.members.length)} models in the ${family.displayName} family, each with its architecture diagram traced with TorchLens.`;
 ---
 
-<BaseLayout title={`${family.name} family`} description={description} noindex={fixture}>
+<BaseLayout title={`${family.displayName} family`} description={description} noindex={fixture}>
   <FamilyPage family={family} />
 </BaseLayout>

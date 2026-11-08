@@ -5,7 +5,7 @@ the trace the validation worker ALREADY built, instead of re-instantiating the m
 and re-tracing it for metadata. That is only sound for a summary field if the field is
 identical between the two capture configurations:
 
-* VALIDATION config (``user_funcs._validate_forward_pass_torch`` ->
+* VALIDATION config (TorchLens's forward validator via ``menagerie.tl_validation`` ->
   ``_run_model_and_save_specified_outs``): ``layers_to_save="all"``,
   ``save_arg_values=True``, ``save_rng_states=True``, ``mark_layer_depths=False``,
   ``inference_only=False`` (autograd graph kept), device resolved (CPU on the
@@ -179,7 +179,7 @@ def _validation_config_summary(model: Any, example_input: Any, stable_id: str) -
         Summary row derived from the validation-config trace.
     """
 
-    from torchlens.user_funcs import _validate_forward_pass_torch
+    from menagerie import tl_validation
 
     captured: dict[str, dict[str, Any]] = {}
 
@@ -188,12 +188,7 @@ def _validation_config_summary(model: Any, example_input: Any, stable_id: str) -
         if trace is not None:
             captured["row"] = summarize_trace(stable_id, trace, "")
 
-    _validate_forward_pass_torch(
-        model,
-        example_input,
-        validate_metadata=True,
-        _trace_observer=observe,
-    )
+    tl_validation.validate_forward(model, example_input, observer=observe)
     if "row" not in captured:
         raise RuntimeError("validation observer did not fire")
     return captured["row"]

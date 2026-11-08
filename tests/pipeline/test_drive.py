@@ -13,6 +13,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -206,7 +207,7 @@ def test_a_review_with_no_saved_source_goes_to_2a_first(data: DataLayout) -> Non
     write_json(stub, data.packet("f-resnet"))
     _ledger(data, _forward(trace), trace, render)
     assert _step(data) == "2a"
-    unjudged = dataclasses.replace(_forward(trace), stage="review", mode=None,
+    unjudged = dataclasses.replace(_forward(trace), stage="review", mode=None, msg="prompt p; case 2",
                                    verdict="cannot_judge", reviewer="model-design-review")
     _ledger(data, _forward(trace), trace, render, unjudged)
     assert _step(data) == "2a"  # a cannot_judge with nothing to judge by is not settled either
@@ -217,16 +218,61 @@ def test_a_review_with_no_saved_source_goes_to_2a_first(data: DataLayout) -> Non
 def test_a_cannot_judge_is_reviewed_again_once_the_packet_gains_sources(data: DataLayout) -> None:
     trace, render = _rows()
     _record(data, source_case="classic")
-    unjudged = dataclasses.replace(_forward(trace), stage="review", mode=None,
+    unjudged = dataclasses.replace(_forward(trace), stage="review", mode=None, msg="prompt p; case 2",
                                    verdict="cannot_judge", reviewer="model-design-review")
     _ledger(data, _forward(trace), trace, render, unjudged)
     assert _step(data) == "done"
     packet = read_json(Packet, data.packet("f-resnet"))
+    paper = Source(sid="s9", role="paper", url="https://arxiv.org/abs/1", text="a" * 64)
     later = Amendment(at="2999-01-01T00:00:00Z", why="paper fetched", evidence=(),
                       changed=("sources.s9",), by="research-complete")
-    write_json(dataclasses.replace(packet, amendments=(*packet.amendments, later)),
-               data.packet("f-resnet"))
+    write_json(dataclasses.replace(packet, sources=(*packet.sources, paper),
+                                   amendments=(*packet.amendments, later)), data.packet("f-resnet"))
     assert _step(data) == "review"
+
+
+def _amended(data: DataLayout, by: str, evidence: tuple[str, ...], **change: Any) -> None:
+    packet = read_json(Packet, data.packet("f-resnet"))
+    sources = tuple(dataclasses.replace(s, **change) if s.sid in evidence and change else s
+                    for s in packet.sources)
+    note = Amendment(at="2999-01-01T00:00:00Z", why=by, evidence=evidence, changed=("sources",), by=by)
+    write_json(dataclasses.replace(packet, sources=sources, amendments=(*packet.amendments, note)),
+               data.packet("f-resnet"))
+
+
+def test_a_verdict_given_against_texts_since_changed_is_reviewed_again(data: DataLayout) -> None:
+    from menagerie.pipeline.review import source_digest
+
+    trace, render = _rows()
+    _record(data, source_case="classic")
+    digest = source_digest(read_json(Packet, data.packet("f-resnet")))
+    seen = dataclasses.replace(_forward(trace), stage="review", mode=None, verdict="faithful",
+                               msg=f"prompt p; case 2; src {digest}", reviewer="model-design-review")
+    _ledger(data, _forward(trace), trace, render, seen)
+    _amended(data, "licence", ("s3",))
+    assert _step(data) == "done"  # a licence text is not in the case
+    _amended(data, "paper-texts", ("s1",), blob="b" * 64)
+    assert _step(data) == "review"  # the paper the verdict read was replaced
+    again = dataclasses.replace(seen, at="2999-02-01T00:00:00Z",
+                                msg=f"prompt p; case 2; src {source_digest(read_json(Packet, data.packet('f-resnet')))}")
+    _ledger(data, _forward(trace), trace, render, seen, again)
+    assert _step(data) == "done"
+
+
+@pytest.mark.parametrize(("by", "evidence", "step"), [
+    ("paper-rejected", ("s1",), "review"),  # its paper text retired
+    ("paper-confirmed", ("s1",), "done"),  # a check that keeps the text
+    ("licence", ("s3",), "done"),  # not a case source
+])
+def test_a_verdict_from_before_digests_follows_the_amendments_after_it(
+        data: DataLayout, by: str, evidence: tuple[str, ...], step: str) -> None:
+    trace, render = _rows()
+    _record(data, source_case="classic")
+    old = dataclasses.replace(_forward(trace), stage="review", mode=None, verdict="minor",
+                              msg="prompt p; case 2", reviewer="model-design-review")
+    _ledger(data, _forward(trace), trace, render, old)
+    _amended(data, by, evidence)
+    assert _step(data) == step
 
 
 def test_vendor_code_is_reviewed_unless_official(data: DataLayout) -> None:
@@ -340,6 +386,7 @@ def tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     _fake(desk / "bin", "fleet-run", "import os\nif sys.argv[1] == 'status':\n"
           "    print(json.dumps({'run': {'state': os.environ.get('FLEET_STATE', 'RUNNING')}}))\n"
           "else:\n    print('started run_id=run-9 pid=1')")
+    _fake(desk / "bin", "systemctl", "import os\nsys.exit(int(os.environ.get('SYSTEMCTL_RC', '0')))")
     _fake(desk / "tools", "pause.py", "")
     _fake(desk / "tools", "chatgpt_usage.py",
           "import os\nsys.exit(75 if os.environ.get('CODEX_FULL') else 0)")
@@ -396,6 +443,46 @@ def test_launch_leases_and_records_what_ran(data: DataLayout, tools: Path, tmp_p
     assert sorted(p.stem for p in (tmp_path / "work" / "leases").glob("*.json")) == ["after"]
 
 
+def test_a_hub_2b_lane_is_niced_and_bounded_to_its_share(data: DataLayout, tools: Path,
+                                                         tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    brief = tmp_path / "BRIEF.md"
+    brief.write_text("x\n")
+    drive.launch("2a", "model-default", brief, label="research")
+    assert not (tools / "bin" / "systemctl.calls").exists()  # only 2b runs model code
+    drive.launch("2b", "model-implementation", brief, keys=["f-a"], label="recipe")
+    start = [c for c in _calls(tools / "bin" / "fleet-run.calls") if c[0] == "start"][-1]
+    assert start[start.index("--") + 1:][:4] == ["/usr/bin/nice", "-n", "10", "/usr/bin/env"]
+    assert _calls(tools / "bin" / "systemctl.calls") == [[
+        "--user", "set-property", "--runtime", "fleet-lane@run-9.service", "CPUQuota=100%",
+        "MemoryMax=4G", "CPUWeight=20", "IOWeight=20"]]
+    assert admission.HUB_2B_MAX_LANES * admission.HUB_2B_LANE_CPUS <= admission.HUB_2B_TOTAL_CPUS
+    assert admission.HUB_2B_MAX_LANES * admission.HUB_2B_LANE_GIB <= admission.HUB_2B_TOTAL_GIB
+    # When the lane ends its lease is released and the runtime property files go with it.
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    control = tmp_path / "run" / "systemd" / "user.control" / "fleet-lane@run-9.service.d"
+    control.mkdir(parents=True)
+    for prop in ("CPUQuota", "MemoryMax", "CPUWeight", "IOWeight"):
+        (control / f"50-{prop}.conf").write_text("[Service]\n")
+    lease = json.loads((tmp_path / "work" / "leases" / "recipe.json").read_text())
+    assert lease["unit"] == "fleet-lane@run-9.service"
+    monkeypatch.setenv("FLEET_STATE", "TERMINAL")
+    assert admission.lanes(data=data) == []
+    assert not control.exists()
+
+
+def test_a_hub_2b_lane_that_cannot_be_bounded_is_stopped(data: DataLayout, tools: Path,
+                                                         tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    brief = tmp_path / "BRIEF.md"
+    brief.write_text("x\n")
+    monkeypatch.setenv("SYSTEMCTL_RC", "1")
+    with pytest.raises(drive.RecordError, match="could not bound fleet-lane@run-9.service"):
+        drive.launch("2b", "model-implementation", brief, keys=["f-a"], label="unbounded")
+    assert ["stop", "run-9"] in _calls(tools / "bin" / "fleet-run.calls")
+    assert not list((tmp_path / "work" / "leases").glob("*.json"))
+
+
 def test_a_claude_lane_runs_on_the_admitted_account_without_web(data: DataLayout, tools: Path,
                                                                  tmp_path: Path) -> None:
     brief = tmp_path / "BRIEF.md"
@@ -406,6 +493,19 @@ def test_a_claude_lane_runs_on_the_admitted_account_without_web(data: DataLayout
     assert start[start.index("--disallowedTools") + 1] == drive.WEB_TOOLS
     assert _calls(tools / "bin" / "burst-admission.calls") == [["continue", "--account",
                                                                 "acct-a"]]
+
+
+def test_a_worker_placed_claude_lane_names_its_host_to_the_burst_check(tools: Path, tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    admission._admit("claude", "model-default", checkout, "2b", "mini-a")
+    assert _calls(tools / "bin" / "burst-admission.calls")[-1] == [
+        "continue", "--account", "acct-a", "--placement", "mini-a"]
+    _fake(tools / "bin", "burst-admission", "print('burst admission: hub MemAvailable 900 MiB below the "
+          "4096 MiB memory floor; write your state file and stop')\nsys.exit(75)")
+    with pytest.raises(drive.Refused) as held:
+        admission._admit("claude", "model-default", checkout, "2b", "mini-a")
+    assert "memory floor" in held.value.result["why"]  # the reason `continue` prints on stdout
 
 
 def test_lanes_releases_ended_and_expired_leases(data: DataLayout, tools: Path,
@@ -1105,6 +1205,28 @@ def test_an_appended_file_is_parsed_only_past_what_was_read(tmp_path: Path) -> N
     assert read() == [7]
 
 
+def test_a_new_process_starts_from_the_kept_ledger_parse(tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    shard, built = tmp_path / "ledger" / "2026-10.jsonl", []
+    shard.parent.mkdir()
+    monkeypatch.setattr(drive, "_ledger_line", lambda raw: built.append(raw["n"]) or raw["n"])
+    monkeypatch.setenv(drive.LEDGER_CACHE_ENV, str(tmp_path / "cache"))
+    shard.write_bytes(b'{"n": 1}\n{"n": 2}\n')
+    assert drive.shard_rows(drive._Memo(), shard) == [1, 2] and built == [1, 2]
+    with shard.open("ab") as handle:
+        handle.write(b'{"n": 3}\n')
+    assert drive.shard_rows(drive._Memo(), shard) == [1, 2, 3] and built == [1, 2, 3]
+    assert drive.shard_rows(drive._Memo(), shard) == [1, 2, 3] and built == [1, 2, 3]
+    shard.write_bytes(b'{"n": 7}\n{"n": 2}\n{"n": 3}\n')  # rewritten: parsed again in full
+    assert drive.shard_rows(drive._Memo(), shard) == [7, 2, 3] and built == [1, 2, 3, 7, 2, 3]
+    assert len(list((tmp_path / "cache").glob("2026-10-*.pickle"))) == 1
+    (tmp_path / "cache" / next((tmp_path / "cache").iterdir()).name).write_bytes(b"junk")
+    assert drive.shard_rows(drive._Memo(), shard) == [7, 2, 3]  # unreadable: parsed in full
+    monkeypatch.delenv(drive.LEDGER_CACHE_ENV)
+    built.clear()
+    assert drive.shard_rows(drive._Memo(), shard) == [7, 2, 3] and built == [7, 2, 3]
+
+
 def test_a_file_read_inside_the_racy_window_is_read_again(tmp_path: Path) -> None:
     path, reads = tmp_path / "x.json", []
     path.write_text("1")
@@ -1125,3 +1247,30 @@ def test_a_filtered_load_equals_the_full_one_for_its_ids(data: DataLayout) -> No
     assert some.rows == {"m8839": full.rows["m8839"]} and list(some.roster) == ["m8839"]
     assert drive._step("m8839", some) == drive._step("m8839", full)
     assert drive._load(data, ids=set()).rows == {}
+
+
+def test_a_cannot_judge_from_an_older_case_is_reviewed_again(data: DataLayout) -> None:
+    trace, render = _rows()
+    _record(data, source_case="classic")
+    old = dataclasses.replace(_forward(trace), stage="review", mode=None, msg="prompt p",
+                              verdict="cannot_judge", reviewer="model-design-review")
+    _ledger(data, _forward(trace), trace, render, old)
+    assert _step(data) == "review"  # its lane's case lacked what the builder now adds
+    _ledger(data, _forward(trace), trace, render, dataclasses.replace(old, msg="prompt p; case 2"))
+    assert _step(data) == "done"
+
+
+def test_a_confirm_only_seat_confirms_a_fabrication_but_never_settles_a_row(data: DataLayout) -> None:
+    from menagerie.pipeline.review import PROVISIONAL
+
+    trace, render = _rows()
+    _record(data, source_case="classic")
+    first = dataclasses.replace(_forward(trace), stage="review", mode=None, verdict="fabrication",
+                                msg=f"prompt p; case 2; {PROVISIONAL}", reviewer="model-design-review")
+    no = dataclasses.replace(first, at="2026-12-30T00:00:00Z", verdict="minor", msg="prompt p; case 2",
+                             reviewer="model-judgment")
+    _ledger(data, _forward(trace), trace, render, first, no)
+    assert _step(data) == "review"  # its "not fabrication" leaves the row waiting
+    yes = dataclasses.replace(no, verdict="fabrication")
+    _ledger(data, _forward(trace), trace, render, first, yes)
+    assert _step(data) == "2b"

@@ -19,7 +19,7 @@ from menagerie.pipeline import envs
 
 ROOT = os.environ.get("MENAGERIE_ENVS")
 PROMISED = {
-    "torch": "2.6.0+cpu", "torchlens": "2.36.0", "timm": "1.0.30", "torchvision": "0.21.0+cpu",
+    "torch": "2.6.0+cpu", "torchlens": "3.0.2", "timm": "1.0.30", "torchvision": "0.21.0+cpu",
     "transformers": None, "segmentation-models-pytorch": None, "ultralytics": None,
     "einops": None, "diffusers": None, "pillow": None, "psutil": None, "pyyaml": None,
     "pyvips": "3.2.0", "pyvips-binary": "8.18.7",
@@ -71,7 +71,7 @@ NATIVE = {
 @pytest.mark.parametrize("name", sorted(NATIVE))
 def test_native_locks_hold_their_framework(name: str) -> None:
     for package, version in {**NATIVE[name], "torch": r"2\.6\.\d\+cpu",
-                             "torchlens": r"2\.36\.0", "pyvips": r"3\.2\.0"}.items():
+                             "torchlens": r"3\.0\.2", "pyvips": r"3\.2\.0"}.items():
         locked = envs.package_version(name, package)
         assert locked is not None and re.fullmatch(version, locked), (name, package, locked)
     text = envs.lock_path(name).read_text()
@@ -81,7 +81,7 @@ def test_native_locks_hold_their_framework(name: str) -> None:
 
 def test_torch_gpu_lock_is_cuda_12_4() -> None:
     assert envs.package_version("torch-gpu", "torch") == "2.6.0+cu124"
-    assert envs.package_version("torch-gpu", "torchlens") == "2.36.0"
+    assert envs.package_version("torch-gpu", "torchlens") == "3.0.2"
     for package in ("ninja", "setuptools", "timm", "transformers"):
         assert envs.package_version("torch-gpu", package), package
 
@@ -201,6 +201,53 @@ def test_overlay_installs_the_verified_wheel_explicitly(tmp_path: Path,
     assert '--find-links' not in installs[0]
     # the overlays' own cache, never the shared ~/.cache/uv, so prune-overlays can free the extras
     assert installs[0][installs[0].index('--cache-dir') + 1] == str(tmp_path / 'overlay-uv-cache')
+
+
+def test_two_runs_needing_one_overlay_build_it_once(tmp_path: Path,
+                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+    import time
+
+    from menagerie.pipeline import sdist
+
+    base = tmp_path / 'base'
+    (base / 'bin').mkdir(parents=True)
+    (base / 'bin' / 'python').write_text('')
+    (base / envs.BUILT_MARKER).write_text('built')
+    monkeypatch.setattr(envs, 'python', lambda *a, **k: base / 'bin' / 'python')
+    monkeypatch.setattr(envs, 'prefix', lambda *a, **k: base)
+    monkeypatch.setattr(sdist, 'wheels', lambda *a, **k: [])
+    original = envs.subprocess.run
+    installs, lost = [], []
+
+    def run(command, **kwargs):
+        if command[0] == 'cp':
+            return original(command, **kwargs)
+        if 'freeze' in command:
+            return subprocess.CompletedProcess(command, 0, 'torch==2.6.0\n', '')
+        installs.append(command)
+        time.sleep(0.3)  # a slow install: the other run arrives meanwhile
+        if not Path(command[command.index('--python') + 1]).parent.is_dir():
+            lost.append(command)  # the other run removed this half-built tree
+        return subprocess.CompletedProcess(command, 0, '', '')
+
+    monkeypatch.setattr(envs.subprocess, 'run', run)
+    got, errors = [], []
+
+    def need() -> None:
+        try:
+            got.append(envs.overlay('torch-main', ['extra'], root=tmp_path))
+        except Exception as exc:  # noqa: BLE001 -- the assertion below names it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=need) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == [] and lost == [] and len(installs) == 1
+    assert got[0] == got[1] and (got[0].parent.parent / envs.BUILT_MARKER).is_file()
+    assert [p.name for p in (tmp_path / 'overlays').iterdir() if p.is_dir()] == [got[0].parent.parent.name]
 
 
 def test_missing_names_every_committed_lock_not_built_at_its_lock(tmp_path: Path) -> None:

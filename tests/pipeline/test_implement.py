@@ -323,7 +323,9 @@ def _traced(data: DataLayout, member: str, outcome: str = "pass") -> None:
     ledger.append([LedgerRow(id=member, stage="trace", at="2026-10-21T08:00:00Z", host="worker",
                              env="torch-main", recipe_rev=rev, outcome=outcome, mode="eval",
                              capture="full", tl="2.36.0",
-                             cls=None if outcome == "pass" else "torchlens_gap:replay")],
+                             cls=None if outcome == "pass" else "torchlens_gap:replay",
+                             **({"validation_state": "passed", "n_ops": 3, "graph_hash": "a" * 64}
+                                if outcome == "pass" else {}))],
                   data=data)
 
 
@@ -373,6 +375,27 @@ def test_a_substitute_recipe_that_traced_is_not_settled(data: DataLayout, tmp_pa
     write_json(replace(record, give_up=GiveUp(cls="standin:dense", reason="dense stand-in",
                                               at="2026-10-06T03:59:14Z")), path)
     assert implement.settled(["m9001"], data) == {}
+
+
+
+def test_any_give_up_beside_a_passing_trace_is_the_outcome(data: DataLayout, tmp_path: Path,
+                                                           served: list, events: list) -> None:
+    """54 records carried a give-up beside a passing trace, counted validated by settled and not
+    by the status page (Lead, 2026-10-29): a record states one outcome, its give-up; an infra
+    give-up does not count, as in drive."""
+
+    recipe = _draft_files(tmp_path / "lane")
+    implement.try_("m9001", recipe=recipe, data=data)
+    assert implement.done(recipe, data=data) == []
+    _traced(data, "m9001")
+    path = data.model("m9001")
+    record = read_json(ModelRecord, path)
+    write_json(replace(record, give_up=GiveUp(cls="budget", reason="out of time",
+                                              at="2026-10-22T00:00:00Z")), path)
+    assert implement.settled(["m9001"], data) == {}
+    write_json(replace(record, give_up=GiveUp(cls="infra:worker", reason="worker lost",
+                                              at="2026-10-22T00:00:00Z")), path)
+    assert list(implement.settled(["m9001"], data)) == ["m9001"]
 
 
 def test_src_materializes_sources_with_an_index(data: DataLayout, tmp_path: Path,
@@ -871,6 +894,16 @@ def _reviewed(data: DataLayout, verdict: str) -> None:
                              reviewer="model-design-review")], data=data)
 
 
+def test_the_tick_reads_repair_families_from_one_ledger_scan(data: DataLayout) -> None:
+    from menagerie.pipeline import tick_full
+
+    assert tick_full._repair_families([FAMILY, "f-absent"], data) == []
+    _reviewed(data, "faithful")
+    assert tick_full._repair_families([FAMILY], data) == []
+    _reviewed(data, "fabrication")
+    assert tick_full._repair_families([FAMILY, "f-absent"], data) == [FAMILY]
+
+
 def test_a_repair_brief_carries_the_fabrication_findings_and_stays_on_its_lab(
         data: DataLayout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, events: list) -> None:
     from menagerie.pipeline import admission, drive, store
@@ -905,6 +938,42 @@ def test_a_repair_brief_carries_the_fabrication_findings_and_stays_on_its_lab(
     assert tried == ["model-default"]  # a repair round is the author's lab's
     (step,) = drive.queued()
     assert step["roles"] == ["model-default"]
+
+
+def test_a_disputed_provisional_fabrication_briefs_its_repair_once(
+        data: DataLayout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from menagerie.pipeline import drive, ledger, review, store
+    from menagerie.pipeline.records import LedgerRow
+
+    def materialize(sha: str, dest: Path, *, store: StoreLayout) -> Path:
+        if sha != FINDINGS:
+            return _put(Path(dest))
+        Path(dest).write_text(json.dumps(REVIEW))
+        return Path(dest)
+
+    monkeypatch.setenv("MENAGERIE_STORE", str(tmp_path / "store"))
+    monkeypatch.setenv("MENAGERIE_CPUS", "3")
+    monkeypatch.setenv("MENAGERIE_MEMORY_GB", "20")
+    monkeypatch.setattr(store, "materialize", materialize)
+    monkeypatch.setattr(drive, "counting_seats",
+                        lambda data: frozenset({"model-design-review", "model-judgment-3vote"}))
+    resnet = read_json(ModelRecord, data.model("m8839"))
+    record = replace(read_json(ModelRecord, data.model("m9001")), recipe=resnet.recipe)
+    write_json(record, data.model("m9001"))
+    rev = record.recipe.rev
+    ledger.append([LedgerRow(id="m9001", stage="review", at="2026-10-05T10:00:00Z", host="hub",
+                             env="review:model-design-review", recipe_rev=rev, outcome="pass",
+                             verdict="fabrication", findings=FINDINGS,
+                             reviewer="model-design-review", msg=f"prompt p; {review.PROVISIONAL}"),
+                   LedgerRow(id="m9001", stage="review", at="2026-10-05T11:00:00Z", host="hub",
+                             env="review:model-judgment-3vote", recipe_rev=rev, outcome="pass",
+                             verdict="minor", findings=FINDINGS, reviewer="model-judgment-3vote",
+                             msg="prompt p")], data=data)
+    assert drive.briefed(FAMILY, "m9001", rev) is None
+    text = implement.brief(FAMILY, data=data).read_text()
+    assert "## Repair round (one)" in text and implement.DISPUTED_NOTE in text
+    assert "- gate [invented]: source: none; ours: a sigmoid gate" in text
+    assert drive.briefed(FAMILY, "m9001", rev) is not None
 
 
 def test_review_lanes_get_the_same_verb_wrapper(data: DataLayout, tmp_path: Path,

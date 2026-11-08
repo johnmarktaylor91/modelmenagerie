@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from menagerie import host_budget
+from menagerie import host_budget, tl_compat
 from menagerie.pipeline import DataLayout, read_json, regression, runner
 from menagerie.pipeline.records import Caps, ModelRecord, RecordError
 
@@ -38,6 +38,22 @@ def compare(rows: Sequence[Mapping[str, Any]], baseline: Sequence[Mapping[str, s
             for old in baseline]
 
 
+def _differences(row: Mapping[str, Any], old_tl: str | None, new_tl: str | None,
+                 ) -> tuple[list[str], list[str]]:
+    """The joined row's differing fields, and a note per field not compared because the two
+    values come from different TorchLens value families (``tl_compat``). A missing new row (no
+    version) compares as before."""
+
+    kinds = {"_n_ops": "n_ops", "_hash": "graph_hash"}
+    mixed = [key for key, kind in kinds.items()
+             if new_tl and not tl_compat.comparable(kind, old_tl, new_tl)]
+    differences = [key for key in ("", "_n_ops", "_hash", "_structure_only")
+                   if key not in mixed and str(row[f"r1{key}"] or "") != str(row[f"r3{key}"] or "")]
+    notes = [f"{key.lstrip('_')} not comparable across TorchLens {old_tl or 'unknown'} and "
+             f"{new_tl or 'unknown'}" for key in mixed]
+    return differences, notes
+
+
 def _compare_one(old: Mapping[str, str], new: Mapping[str, Any], meta: Mapping[str, Any],
                  explanations: Mapping[str, str]) -> dict[str, Any]:
     """One baseline join with an explicit, non-infrastructure difference classification."""
@@ -51,15 +67,14 @@ def _compare_one(old: Mapping[str, str], new: Mapping[str, Any], meta: Mapping[s
            "r1_structure_only": old["r1_structure_only"],
            "r3_structure_only": meta.get("status", ""),
            **{k: new.get(k) for k in COLUMNS[13:]}}
-    differences = [key for key in ("", "_n_ops", "_hash", "_structure_only")
-                   if str(row[f"r1{key}"] or "") != str(row[f"r3{key}"] or "")]
-    row["agree"] = "same" if not differences else "unexplained"
-    row["note"] = "; ".join(f"{key or 'verdict'} differs" for key in differences)
+    differences, mixed = _differences(row, old.get("tl"), new.get("tl"))
+    row["agree"] = "same" if not (differences or mixed) else "unexplained"
+    row["note"] = "; ".join([f"{key or 'verdict'} differs" for key in differences] + mixed)
     note = explanations.get(sid)
     required_meta = bool(old["r1_structure_only"])
     explainable = row["r3"] not in ("missing", "infra") and (
         not required_meta or row["r3_structure_only"] not in ("", "missing", "infra"))
-    if differences and note and explainable:
+    if differences and not mixed and note and explainable:
         row["agree"], row["note"] = "explained", note
     return row
 

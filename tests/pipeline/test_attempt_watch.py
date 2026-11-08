@@ -105,7 +105,7 @@ def _stop(_seconds: float) -> None:
 def test_runner_serve_claims_nothing_below_the_pause_line(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     started = []
-    monkeypatch.setattr(disk_guard, "claim_ok", lambda path: False)
+    monkeypatch.setattr(disk_guard, "claim_ok", lambda path, **kw: False)
     monkeypatch.setattr(runner, "_start_waiting", lambda *a, **k: started.append(1))
     monkeypatch.setattr(runner.time, "sleep", _stop)
     monkeypatch.setenv("MENAGERIE_CPUS", "2")

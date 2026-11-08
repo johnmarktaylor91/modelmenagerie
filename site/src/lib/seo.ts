@@ -2,14 +2,13 @@
  * Search and sharing metadata: share images, structured data (JSON-LD) and the per-model metadata
  * a model page passes to the layout. The tags themselves are written by `components/SeoHead.astro`.
  */
+import { assetRefHref } from "@/lib/assets";
 import type { AssetRef, ModelRecord } from "@/lib/catalog";
-import { categoryLabel } from "@/lib/labels";
+import { categoryLabel, taskLabel, webUrl } from "@/lib/labels";
 import { CONTENT_LICENCE, CREATOR, SITE_NAME, SITE_URL, TORCHLENS } from "@/lib/site";
 
 export const SHARE_IMAGE_WIDTH = 1200;
 export const SHARE_IMAGE_HEIGHT = 630;
-
-const publicR2Base = (import.meta.env.PUBLIC_R2_BASE as string | undefined)?.replace(/\/+$/, "") ?? "";
 
 export interface ShareImage {
   url: string;
@@ -41,8 +40,7 @@ function ownShareImage(model: ModelRecord): AssetRef | null {
   if (!ref?.url) {
     return null;
   }
-  const key = ref.url.split("/").filter(Boolean).pop() ?? "";
-  return { ...ref, url: publicR2Base ? `${publicR2Base}/${key}` : `/assets/${key}` };
+  return { ...ref, url: assetRefHref(ref.url) };
 }
 
 /** Share image for a model page: its own when the export has one, else its task's image. */
@@ -90,9 +88,9 @@ function optionalField<T>(model: ModelRecord, key: string): T | null {
  */
 export function modelJsonLd(model: ModelRecord): Record<string, unknown>[] {
   const pageUrl = absolute(`/models/${model.slug}/`);
-  const sourceUrl = optionalField<string>(model, "source_url");
+  const sourceUrl = webUrl(optionalField<string>(model, "source_url"));
   const sourceLicence = optionalField<string>(model, "source_license");
-  const paperUrl = optionalField<string>(model, "paper_url");
+  const paperUrl = webUrl(optionalField<string>(model, "paper_url"));
   const code: Record<string, unknown> = {
     "@type": "SoftwareSourceCode",
     name: model.display_name,
@@ -108,7 +106,7 @@ export function modelJsonLd(model: ModelRecord): Record<string, unknown>[] {
       name: `${model.display_name} computational graph`,
       url: pageUrl,
       image: absolute(modelShareImage(model).url),
-      genre: categoryLabel(model.category),
+      genre: taskLabel(model.category) || undefined,
       about: code,
       license: CONTENT_LICENCE.url,
       isPartOf: { "@type": "WebSite", name: SITE_NAME, url: absolute("/") },

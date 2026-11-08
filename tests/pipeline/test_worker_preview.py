@@ -74,15 +74,30 @@ def test_module_mode_is_a_ledger_field() -> None:
                   recipe_rev="0123456789ab", outcome="pass", module_mode="guessed")
 
 
-@pytest.mark.parametrize(("level", "twin"), [("runnable", True), ("portable", False)])
-def test_a_preview_writes_its_drawing_save_only_beside_a_runnable_save(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, level: str, twin: bool) -> None:
-    """Every preview refuses the runnable level at 2.35.3, so its ``trace.tlspec`` is the
-    portable save and no ``render.tlspec`` twin follows; a retry's stale one goes."""
+def _preview_trace(shape: str) -> Any:
+    """A stand-in preview trace in the pinned shape or the 2.38 shape (``ops``, ``provenance``,
+    ``options.module_identity_mode``; no ``module_identity_mode`` on the trace)."""
 
     from types import SimpleNamespace
 
-    trace = SimpleNamespace(num_ops=3, graph_shape_hash="", module_identity_mode="object_module")
+    if shape == "pinned":
+        return SimpleNamespace(num_ops=3, graph_shape_hash="", module_identity_mode="object_module")
+    return SimpleNamespace(ops=[1, 2, 3], provenance=SimpleNamespace(fingerprint=""),
+                           options=SimpleNamespace(module_identity_mode="object_module"))
+
+
+@pytest.mark.parametrize("shape", ["pinned", "2.38"])
+@pytest.mark.parametrize(("level", "twin"), [("runnable", True), ("portable", False)])
+def test_a_preview_writes_its_drawing_save_only_beside_a_runnable_save(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, level: str, twin: bool,
+        shape: str) -> None:
+    """Every preview refuses the runnable level at 2.35.3, so its ``trace.tlspec`` is the
+    portable save and no ``render.tlspec`` twin follows; a retry's stale one goes. The module
+    mode reaches the ledger row from either TorchLens line."""
+
+    from types import SimpleNamespace
+
+    trace = _preview_trace(shape)
     check = SimpleNamespace(trace=trace, state="passed", msg=None, warm=None, secs=0.1)
     stand_ins = {"prepare": lambda backend, threads: None, "build": lambda r, train: object(),
                  "_timed": lambda native: ((), 0.1), "count_params": lambda native, b: 7,
@@ -117,6 +132,7 @@ def test_a_preview_writes_its_drawing_save_only_beside_a_runnable_save(
     assert written == ([worker.RENDER_FILE] if twin else [])
     assert ("tlspec-portable" in kinds) is twin and "tlspec" in kinds
     assert not (stale / "stale").exists()
+    assert [row.module_mode for row in result.rows] == ["object_module"]
 
 
 def recipe_free(backend: str) -> Recipe:

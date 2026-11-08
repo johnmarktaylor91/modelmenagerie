@@ -13,6 +13,14 @@ export interface Change {
 
 export const SITE_CHANGES: readonly Change[] = [
   {
+    date: "2026-11-04",
+    title: "The site is now called Model Menagerie",
+    items: [
+      "The site's name is now Model Menagerie; every diagram is still traced and drawn with TorchLens. The citation text uses the new name.",
+      "The short addresses /models/gpt2/ and /models/vit/ now open the checked GPT-2 and ViT-B/16 pages.",
+    ],
+  },
+  {
     date: "2026-10-11",
     title: "Browsing and model pages",
     items: [
@@ -24,11 +32,11 @@ export const SITE_CHANGES: readonly Change[] = [
   },
   {
     date: "2026-10-11",
-    title: "About, dataset and licence pages",
+    title: "About, dataset and license pages",
     items: [
       "The About page explains how each diagram is traced, checked and drawn, and how to cite the Menagerie.",
-      "The Dataset page lists every column of the download, with licence and citation.",
-      "New pages for privacy and licences, and for this list of changes.",
+      "The Dataset page lists every column of the download, with license and citation.",
+      "New pages for privacy and licenses, and for this list of changes.",
       "Links shared in chat apps and social sites show a picture of a real diagram for each task.",
       "Downloaded catalog files now give each diagram's full web address.",
     ],

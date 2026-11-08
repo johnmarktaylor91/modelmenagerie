@@ -9,8 +9,14 @@ export interface ViewerVariant {
   svgSize: string;
   /** File name offered when the reader saves the SVG, for example "resnet18-unrolled-none.svg". */
   svgFileName: string;
-  /** Small preview image, or null when the thumbnail is too small to be useful. */
+  /** Preview image (the top crop when the export has one, else the thumbnail), or null when there is no useful one. */
   thumbUrl: string | null;
+  /** The preview's own size when known (a crop's width and height), so it reserves its box before it loads. */
+  previewWidth: number | null;
+  previewHeight: number | null;
+  /** The SVG's own size from the export, or null; used to size the stage and the scale before the SVG loads. */
+  svgWidth: number | null;
+  svgHeight: number | null;
   pdfUrl: string | null;
   pdfSize: string | null;
   /** Load only on request (monster flag or byte size above the site-wide limit). */
@@ -24,6 +30,11 @@ export interface ViewerVariant {
    * readable view opens centred there. Null: open centred on the middle.
    */
   focusX: number | null;
+  /**
+   * Where the readable view of a wide diagram starts down the page, as a fraction of its height,
+   * when the top of the window it opens on is blank paper. Null: open at the top.
+   */
+  focusY: number | null;
 }
 
 /** Everything the model page script needs, serialised into the page as JSON. */

@@ -2,9 +2,11 @@
  * Families and relatives: the family pages (`/families/<slug>/`) and the model page's
  * "Related models" block. Build-time only.
  */
-import { getAllModels, type ModelRecord } from "@/lib/catalog";
-import { isPresent } from "@/lib/labels";
-import { compactText } from "@/scripts/CardView";
+import { findDefaultVariant, getAllModels, getStandInShareCount, type FamilyRecord, type ModelRecord } from "@/lib/catalog";
+import { isPresent, webUrl } from "@/lib/labels";
+import { getFamilyRecords } from "@/lib/roster";
+import { familyDisplayOverride } from "@/lib/display-names";
+import { compactText, slugText } from "@/scripts/CardView";
 
 /**
  * A family gets its own page only when it has at least this many members. Pages Free allows
@@ -20,6 +22,8 @@ export const RELATIVES_SHOWN = 6;
 export interface Family {
   /** The catalog's family value, used by the listing's `family` filter. */
   name: string;
+  /** How the family is named on the page: `families.jsonl`'s display name when the export has one, else `name`. */
+  displayName: string;
   slug: string;
   /** Members, smallest first (parameters, then operations, then name). */
   members: ModelRecord[];
@@ -31,14 +35,21 @@ export interface Family {
 let families: Map<string, Family> | null = null;
 let familiesByName: Map<string, Family> | null = null;
 let shapeGroups: Map<string, ModelRecord[]> | null = null;
+let diagramGroups: Map<string, ModelRecord[]> | null = null;
 
 /** Lower-case words joined by hyphens: "smp unet" becomes "smp-unet". */
 export function familySlug(name: string): string {
-  return name
-    .normalize("NFKD")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  return slugText(name);
+}
+
+/** The display name `families.jsonl` gives a family value, or null (the card chip's source, `familyChip`). */
+export function familyDisplayName(name: string | null | undefined): string | null {
+  const override = familyDisplayOverride(name);
+  if (override) {
+    return override;
+  }
+  const record = name ? getFamilyRecords().get(name) : undefined;
+  return record && isPresent(record.display_name) ? record.display_name : null;
 }
 
 /** True when a family value names a real group rather than a placeholder. */
@@ -67,15 +78,18 @@ function compareBySize(left: ModelRecord, right: ModelRecord): number {
 function sharedPaper(members: readonly ModelRecord[]): Family["paper"] {
   const urls = new Set(members.map((member) => member.paper_url ?? ""));
   const [url] = [...urls];
-  if (urls.size !== 1 || !isPresent(url)) {
+  if (urls.size !== 1 || !webUrl(url)) {
     return null;
   }
   const titled = members.find((member) => isPresent(member.paper_title));
   return { url, title: titled?.paper_title ?? null };
 }
 
-/** Group a record list into families; exported so fixture pages build families the same way. */
-export function groupFamilies(models: readonly ModelRecord[]): Map<string, Family> {
+/**
+ * Group a record list into families; exported so fixture pages build families the same way.
+ * `records` (from `families.jsonl`) supply the display name, summary and paper when present.
+ */
+export function groupFamilies(models: readonly ModelRecord[], records: ReadonlyMap<string, FamilyRecord> = new Map()): Map<string, Family> {
   const groups = new Map<string, ModelRecord[]>();
   for (const model of models) {
     if (isRealFamily(model.family_normalized)) {
@@ -91,14 +105,18 @@ export function groupFamilies(models: readonly ModelRecord[]): Map<string, Famil
       slug = `${familySlug(name) || "family"}-${suffix}`;
     }
     members.sort(compareBySize);
-    const summary = members.map((member) => member.family_summary).find(isPresent) ?? null;
-    bySlug.set(slug, { name, slug, members, paper: sharedPaper(members), summary });
+    const record = records.get(name);
+    const summary = (isPresent(record?.summary) ? record.summary : null) ?? members.map((member) => member.family_summary).find(isPresent) ?? null;
+    const recordPaperUrl = record ? webUrl(record.paper_url) : null;
+    const paper = record && recordPaperUrl ? { url: recordPaperUrl, title: isPresent(record.paper_title) ? record.paper_title : null } : sharedPaper(members);
+    const displayName = familyDisplayOverride(name) ?? (record && isPresent(record.display_name) ? record.display_name : name);
+    bySlug.set(slug, { name, displayName, slug, members, paper, summary });
   }
   return bySlug;
 }
 
 function loadFamilies(): Map<string, Family> {
-  families ??= groupFamilies(getAllModels());
+  families ??= groupFamilies(getAllModels(), getFamilyRecords());
   return families;
 }
 
@@ -150,12 +168,48 @@ export function familyRelatives(model: ModelRecord, family: Family | null, limit
   return others.slice(start, start + limit);
 }
 
-/** Other models with the same graph shape, outside the model's family (those show as family). */
+/** The default diagram's SVG hash, or "" when the record has no diagram. */
+function diagramHash(model: ModelRecord): string {
+  return findDefaultVariant(model)?.svg.sha256 ?? "";
+}
+
+function loadDiagramGroups(): Map<string, ModelRecord[]> {
+  if (diagramGroups === null) {
+    diagramGroups = new Map();
+    for (const model of getAllModels()) {
+      const hash = diagramHash(model);
+      if (hash) {
+        const group = diagramGroups.get(hash) ?? [];
+        group.push(model);
+        diagramGroups.set(hash, group);
+      }
+    }
+  }
+  return diagramGroups;
+}
+
+/**
+ * Other models whose default diagram is the identical drawing, outside the model's family. The
+ * export's `diagram_shared_with` says whether there are any; without it, a shared drawing that
+ * looks like a stand-in (see `getStandInShareCount`) is not offered as a relative.
+ */
+export function sameDiagramModels(model: ModelRecord, limit = RELATIVES_SHOWN): ModelRecord[] {
+  const shared = model.diagram_shared_with;
+  if (shared === 0 || (shared == null && getStandInShareCount(findDefaultVariant(model), model) > 0)) {
+    return [];
+  }
+  return (loadDiagramGroups().get(diagramHash(model)) ?? [])
+    .filter((other) => other.slug !== model.slug && other.family_normalized !== model.family_normalized)
+    .slice(0, limit);
+}
+
+/** Other models with the same graph shape, outside the model's family and the identical-drawing group. */
 export function sameShapeModels(model: ModelRecord, limit = RELATIVES_SHOWN): ModelRecord[] {
   if (!isPresent(model.graph_shape_hash)) {
     return [];
   }
+  const hash = diagramHash(model);
   return (loadShapeGroups().get(model.graph_shape_hash) ?? [])
-    .filter((other) => other.slug !== model.slug && other.family_normalized !== model.family_normalized)
+    .filter((other) => other.slug !== model.slug && other.family_normalized !== model.family_normalized && diagramHash(other) !== hash)
     .slice(0, limit);
 }

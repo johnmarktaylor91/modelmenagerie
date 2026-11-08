@@ -209,6 +209,9 @@ def test_rung1_fields_round_trip() -> None:
     record = from_dict(ModelRecord, {**model, "recipe": recipe})
     assert (record.recipe.extras, record.recipe.vendor) == (("torch_geometric==2.6.1",), "b" * 64)
     assert from_dict(ModelRecord, json.loads(dumps(record))) == record
+    noted = from_dict(ModelRecord, {**model, "note": "eval output collapses at a discrete step"})
+    assert from_dict(ModelRecord, json.loads(dumps(noted))) == noted
+    assert "note" not in json.loads(dumps(record))
     adapter_src = "VARIANTS = {}\n"
     request = from_dict(RunRequest, {**_fixture("run_request.json"), "adapter_src": adapter_src})
     assert json.loads(dumps(request))["adapter_src"] == adapter_src
@@ -440,6 +443,11 @@ def test_every_verb_parses_and_dispatches(monkeypatch: pytest.MonkeyPatch,
         "try": ["try", "m8839"], "trace": ["trace", "m8839", "--structure-only"],
         "render": ["render", "m8839", "--trace", "t"], "worker": ["worker", "a"],
         "publish export": ["publish", "export", "out"],
+        "publish derive": ["publish", "derive", "out"],
+        "publish stage": ["publish", "stage", "out", "dest"],
+        "publish clean": ["publish", "clean", "out"],
+        "publish restrict": ["publish", "restrict", "out", "dest"],
+        "publish release": ["publish", "release", "out", "dest", "--base", "https://a.example/"],
         **RUNG1_VERBS, **{k: v for k, v in {**RUNG2_VERBS, **RUNG3_VERBS}.items()
                           if " --" not in k}, **SPEEDUP_VERBS,
     }
@@ -461,11 +469,13 @@ RUNG1_VERBS = {
     "fetch bib": ["fetch", "bib", "1512.03385", "--family", "f-resnet"],
     "store drain": ["store", "drain", "--sha", "a" * 64],
     "store materialize": ["store", "materialize", "a" * 64, "dest"],
+    "store trim-unpack": ["store", "trim-unpack", "--root", "absent-unpack-cache"],
     "family seed": ["family", "seed", "m1873", "m1835"],
     "packet write": ["packet", "write", "f-nin", "draft.json"],
     "research launch": ["research", "launch", "batch.json"],
     "research second-search": ["research", "second-search", "f-nin"],
     "src": ["src", "f-nin"], "giveup": ["giveup", "m1873", "budget", "ten tries"],
+    "defer": ["defer", "f-nin", "needs a new session"],
     "done": ["done", "recipe.json"],
     "implement launch": ["implement", "launch", "f-nin", "--role", "model-default"],
     "bridge serve": ["bridge", "serve"],
@@ -473,6 +483,7 @@ RUNG1_VERBS = {
     "review calibrate": ["review", "calibrate", "--role", "model-default"],
     "review launch": ["review", "launch", "m1873"],
     "review record": ["review", "record", "m1873", "findings.json"],
+    "review disputed": ["review", "disputed", "--apply"],
     "prose audit": ["prose", "audit"], "next": ["next", "m8839"], "lanes": ["lanes"],
     "measures": ["measures", "run-1"], "collect": ["collect"],
 }
@@ -521,6 +532,8 @@ RUNG3_VERBS = {
     "review calibrate --all": ["review", "calibrate", "--all", "--runs", "3"],
     "jev freeze": ["jev", "freeze", "--packets", "50"],
     "jev drive --retry": ["jev", "drive", "--retry"],
+    "review big-deferred": ["review", "big-deferred", "--cohort", "r4-github"],
+    "review torchlens-corpus": ["review", "torchlens-corpus", "--all", "--out", "corpus"],
 }
 # The pack lane's verbs (store gate); they act on the worker's live store.
 RUNG3_VERBS |= {"store offload": ["store", "offload", "tiles", "--catalog", "c", "--host", "h"],
@@ -532,13 +545,15 @@ HUB_MODULES = ("cli", "fetch", "store", "research", "implement", "review", "desc
                "stubs", "census_harvest", "dossier", "worklist_build", "counts", "replay_table",
                "resolve", "resolve_confirm", "stage3", "harvest_tiers", "cluster", "admission",
                "checkin", "packet", "fetch_repos", "bridge", "tick", "runner_job", "find_paper", "describe_jev",
-               "describe_write", "census", "residual", "disk_guard", "tick_full")
+               "describe_write", "census", "residual", "disk_guard", "tick_full", "big_deferred")
 # Verbs whose lane has merged: they no longer reach a stub (each lane adds its own on merge).
 FILLED = {"next", "lanes", "measures", "collect",
           "fetch code", "fetch hf", "fetch page", "fetch bib", "store drain", "store materialize",
+          "store trim-unpack",
           "family seed", "packet write", "research launch", "research second-search",
-          "src", "giveup", "done", "implement launch", "bridge serve",
-          "review pick", "review calibrate", "review launch", "review record", "prose audit"}
+          "src", "giveup", "defer", "done", "implement launch", "bridge serve",
+          "review pick", "review calibrate", "review launch", "review record", "prose audit",
+          "review disputed"}
 # Filled verbs that would reach the network with these arguments; their lane's tests cover them.
 NETWORK = {"fetch code", "fetch hf", "fetch page", "fetch bib"}
 # Rung 3 verbs that read the worker, run-on or fleet-run from the hub.
@@ -548,6 +563,7 @@ WORKER_VERBS = {"stage3 serve", "hash harness", "axon run"}
 # Rung 3 verbs that run on the worker (they trace, build or count the site).
 WORKER_VERBS |= {"repin check", "release build", "site count"}
 WORKER_VERBS |= {"store offload", "store pack", "store pack-views", "store ceiling"}
+WORKER_VERBS |= {"store trim-unpack"}  # clears the worker's unpack cache
 NETWORK |= {"store fetch"}  # restores from the box through the hub's broker
 WORKER_VERBS |= {"implement library-adapter", "implement sdist-wheel"}  # r3-residual
 
@@ -593,6 +609,8 @@ FILLED3 |= {"census run", "census draw"}  # r3-census
 FILLED3 |= {"release build", "site count"}  # r3-release
 FILLED3 |= {"residual plan", "implement library-adapter", "implement sdist-wheel"}  # r3-residual
 FILLED3 |= {"repin check", "repin flip"}  # r3-repin
+FILLED3 |= {"review big-deferred"}  # the rung 4 tail for big rows
+FILLED3 |= {"review torchlens-corpus"}  # the TorchLens failure corpus (decisions.md 2026-11-04)
 
 
 @pytest.mark.parametrize("verb", sorted(set(RUNG3_VERBS) - FILLED3))

@@ -1,14 +1,22 @@
 ---
 import CopyCode from "@/components/CopyCode.astro";
 import BaseLayout from "@/layouts/BaseLayout.astro";
-import { getAllModels, getCatalogIndex, getDefaultVariant, getDiagramFocus } from "@/lib/catalog";
+import { getDefaultVariant, getDiagramFocus, getShownModels } from "@/lib/catalog";
+import { getSiteCounts } from "@/lib/counts";
+import { datasetVersion, isLaunched } from "@/lib/stage";
+import { GRAPHVIZ_DOWNLOAD_URL, SITE_NAME, TORCHLENS } from "@/lib/site";
 import { getFeaturedModels, getHeroImage } from "@/lib/featured-select";
-import { categoryLabel, formatNumber, labelCategoryFacets } from "@/lib/labels";
+import { formatNumber, labelCategoryFacets, taskLabel } from "@/lib/labels";
 import { diagramAlt } from "@/lib/alt";
 import { cardImage } from "@/lib/preview";
+import { featuredWindow, windowStyle } from "@/lib/featured-view";
 
-const models = getAllModels();
-const total = formatNumber(models.length);
+// Home shows validated models only; counts come from the export's funnel, dated by its as_of.
+const models = getShownModels();
+const counts = getSiteCounts();
+const total = formatNumber(counts.validated);
+const launched = isLaunched();
+const version = datasetVersion();
 const hero = getHeroImage(models);
 /**
  * A wide graph is drawn at twice the panel width around where its drawing starts (left, centre
@@ -21,33 +29,58 @@ function panelZoom(focus: number | null): string {
   return focus < 0.375 ? "home-panel__frame--zoom-left" : focus > 0.625 ? "home-panel__frame--zoom-right" : "home-panel__frame--zoom-centre";
 }
 
+// A featured model with a chosen window shows that readable part of its SVG; others keep the top of the graph.
+// The six panels load eagerly: they sit just below the hero, the phone row scrolls sideways (lazy
+// loading leaves the off-screen ones blank until swiped), and each SVG is small.
 const panels = getFeaturedModels(models, 6, hero ? [hero.model.slug] : []).map((model) => {
   const variant = getDefaultVariant(model);
-  return { model, imageUrl: cardImage(variant).url, zoom: panelZoom(getDiagramFocus(variant)) };
+  const view = featuredWindow(model.slug, variant);
+  return view
+    ? { model, imageUrl: variant.svg.url, zoom: "home-panel__frame--window", style: windowStyle(view) }
+    : { model, imageUrl: cardImage(variant).url, zoom: panelZoom(getDiagramFocus(variant)), style: undefined };
 });
-const categories = labelCategoryFacets(getCatalogIndex().facets.categories);
-const README_URL = "https://github.com/johnmarktaylor91/torchlens#readme";
-// Matches the TorchLens README quickstart.
+// Task counts over the validated models, so each number matches the listing it links to.
+const categoryCounts = new Map<string, number>();
+for (const model of models) {
+  categoryCounts.set(model.category, (categoryCounts.get(model.category) ?? 0) + 1);
+}
+const categories = labelCategoryFacets([...categoryCounts].map(([value, count]) => ({ value, count })));
+// Uses the trace and draw calls of the current TorchLens README (it names the result `trace`).
 const snippet = `import torchlens as tl
 
-log = tl.trace(model, x)
-log.draw()`;
+trace = tl.trace(model, x)
+trace.draw()`;
+const installCommand = `pip install torchlens
+# and Graphviz: brew install graphviz (macOS) or sudo apt install graphviz (Debian, Ubuntu)`;
 ---
 
 <BaseLayout
-  title="TorchLens Model Menagerie"
+  title={SITE_NAME}
   description={`Architecture diagrams of ${total} neural networks, traced with TorchLens. Browse, zoom and download.`}
 >
   <section class="shell home-hero">
     <div class="home-hero__text">
-      <h1 class="home-hero__title">TorchLens Model Menagerie</h1>
+      <h1 class="home-hero__title">{SITE_NAME}</h1>
       <p class="home-hero__lede">
-        Architecture diagrams of {total} neural networks, each traced with TorchLens.
-        <a class="textlink" href="/about/#status">This is a preview; here is what has been checked so far.</a>
+        Architecture diagrams of <span data-count="validated">{total}</span> neural networks, each traced with
+        <a class="textlink" href="/about/#torchlens">TorchLens</a> and checked operation by
+        operation{counts.asOfText && ` (as of ${counts.asOfText})`}.
+        {
+          launched ? (
+            version && (
+              <a class="textlink" href="/dataset/">
+                Dataset release {version}.
+              </a>
+            )
+          ) : (
+            <a class="textlink" href="/about/#status">This is a preview; here is what has been checked so far.</a>
+          )
+        }
       </p>
       <div class="home-hero__actions">
         <a class="button primary" href="/models/">Browse models</a>
         <a class="button" href="/dataset/">Download the dataset</a>
+        <a class="button" href="#draw-your-own">Draw your own model</a>
       </div>
     </div>
     {
@@ -58,7 +91,7 @@ log.draw()`;
           </a>
           <figcaption class="home-hero__caption">
             <a href={`/models/${hero.model.slug}/`}>{hero.model.display_name}</a>
-            <span>{categoryLabel(hero.model.category)}{hero.model.n_ops !== null && `, ${formatNumber(hero.model.n_ops)} operations`}</span>
+            <span>{[taskLabel(hero.model.category), hero.model.n_ops !== null ? `${formatNumber(hero.model.n_ops)} operations` : ""].filter(Boolean).join(", ")}</span>
           </figcaption>
         </figure>
       )
@@ -70,14 +103,14 @@ log.draw()`;
       <section class="shell home-section" aria-labelledby="home-panels-title">
         <h2 class="home-section__title" id="home-panels-title">Well-known architectures</h2>
         <ul class="home-panels">
-          {panels.map(({ model, imageUrl, zoom }) => (
+          {panels.map(({ model, imageUrl, zoom, style }) => (
             <li>
               <a class="home-panel" href={`/models/${model.slug}/`}>
                 <span class:list={["home-panel__frame", zoom]}>
-                  <img src={imageUrl} alt="" loading="lazy" decoding="async" />
+                  <img src={imageUrl} alt="" loading="eager" decoding="async" style={style} />
                 </span>
                 <span class="home-panel__name">{model.display_name}</span>
-                <span class="home-panel__task">{categoryLabel(model.category)}</span>
+                {taskLabel(model.category) && <span class="home-panel__task">{taskLabel(model.category)}</span>}
               </a>
             </li>
           ))}
@@ -105,17 +138,19 @@ log.draw()`;
   <section class="shell home-section home-section--last">
     <div class="home-own">
       <div class="home-own__text">
-        <h2 class="home-section__title">Draw your own model</h2>
+        <h2 class="home-section__title" id="draw-your-own">Draw your own model</h2>
         <p class="home-own__note">
-          Install Graphviz, then TorchLens. Any PyTorch model and input give you the same kind of diagram.
+          Every diagram on this site was drawn by TorchLens. Install TorchLens and
+          <a class="textlink" href={GRAPHVIZ_DOWNLOAD_URL}>Graphviz</a>, then run this Python code with your PyTorch
+          model as <code>model</code> and an example input as <code>x</code>.
         </p>
       </div>
       <div class="home-own__actions">
-        <CopyCode code="pip install torchlens" label="Copy the install command" name="Install command" />
+        <CopyCode code={installCommand} label="Copy the install commands" name="Install commands" />
         <CopyCode code={snippet} label="Copy the TorchLens example" name="TorchLens example" />
         <div class="home-own__links">
-          <a class="button primary" href={README_URL} rel="noreferrer">TorchLens quickstart</a>
-          <a class="button" href="https://pypi.org/project/torchlens/" rel="noreferrer">PyPI</a>
+          <a class="button primary" href={TORCHLENS.docs} rel="noreferrer">TorchLens docs</a>
+          <a class="button" href={TORCHLENS.repo} rel="noreferrer">TorchLens on GitHub</a>
         </div>
       </div>
     </div>
@@ -237,14 +272,38 @@ log.draw()`;
     font-weight: 600;
   }
 
-  /* Six small panels in one row on a desktop, two or three to a row on smaller screens. */
+  /* Six panels, three to a row on a desktop and two on a tablet, each wide enough that its window's
+     node titles read; on a phone they form one row the reader swipes through, the next one peeking in. */
   .home-panels {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 9.5rem), 1fr));
-    gap: 1rem;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1.25rem;
     margin: 0;
     padding: 0;
     list-style: none;
+  }
+
+  @media (max-width: 860px) {
+    .home-panels {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 560px) {
+    .home-panels {
+      grid-template-columns: none;
+      grid-auto-columns: 80%;
+      grid-auto-flow: column;
+      gap: 0.85rem;
+      padding-bottom: 0.5rem;
+      overflow-x: auto;
+      overscroll-behavior-x: contain;
+      scroll-snap-type: x mandatory;
+    }
+
+    .home-panels > li {
+      scroll-snap-align: start;
+    }
   }
 
   .home-panel {
@@ -263,7 +322,7 @@ log.draw()`;
     flex-direction: column;
     justify-content: flex-start;
     justify-content: safe center;
-    aspect-ratio: 5 / 6;
+    aspect-ratio: 4 / 3;
     margin-bottom: 0.45rem;
     overflow: hidden;
     border: 1px solid var(--border);
@@ -287,6 +346,12 @@ log.draw()`;
     width: 100%;
     max-width: none;
     height: auto;
+  }
+
+  /* A chosen window on the SVG (featured-view.ts): block layout, so the inline percentage margins
+     resolve against the frame's width. */
+  .home-panel__frame--window {
+    display: block;
   }
 
   .home-panel__frame--zoom-left img,

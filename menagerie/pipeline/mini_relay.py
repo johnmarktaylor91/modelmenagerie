@@ -3,16 +3,21 @@
 Every connection goes from the hub to the worker (the worker's registry ssh alias); the worker
 never reaches the hub. For each live mini lease (``mini_placement``) the relay stages the brief
 and family folders into the run-on job's checkout (``.mini-lane/``), runs the configured hub
-``deliver`` hook if any, and only then writes ``READY``. It answers the verbs the lane queues
-in ``.mini-lane/spool/new/``: a request is authorized by ``mini_verbs``, the drafts it uses
-come to the hub only through a worker snapshot that ``pull-outputs --dry-run`` leak-scans and
-whose hashes the copy must match, and the canonical hub wrapper runs from a trusted empty
-folder. Answers are kept on the hub until delivered. When fleet-run reports the run ended the
-relay pulls ``outputs/lane/`` with ``pull-outputs`` into the project's ``outputs/<job>/`` and,
-while the lease is still this lane's, ingests the drafts and result; the lease is kept until
-then (``admission._live``). A describe lease (``kind`` ``describe``, ``describe_workers``) has no
-verbs: the relay stages its batch folder's ``families/`` and ``out/`` with the translated brief,
-and ingest keeps only ``out/<family>.json`` for the lease's families and the result file.
+``deliver`` hook if any, and only then writes ``READY``. It answers the verbs the lane queues in
+``.mini-lane/spool/new/`` (every lane on a worker is listed in one ssh per pass, every
+``POLL_S`` while requests come and ``IDLE_POLL_S`` after a quiet minute): a request is
+authorized by ``mini_verbs``, the drafts it uses come to the hub only through a worker snapshot
+that ``pull-outputs --dry-run`` leak-scans and whose hashes the copy must match (skipped when
+the snapshot's digest matches the drafts last brought in), and the canonical hub wrapper runs
+from a trusted empty folder. Answers are kept on the hub until delivered. When fleet-run reports
+the run ended the relay pulls ``outputs/lane/`` with ``pull-outputs`` into the project's
+``outputs/<job>/`` and, while the lease is still this lane's, ingests the drafts and result; the
+lease is kept until then (``admission._live``). A describe lease (``kind`` ``describe``,
+``describe_workers``) has no verbs: the relay stages its batch folder's ``families/`` and
+``out/`` with the translated brief, and ingest keeps only ``out/<family>.json`` for the lease's
+families and the result file. A 2a lease (``kind`` ``2a``, ``mini_2a``) answers the 2a verbs
+through the hub lane's pipeline command, copies the store blobs its fetches print to the worker,
+and ingest keeps its drafts and result.
 
 Started as a thread of the bridge service (``bridge.serve``); ``python -m
 menagerie.pipeline.mini_relay`` runs it alone. One relay serves at a time. Imports neither
@@ -40,7 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from menagerie.paths import work_dir
-from menagerie.pipeline import DataLayout, admission, now
+from menagerie.pipeline import DataLayout, admission, mini_2a, now
 from menagerie.pipeline.mini_lane import (
     DRAFT_MAX_BYTES,
     NOT_DRAFTS,
@@ -53,6 +58,12 @@ from menagerie.pipeline.mini_lane import (
 )
 
 POLL_S = 2.0
+# The relay polls every POLL_S while a verb request is waiting or running (or a lane is new),
+# and every IDLE_POLL_S once none has been seen for IDLE_AFTER_S; a new request then waits at
+# most IDLE_POLL_S to be picked up, and the next pass is fast again.
+IDLE_POLL_S = 12.0
+IDLE_AFTER_S = 60.0
+BOXES = ("new", "claimed", "done")
 STATUS_EVERY_S = 10.0
 HEARTBEAT_STALE_S = 60
 MAX_VERBS = 4  # concurrent verbs per lane
@@ -67,6 +78,7 @@ REFILL_WANT = "refill.want"
 DELIVER_TIMEOUT_S = 300
 # run-on's job checkout, relative to the worker's home (legacy run-on, pull-outputs).
 WORKTREE = ".orca-run/worktrees/menagerie/{label}"
+PAST = "this lane is past its lease window; finish with the result file"
 SAFE_PATH = re.compile(r"/[A-Za-z0-9._/-]+")
 NAME = re.compile(r"[0-9]+-[0-9a-f]{8}")
 q = shlex.quote
@@ -100,11 +112,13 @@ def _reply(rc: int, stderr: str = "", stdout: str = "") -> dict[str, Any]:
 # --- the path map ---------------------------------------------------------------------------
 
 
-def layout(families: Sequence[str], brief: Path) -> tuple[str, str]:
+def layout(families: Sequence[str], brief: Path, kind: str = "2b") -> tuple[str, str]:
     """The brief's and result's paths under the worker's ``.mini-lane/``."""
     folder = Path(brief).parent
     if folder.parent == work_dir("describe"):  # a describe batch folder and its own result name
         return f"work/{folder.name}/{Path(brief).name}", f"work/{folder.name}/{Path(brief).stem}.result.md"
+    if kind == mini_2a.KIND:  # a 2a lane's folder, ``briefs/<label>/`` (``mini_2a``)
+        return f"work/{folder.name}/{Path(brief).name}", f"work/{folder.name}/BRIEF.result.md"
     name = folder.name if folder.parent == work_dir("2b") and folder.name in families else "_batch"
     return f"work/{name}/{Path(brief).name}", f"work/{name}/BRIEF.result.md"
 
@@ -228,6 +242,31 @@ def _q(path: str) -> str:
     return q(path)
 
 
+def list_boxes(remote: Remote, roots: Sequence[str]) -> dict[str, dict[str, list[str]]]:
+    """Every lane's spool folders on one worker over one ssh: root to box to request names.
+
+    A box lists regular files with a request name, at most ``SPOOL_MAX`` (only request names
+    count toward the cap, so junk can never hide a real request); anything else is ignored. A
+    missing folder lists as empty.
+    """
+    folders = " ".join(_q(f"{root}/spool/{box}") for root in roots for box in BOXES)
+    listed = remote.run(f"for d in {folders}; do find \"$d\" -mindepth 1 -maxdepth 1 -type f "
+                        f"-name '*.json' 2>/dev/null | grep -E '/[0-9]+-[0-9a-f]{{8}}\\.json$' "
+                        f"| head -n {SPOOL_MAX}; done; true").decode().splitlines()
+    found: dict[str, list[str]] = {}
+    for entry in listed:
+        folder, _, file = entry.rpartition("/")
+        if NAME.fullmatch(file[:-5]):
+            found.setdefault(folder, []).append(file[:-5])
+    return {root: {box: sorted(found.get(f"{root}/spool/{box}", [])) for box in BOXES}
+            for root in roots}
+
+
+def _waiting(listing: Mapping[str, Sequence[str]]) -> bool:
+    """A request is queued, or claimed and not yet answered."""
+    return bool(listing["new"]) or bool(set(listing["claimed"]) - set(listing["done"]))
+
+
 # Staging: the hub's wrapper, result and defer marker stay on the hub.
 STAGE = ["-rtl", "--safe-links", "--exclude=/menagerie", "--exclude=/BRIEF.result.md",
          "--exclude=/deferred.json"]
@@ -251,6 +290,8 @@ class Lane:
         self.state, self.checked, self.next_pull, self.pulls = "unknown", 0.0, 0.0, 0
         self.scope = None
         self.staged = self._load("staged.json")
+        # Hub draft folder to the snapshot digest last brought in and the files it wrote then.
+        self.kept: dict[str, tuple[str, dict[str, tuple[int, int, int] | None]]] = {}
 
     def _load(self, name: str) -> dict[str, Any] | None:
         path = state_dir(self.label) / name
@@ -264,14 +305,24 @@ class Lane:
         return any(t.is_alive() for t in self.inflight.values()) or bool(
             self.task and self.task.is_alive())
 
-    def step(self) -> None:
-        """Start the lane's next piece of work off the relay loop, one at a time."""
+    def wants_poll(self) -> bool:
+        """The next step reads the spool: staged and ready, has verbs, not known to have ended."""
+        return not ingested(self.label) and not (self.task and self.task.is_alive()) \
+            and (self.staged or {}).get("phase") == "ready" and self.kind != "describe" \
+            and self.state != "TERMINAL" and SAFE_PATH.fullmatch(self.staged["root"]) is not None
+
+    def verbs_running(self) -> bool:
+        return any(t.is_alive() for t in self.inflight.values())
+
+    def step(self, listing: Mapping[str, list[str]] | None = None) -> None:
+        """Start the lane's next piece of work off the relay loop, one at a time. ``listing``
+        is its spool as ``list_boxes`` read it this pass; without one the lane lists its own."""
         if ingested(self.label) or (self.task and self.task.is_alive()):
             return
-        self.task = threading.Thread(target=self._advance, daemon=True)
+        self.task = threading.Thread(target=self._advance, args=(listing,), daemon=True)
         self.task.start()
 
-    def _advance(self) -> None:
+    def _advance(self, listing: Mapping[str, list[str]] | None = None) -> None:
         try:
             self.inflight = {k: t for k, t in self.inflight.items() if t.is_alive()}
             if self.ended():
@@ -279,7 +330,7 @@ class Lane:
                     self.ingest()
             elif (self.staged or {}).get("phase") == "ready":
                 if self.kind != "describe":  # a describe lane has no verbs; its spool is never read
-                    self.poll()
+                    self.poll(listing)
             elif (self.staged or {}).get("phase") != "aborted":
                 self.stage()
         except Exception as exc:  # noqa: BLE001 - retried on the next pass; the log keeps why.
@@ -317,6 +368,8 @@ class Lane:
         root = worktree + "/" + ROOT
         if self.kind == "describe":
             return self._stage_describe(worktree, root)
+        if self.kind == mini_2a.KIND:
+            return self._stage_2a(worktree, root)
         mapping = paths(root, self.families, self.brief, self.run)
         spool = " ".join(_q(f"{root}/spool/{box}") for box in ("new", "claimed", "done"))
         self.remote.run(f"mkdir -p {spool}")
@@ -355,6 +408,28 @@ class Lane:
         _log(self.label, f"staged describe batch {folder.name} ({len(self.families)} families) at {work}")
         return True
 
+    def _stage_2a(self, worktree: str, root: str) -> bool:
+        """A 2a lane: its spool, an empty store copy, the lane folder's drafts (none at the start;
+        a relaunch's earlier ones) and the brief, translated (``mini_2a.mapping``)."""
+        folder = mini_2a.folder_of(self.brief)
+        mapping = mini_2a.mapping(root, self.brief, self.lease["pipe"], self.lease.get("store"))
+        work = f"{root}/work/{folder.name}"
+        boxes = " ".join(_q(f"{root}/spool/{box}") for box in ("new", "claimed", "done"))
+        self.remote.run(f"mkdir -p {boxes} {_q(work + '/drafts')} {_q(root + '/store')}")
+        if (folder / "drafts").is_dir():
+            self.remote.rsync(["-rt"], f"{folder / 'drafts'}/",
+                              self.remote.target(f"{work}/drafts/"))
+        brief_rel, _ = layout(self.families, self.brief, self.kind)
+        self._put(f"{root}/{brief_rel}", translate(self.brief.read_text(encoding="utf-8"),
+                                                   mapping).encode())
+        subprocess.run([admission._tool("run-on"), "fetch", self.label], capture_output=True,
+                       text=True, timeout=180, check=False)
+        self.staged = {"root": root, "worktree": worktree, "paths": mapping, "phase": "staged",
+                       "at": now()}
+        self._save("staged.json", self.staged)
+        _log(self.label, f"staged 2a lane {folder.name} ({len(self.families)} families) at {work}")
+        return True
+
     def _deliver(self, argv: Sequence[str]) -> bool:
         """The configured hub hook that hands the runtime its login; it finishes before READY."""
         values = {"job": self.label, "host": self.host, "account": self.lease["account"]}
@@ -379,27 +454,20 @@ class Lane:
 
     # verbs -----------------------------------------------------------------------------------
 
-    def _box(self, box: str) -> list[str]:
-        """Request names in one spool folder: regular files with a request name, at most
-        ``SPOOL_MAX``; anything else there is ignored."""
-        folder = _q(f"{self.staged['root']}/spool/{box}")
-        # Only request names count toward the cap, so junk can never hide a real request.
-        listed = self.remote.run(f"find {folder} -mindepth 1 -maxdepth 1 -type f -name '*.json' "
-                                 f"| grep -E '/[0-9]+-[0-9a-f]{{8}}\\.json$' | head -n {SPOOL_MAX}"
-                                 ).decode().splitlines()
-        stems = (Path(entry).name[:-5] for entry in listed)
-        return sorted(stem for stem in stems if NAME.fullmatch(stem))
-
     def _spool(self, box: str, name: str) -> str:
         return _q(f"{self.staged['root']}/spool/{box}/{name}.json")
 
     def _answers(self) -> Path:
         return state_dir(self.label) / "answers"
 
-    def poll(self) -> None:
-        self.reconcile()
+    def poll(self, listing: Mapping[str, list[str]] | None = None) -> None:
+        """Settle claimed verbs, deliver kept answers, claim and start new requests. ``listing``
+        was read before this lane's step started, and only this lane moves its spool files."""
+        root = self.staged["root"]
+        listing = listing if listing is not None else list_boxes(self.remote, [root])[root]
+        requeued = self.reconcile(listing)
         self.redeliver()
-        for name in self._box("new"):
+        for name in sorted({*listing["new"], *requeued}):
             if name in self.inflight or len(self.inflight) >= MAX_VERBS:
                 continue
             self.remote.run(f"mv {self._spool('new', name)} {self._spool('claimed', name)}")
@@ -410,11 +478,12 @@ class Lane:
             self.inflight[name] = thread
             thread.start()
 
-    def reconcile(self) -> None:
+    def reconcile(self, listing: Mapping[str, list[str]]) -> list[str]:
         """Claimed verbs this relay is not running (after a restart or a failed read): one that
-        never started runs again; one that started is answered as uncertain, never rerun; a
-        kept answer is delivered."""
-        claimed, done = set(self._box("claimed")), set(self._box("done"))
+        never started goes back to ``new`` to run again (returned); one that started is answered
+        as uncertain, never rerun; a kept answer is delivered."""
+        claimed, done = set(listing["claimed"]), set(listing["done"])
+        requeued = []
         for name in sorted(claimed - done - set(self.inflight)):
             if (self._answers() / f"{name}.json").is_file():
                 continue
@@ -423,6 +492,8 @@ class Lane:
                                               "check its effect (tries, records) before retrying\n"))
             else:
                 self.remote.run(f"mv {self._spool('claimed', name)} {self._spool('new', name)}")
+                requeued.append(name)
+        return requeued
 
     def redeliver(self) -> None:
         with self.deliver_lock:
@@ -466,6 +537,8 @@ class Lane:
 
         if not self._owned():
             return _reply(2, "this lane is past its lease window; finish with the result file\n")
+        if self.kind == mini_2a.KIND:
+            return self._serve_2a(name, request)
         family, args = request.get("family"), request.get("args")
         if request.get("id") != name or family not in self.families or not isinstance(args, list) \
                 or not args or not all(isinstance(a, str) and "\0" not in a for a in args):
@@ -481,6 +554,55 @@ class Lane:
             reply = self._locked(name, plan, scope)
         _log(self.label, f"verb {name} {plan.verb} {plan.family} rc={reply['rc']}")
         return reply
+
+    def _serve_2a(self, name: str, request: Mapping[str, Any]) -> dict[str, Any]:
+        """A 2a verb (``mini_2a``): authorize, bring a packet draft in, run it, copy the blobs a
+        fetch printed to the worker's store."""
+        folder = mini_2a.folder_of(self.brief)
+        args = request.get("args")
+        if request.get("id") != name or request.get("family") != folder.name \
+                or not _plain_args(args):
+            return _reply(2, "malformed verb request\n")
+        mapping = self.staged["paths"]
+        hub = [translate(a, inverse(mapping)) for a in args]
+        try:
+            plan = mini_2a.authorize(hub, self.families, folder / "drafts",
+                                     _base_2a(request.get("cwd"), mapping, folder))
+        except ValueError as exc:
+            return _reply(2, f"{exc}\n")
+        if plan.draft is None:
+            reply = self._run_2a(name, plan)
+        else:
+            # One draft bring-in and packet write at a time.
+            with self.family_locks[self.families[0]]:
+                refused = self.bring_in(name, folder.name, folder) if self._owned() else PAST
+                reply = _reply(2, refused + "\n") if refused else self._run_2a(name, plan)
+        # The blobs go before the answer is kept: a kept answer may be delivered at once.
+        if plan.fetch and reply["rc"] == 0:
+            try:
+                self.push_blobs(name, reply["stdout"])
+            except (subprocess.SubprocessError, OSError) as exc:
+                _log(self.label, f"verb {name} blobs not pushed: {exc!r}"[:500])
+        _log(self.label, f"verb {name} {' '.join(plan.words)} rc={reply['rc']}")
+        return reply
+
+    def _run_2a(self, name: str, plan: Any) -> dict[str, Any]:
+        if not self._owned():
+            return _reply(2, PAST + "\n")
+        self._answers().mkdir(parents=True, exist_ok=True)
+        (self._answers() / f"{name}.started").touch()
+        return mini_2a.run(plan, self.lease, state_dir(self.label) / "cwd", VERB_TIMEOUT_S)
+
+    def push_blobs(self, name: str, text: str) -> None:
+        """The store blobs a fetch printed, into the worker's ``.mini-lane/store/``."""
+        store = self.lease.get("store")
+        found = mini_2a.blobs(text, store)
+        if not found:
+            return
+        listing = state_dir(self.label) / f"blobs-{name}.txt"  # verbs run side by side
+        listing.write_text("\n".join(found) + "\n", encoding="utf-8")
+        self.remote.rsync(["-t", f"--files-from={listing}"], f"{store}/",
+                          self.remote.target(f"{self.staged['root']}/store/"))
 
     def _locked(self, name: str, plan: Any, scope: Any) -> dict[str, Any]:
         """Under the family's lock: drafts in, checks, the verb, its kept outcome, evidence."""
@@ -533,8 +655,9 @@ class Lane:
                 return _reply(124, "infra: verb timed out on the hub\n")
         return _reply(child.returncode, stderr, stdout)
 
-    def bring_in(self, name: str, family: str) -> str | None:
-        """The family's drafts, through a worker snapshot the leak scan passed; or a refusal."""
+    def bring_in(self, name: str, family: str, folder: Path | None = None) -> str | None:
+        """The family's drafts, through a worker snapshot the leak scan passed; or a refusal.
+        ``folder`` is the hub folder they go to (default the family's 2b folder)."""
         root, worktree = self.staged["root"], self.staged["worktree"]
         summary = json.loads(self.remote.run(
             f"cd {_q(worktree)} && python3 menagerie/pipeline/mini_lane.py snapshot "
@@ -542,11 +665,22 @@ class Lane:
         if summary.get("refused") or not summary.get("files"):
             return summary.get("refused")
         try:
-            return self._scanned_copy(name, family)
+            if self._unchanged(folder or work_dir("2b") / family, summary.get("digest")):
+                return None  # the same drafts passed the scan and were written last time
+            return self._scanned_copy(name, family, folder, summary.get("digest"))
         finally:
             self.remote.run(f"rm -rf {_q(f'{root}/snap/{name}')}")
 
-    def _scanned_copy(self, name: str, family: str) -> str | None:
+    def _unchanged(self, folder: Path, digest: Any) -> bool:
+        """The snapshot holds exactly the drafts last brought into ``folder`` (worker digest) and
+        the hub files written then are untouched, so a new scan and copy would change nothing.
+        A lane started on code without the digest always scans."""
+        kept = self.kept.get(str(folder))
+        return isinstance(digest, str) and kept is not None and kept[0] == digest \
+            and kept[1] == _stamps(folder, kept[1])
+
+    def _scanned_copy(self, name: str, family: str, folder: Path | None = None,
+                      digest: str | None = None) -> str | None:
         """Read exactly the files the scan listed, each at most its scanned size, keep them only
         when every hash matches what was scanned, and promote them only while the lease is this
         lane's. Nothing unscanned is written on the hub."""
@@ -570,10 +704,11 @@ class Lane:
             if len(body) != size or hashlib.sha256(body).hexdigest()[:16] != sha:
                 return "drafts changed while the hub scanned them; retry"
             got[rel] = body
-        return self._promote(family, got)
+        return self._promote(family, got, folder, digest)
 
-    def _promote(self, family: str, files: Mapping[str, bytes]) -> str | None:
-        folder = work_dir("2b") / family
+    def _promote(self, family: str, files: Mapping[str, bytes],
+                 folder: Path | None = None, digest: str | None = None) -> str | None:
+        folder = folder or work_dir("2b") / family
         real = os.path.realpath(folder)
         with admission._lease_lock():
             if not self._owned():
@@ -586,6 +721,8 @@ class Lane:
                     continue  # never write through a link out of the family's folder
                 _write_bytes(target, body)
         keep_adapter_paths(folder, self.staged["paths"])
+        if digest:  # after the adapter paths settle, so the stamps are of the final files
+            self.kept[str(folder)] = (digest, _stamps(folder, files))
         return None
 
     def push_evidence(self, family: str) -> None:
@@ -637,6 +774,9 @@ class Lane:
                 return "late: the lease was released; results stay in the pulled folder"
             if self.kind == "describe":
                 self._keep_describe(lane)
+            elif self.kind == mini_2a.KIND:  # its verbs wrote its packets; drafts are evidence
+                if (lane / "drafts").is_dir():
+                    _copy_drafts(lane / "drafts", mini_2a.folder_of(self.brief) / "drafts")
             else:
                 for family in self.families:
                     source = lane / "families" / family
@@ -665,6 +805,33 @@ class Lane:
             _write_bytes(folder / "out" / draft.name, draft.read_bytes())
 
 
+def _stamps(folder: Path, names: Any) -> dict[str, tuple[int, int, int] | None]:
+    """Size, modification time and inode of each named file under ``folder`` (None if absent)."""
+    found: dict[str, tuple[int, int, int] | None] = {}
+    for rel in names:
+        try:
+            st = os.lstat(folder / rel)
+            found[rel] = (st.st_size, st.st_mtime_ns, st.st_ino)
+        except OSError:
+            found[rel] = None
+    return found
+
+
+def _plain_args(args: Any) -> bool:
+    return isinstance(args, list) and bool(args) and all(
+        isinstance(a, str) and "\0" not in a for a in args)
+
+
+def _base_2a(cwd: Any, mapping: Mapping[str, str], folder: Path) -> str:
+    """Where a 2a verb's relative paths resolve: the agent's folder on the hub when it is inside
+    the lane folder, else the lane folder."""
+    if isinstance(cwd, str) and cwd.startswith("/"):
+        hub = translate(cwd, inverse(mapping))
+        if os.path.realpath(hub).startswith(os.path.realpath(folder)):
+            return hub
+    return str(folder)
+
+
 def _pulled_lane(dest: Path) -> Path | None:
     for candidate in (dest / OUT, dest / Path(OUT).name):
         if (candidate / "lane.json").is_file():
@@ -690,8 +857,12 @@ def mini_leases() -> list[dict[str, Any]]:
 
 
 class Relay:
-    def __init__(self, connect: Callable[[str, Path], Remote] = Remote) -> None:
+    def __init__(self, connect: Callable[[str, Path], Remote] = Remote,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         self.connect, self.remotes, self.lanes = connect, {}, {}
+        self.listers: dict[str, threading.Thread] = {}  # one spool listing per worker at a time
+        self.clock = clock
+        self.active = clock()  # when a request, a running verb or a new lane was last seen
 
     def remote(self, alias: str) -> Remote:
         if alias not in self.remotes:
@@ -700,18 +871,59 @@ class Relay:
         return self.remotes[alias]
 
     def once(self) -> None:
+        """One pass: lanes that read their spool are listed together, one ssh per worker
+        (``list_boxes``), and stepped from that worker's listing thread; the rest step here."""
         state_dir().mkdir(parents=True, exist_ok=True)
         (state_dir() / "serving").touch()
         live = {lease["label"]: lease for lease in mini_leases()}
+        polling: dict[str, list[Lane]] = {}
         for label, lease in live.items():
             try:
-                if label not in self.lanes:
-                    self.lanes[label] = Lane(lease, self.remote(lease["mini"]["ssh_alias"]))
-                self.lanes[label].step()
+                lane = self._lane(label, lease)
+                if lane.wants_poll():
+                    polling.setdefault(lane.remote.alias, []).append(lane)
+                else:
+                    lane.step()
             except Exception as exc:  # noqa: BLE001 - one lane's failure never stops the others.
                 _log(label, f"step failed: {exc!r}"[:500])
+        for alias, lanes in polling.items():
+            if alias not in self.listers or not self.listers[alias].is_alive():
+                self.listers[alias] = threading.Thread(target=self._poll_worker, args=(lanes,),
+                                                       daemon=True)
+                self.listers[alias].start()
         for label in [k for k, lane in self.lanes.items() if k not in live and not lane.busy()]:
             del self.lanes[label]
+
+    def _lane(self, label: str, lease: Mapping[str, Any]) -> Lane:
+        """The lane for a live lease; a new lane or a running verb counts as activity."""
+        if label not in self.lanes:
+            self.lanes[label] = Lane(lease, self.remote(lease["mini"]["ssh_alias"]))
+            self.active = self.clock()
+        if self.lanes[label].verbs_running():
+            self.active = self.clock()
+        return self.lanes[label]
+
+    def _poll_worker(self, lanes: Sequence[Lane]) -> None:
+        """List these lanes' spools (all on one worker) in one ssh, then step each with its own
+        listing; if the listing fails, each lane lists its own as before."""
+        try:
+            listings = list_boxes(lanes[0].remote, [lane.staged["root"] for lane in lanes])
+        except Exception as exc:  # noqa: BLE001 - the lanes fall back to their own listing.
+            print(f"{now()} mini relay: spool listing on {lanes[0].remote.alias} failed: {exc!r}"
+                  [:500], file=sys.stderr, flush=True)
+            listings = {}
+        for lane in lanes:
+            listing = listings.get(lane.staged["root"])
+            if listing is not None and _waiting(listing):
+                self.active = self.clock()
+            try:
+                lane.step(listing)
+            except Exception as exc:  # noqa: BLE001 - one lane's failure never stops the others.
+                _log(lane.label, f"step failed: {exc!r}"[:500])
+
+    def pause(self) -> float:
+        """Seconds until the next pass: fast while requests come, slower after a quiet spell."""
+        return POLL_S if self.clock() - self.active < IDLE_AFTER_S else IDLE_POLL_S
 
     def close(self) -> None:
         for remote in self.remotes.values():
@@ -750,7 +962,7 @@ def serve(stop: threading.Event | None = None) -> None:
                 relay.once()
             except Exception as exc:  # noqa: BLE001 - the relay outlives any one pass's failure.
                 print(f"{now()} mini relay: {exc!r}", file=sys.stderr, flush=True)
-            stop.wait(POLL_S)
+            stop.wait(relay.pause())
     finally:
         relay.close()
         lock.close()

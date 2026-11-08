@@ -112,6 +112,29 @@ def landed(lane: Mapping[str, object]) -> bool:
     return mini_relay.ingested(label) or not (work_dir("leases") / f"{label}.json").is_file()
 
 
+def _read(path: Path) -> dict[str, object]:
+    try:
+        found = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def never_ran(lane: Mapping[str, object]) -> bool:
+    """Whether an ended worker lane's agent never started: the relay aborted it before READY (its
+    login delivery failed), or its pulled outputs hold no agent log (it stopped waiting for its
+    inputs or its runtime identity). Like a lane the hub's queue never admitted, it starts again
+    without spending its families' one return. A hub lane is never one."""
+
+    if not lane.get("placement"):
+        return False
+    state = mini_relay.state_dir(str(lane.get("label") or ""))
+    if _read(state / "staged.json").get("phase") == "aborted":
+        return True
+    pulled = _read(state / "ingested.json").get("pulled")
+    return isinstance(pulled, str) and Path(pulled).is_dir() and not (Path(pulled) / "agent.log").exists()
+
+
 def launch(brief: Path, families: Sequence[str], *, role: str) -> tuple[str, str, str] | None:
     """Start a describe lane on the first worker with room that admits it: its run, worker and
     lease label. None when no worker has room or each refused (the caller falls back to the

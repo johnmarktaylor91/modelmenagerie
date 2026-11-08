@@ -82,7 +82,8 @@ def construct(recipe: Recipe, *, device: str = "cpu", data: DataLayout | None = 
     """Build the model a recipe names, with random weights, on ``device`` (``cpu`` or ``meta``).
 
     Weights are drawn under seed 0 inside a forked RNG, so two constructions are identical
-    and the caller's random state is untouched.
+    and the caller's random state is untouched. A recipe with ``weights`` then loads that stored
+    state dict (``load_weights``), except on the meta device, which holds no values.
     """
 
     import torch
@@ -102,7 +103,33 @@ def construct(recipe: Recipe, *, device: str = "cpu", data: DataLayout | None = 
         # Legacy constructors (`nn.Parameter(torch.Tensor(n, d))`, DINO's `level_embed`) ignore
         # the default device; a meta build holds only meta tensors, so structure-only accepts it.
         model = model.to("meta")
+    elif recipe.weights:
+        load_weights(model, recipe.weights)
     return model
+
+
+def load_weights(model: Any, sha256: str) -> None:
+    """Load the ``.safetensors`` state dict stored under ``sha256`` into ``model``, strictly.
+
+    The blob is read from ``MENAGERIE_STORE`` (bound read-only into the sandbox; ``bridge`` and
+    ``cluster`` stage it like a vendor tree). Every key must match: a partial load would trace a
+    half-trained model under a pretrained recipe. Raises ``RecordError`` when the model is not a
+    ``torch.nn.Module`` or the keys differ; a missing blob raises ``store.BlobOffloaded``.
+    """
+
+    import torch
+    from safetensors.torch import load_file
+
+    from menagerie.pipeline import StoreLayout, store
+
+    if not isinstance(model, torch.nn.Module):
+        raise RecordError(f"weights {sha256[:12]}: the recipe builds a {type(model).__name__}, "
+                          "not a torch.nn.Module, so there is nothing to load them into")
+    state = store.read_blob(sha256, load_file, store=StoreLayout.from_env())
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        raise RecordError(f"weights {sha256[:12]} do not fit the model: {exc}"[:600]) from exc
 
 
 def _seeded(build: Callable[[], Any], device: str, mode: Any = None) -> Any:

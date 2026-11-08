@@ -887,8 +887,8 @@ def test_forward_replay_failure_retries_single_thread(
     monkeypatch.setattr("menagerie.validate_menagerie._build_input", lambda *_: object())
     monkeypatch.setattr("menagerie.validate_menagerie.instantiate_model", lambda _row: ProbeModel())
     monkeypatch.setattr(
-        "torchlens.user_funcs._validate_forward_pass_torch",
-        fake_validate_forward_pass_torch,
+        "menagerie.tl_validation._legacy_validator",
+        lambda: fake_validate_forward_pass_torch,
     )
 
     result = validate_one(_row(stable_id="retry-model"), False, "forward", "cpu")
@@ -945,8 +945,8 @@ def test_forward_precondition_refusal_reports_reason_without_a_trace(
     monkeypatch.setattr("menagerie.validate_menagerie._build_input", lambda *_: object())
     monkeypatch.setattr("menagerie.validate_menagerie.instantiate_model", lambda _row: ProbeModel())
     monkeypatch.setattr(
-        "torchlens.user_funcs._validate_forward_pass_torch",
-        fake_validate_forward_pass_torch,
+        "menagerie.tl_validation._legacy_validator",
+        lambda: fake_validate_forward_pass_torch,
     )
 
     result = validate_one(_row(stable_id="refused-model"), False, "forward", "cpu")

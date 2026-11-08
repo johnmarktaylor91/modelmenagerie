@@ -35,6 +35,7 @@ from menagerie.pipeline.records import (
     LedgerLine,
     LedgerRow,
     LegacyRow,
+    ModelRecord,
     RecordError,
     RenderRow,
     dumps,
@@ -100,15 +101,41 @@ def _latest(rows: Iterable[LedgerRow | RenderRow]) -> LedgerRow | RenderRow | No
 
 
 def deciding_trace(model_id: str, rows: Sequence[LedgerLine], *, recipe_rev: str,
-                   tl: str) -> LedgerRow | None:
-    """The trace row that decides a model's verdict at the current revisions, if any."""
+                   tl: str | None) -> LedgerRow | None:
+    """The trace row that decides a model's verdict at the current revisions, if any (at any
+    TorchLens pin when ``tl`` is ``None``)."""
 
     return _latest(
         r for r in rows
         if isinstance(r, LedgerRow) and r.id == model_id and r.stage == "trace"
-        and r.recipe_rev == recipe_rev and r.tl == tl and r.outcome != "infra"
+        and r.recipe_rev == recipe_rev and (tl is None or r.tl == tl) and r.outcome != "infra"
         and r.capture in (None, "full") and r.mode in (None, "eval")
     )
+
+
+def gave_up(record: ModelRecord) -> bool:
+    """Whether a record's give-up is its outcome (any but ``infra``, which drive retries)."""
+
+    return record.give_up is not None and record.give_up.cls.split(":")[0] != "infra"
+
+
+def validated_record(record: ModelRecord | None, rows: Sequence[LedgerLine], *,
+                     tl: str | None = None) -> LedgerRow | None:
+    """The trace that makes a model validated, else ``None``: the one rule ``implement.settled``,
+    the tick's cohort counts and ``scripts/data_status.py`` share (Lead, 2026-10-29).
+
+    A record states one outcome. It is validated when it has a recipe and no give-up (a give-up
+    is the other outcome, and drive reads it first; an ``infra`` one does not count there either), its deciding trace at the recipe's revision
+    (at pin ``tl``, or any pin) validates (``validated``), and no review calls that recipe a
+    fabrication."""
+
+    if record is None or record.recipe is None or gave_up(record):
+        return None
+    rev = record.recipe.rev
+    row = deciding_trace(record.id, rows, recipe_rev=rev, tl=tl)
+    if not validated(row) or _fabricated(record.id, rows, rev):
+        return None
+    return row
 
 
 def validated(row: LedgerRow | None) -> bool:
@@ -119,10 +146,14 @@ def validated(row: LedgerRow | None) -> bool:
 
 
 def _fabricated(model_id: str, rows: Sequence[LedgerLine], recipe_rev: str) -> bool:
+    # A confirm-only seat's other answers never clear a fabrication (decisions.md 2026-10-29).
+    from menagerie.pipeline.review import CONFIRM_ROLES  # review imports ledger
+
     review = _latest(
         r for r in rows
         if isinstance(r, LedgerRow) and r.id == model_id and r.stage == "review"
         and r.recipe_rev == recipe_rev and r.outcome != "infra"
+        and not (r.reviewer in CONFIRM_ROLES and r.verdict != "fabrication")
     )
     return review is not None and review.verdict == "fabrication"
 

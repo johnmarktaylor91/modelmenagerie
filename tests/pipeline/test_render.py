@@ -23,6 +23,7 @@ tl = pytest.importorskip("torchlens")
 pytest.importorskip("pyvips")
 from PIL import Image  # noqa: E402
 
+from menagerie import tl_compat  # noqa: E402
 from menagerie.pipeline import render, tree_sha256  # noqa: E402
 from menagerie.pipeline.records import RenderRow, dumps, from_dict, to_dict  # noqa: E402
 
@@ -101,7 +102,7 @@ def capture(name: str, tmp: Path) -> tuple[Any, Any, dict[str, float]]:
     live = tl.trace(model, x)
     traced = time.monotonic()
     path = tmp / f"{name}.tlspec"
-    tl.save(live, path, level="portable", include_outs=False)
+    tl_compat.save(live, path, level="portable", include_outs=False)
     loaded = tl.load(path)
     times = {"capture_secs": round(traced - started, 2),
              "save_load_secs": round(time.monotonic() - traced, 2),
@@ -185,7 +186,7 @@ def test_resnet18_renders_every_artifact_and_viewers_parse(tmp_path: Path) -> No
 
 def test_recurrent_classic_gets_rolled_default(tmp_path: Path) -> None:
     _, loaded, _ = capture("orig_lstm_1997", tmp_path)
-    assert loaded.is_recurrent
+    assert tl_compat.trace_field(loaded, "is_recurrent")
     keys = render.variants_for(loaded)
     assert "rolled-none" in keys
     row, files = render.render_set(loaded, model_id="m0001", trace_sha="1" * 64,
@@ -195,12 +196,12 @@ def test_recurrent_classic_gets_rolled_default(tmp_path: Path) -> None:
     accounted = drawn_variants(row) | {s.variant for s in row.skipped if s.kind == "svg"}
     assert accounted == set(keys)
     assert render.default_variant(sorted(drawn_variants(row)), is_recurrent=True,
-                                  n_ops=loaded.num_ops) == "rolled-none"
+                                  n_ops=tl_compat.num_ops(loaded)) == "rolled-none"
 
 
 def test_identical_render_is_deduplicated(tmp_path: Path) -> None:
     _, loaded, _ = capture("lenet5_classic", tmp_path)
-    assert loaded.num_ops <= render.READABLE_OPS
+    assert tl_compat.num_ops(loaded) <= render.READABLE_OPS
     assert render.variants_for(loaded) == ["unrolled-none"]
     row, _ = render.render_set(loaded, model_id="m0002", trace_sha="2" * 64,
                                out_dir=tmp_path / "out", variants=["unrolled-none", "unrolled-auto"])
@@ -252,7 +253,7 @@ def test_acceptance_model(name: str, tmp_path: Path) -> None:
     root = Path(str(OUT))
     out = root / name
     _, loaded, times = capture(name, tmp_path)
-    recurrent = bool(loaded.is_recurrent)
+    recurrent = bool(tl_compat.trace_field(loaded, "is_recurrent"))
     requested = list(QUALIFIED + (RECURRENT if render.reuses_weights(loaded) else ()))
     row, files = render.render_set(loaded, model_id="m0003", trace_sha="3" * 64, out_dir=out,
                                    variants=requested)
@@ -272,14 +273,14 @@ def test_acceptance_model(name: str, tmp_path: Path) -> None:
             tile.load()
             assert tile.size[0] > 0
     log = [json.loads(line) for line in (out / "render.log").read_text().splitlines()]
-    line = {"model": name, "n_ops": loaded.num_ops, "num_layers": loaded.num_layers,
+    line = {"model": name, "n_ops": tl_compat.num_ops(loaded), "num_layers": len(tl_compat.layers(loaded)),
             "is_recurrent": recurrent,
             "reuses_weights": render.reuses_weights(loaded),
             "rolled_units": render.rolled_units(loaded), **times, "render_secs": row.secs, "outcome": row.outcome,
             "renderer_rev": row.renderer_rev, "qualified": render.variants_for(loaded),
             "drawn": sorted(drawn), "deduped": deduped,
             "default": render.default_variant(sorted(drawn), is_recurrent=recurrent,
-                                              n_ops=loaded.num_ops),
+                                              n_ops=tl_compat.num_ops(loaded)),
             "artifacts": [{k: e.get(k) for k in ("variant", "kind", "bytes", "secs", "why")}
                           for e in log],
             "warnings": sorted({w for e in log for w in e.get("warnings", [])})}

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from menagerie.catalog import CATALOG_DB, CatalogRow, load_rows
+from menagerie import tl_compat
 from menagerie.recipe import (
     build_input_for_row,
     instantiate_model,
@@ -132,9 +133,10 @@ def trace_graph_shape_hash(model: Any, input_value: Any) -> str:
             model,
             input_value,
             save=None,
-            capture=tl.options.CaptureOptions(layers_to_save=None, save_rng_states=False, inference_only=True),
+            capture=tl_compat.capture_options(
+                layers_to_save=None, save_rng_states=False, inference_only=True),
         )
-    return str(getattr(trace, "graph_shape_hash", "") or "")
+    return tl_compat.graph_hash(trace, missing_ok=True) or ""
 
 
 def hash_catalog_row(row: CatalogRow, device: str) -> HashRecord:

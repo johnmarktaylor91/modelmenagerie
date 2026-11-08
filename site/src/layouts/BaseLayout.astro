@@ -7,7 +7,9 @@ import serifLatin600 from "@fontsource/source-serif-4/files/source-serif-4-latin
 import "../styles/global.css";
 import SeoHead from "@/components/SeoHead.astro";
 import SiteSearch from "@/components/SiteSearch.astro";
-import { getManifest } from "@/lib/catalog";
+import { ASSET_ORIGIN } from "@/lib/assets";
+import { getSiteCounts } from "@/lib/counts";
+import { datasetVersion, isLaunched } from "@/lib/stage";
 import { websiteJsonLd } from "@/lib/seo";
 import { CONTENT_LICENCE, SITE_NAME, TORCHLENS } from "@/lib/site";
 
@@ -17,9 +19,8 @@ import { CONTENT_LICENCE, SITE_NAME, TORCHLENS } from "@/lib/site";
  */
 const DEFAULT_THEME = "system" as "system" | "light" | "dark";
 
-/** Diagram images come from the asset host; open its connection early. Empty for local previews. */
-const assetBase = (import.meta.env.PUBLIC_R2_BASE as string | undefined) ?? "";
-const assetOrigin = assetBase ? new URL(assetBase).origin : "";
+/** Diagram images come from the asset host; open its connection early (bare origin). Empty for local previews. */
+const assetOrigin = ASSET_ORIGIN;
 
 interface Props {
   title: string;
@@ -34,7 +35,10 @@ interface Props {
   noindex?: boolean;
 }
 
-const modelCount = new Intl.NumberFormat("en").format(getManifest().counts.models ?? 0);
+const modelCount = new Intl.NumberFormat("en").format(getSiteCounts().validated);
+// Preview builds carry the preview tag; PUBLIC_SITE_STAGE=launch shows the dataset version instead.
+const launched = isLaunched();
+const version = datasetVersion();
 const {
   title,
   description = `Architecture diagrams of ${modelCount} neural networks, traced with TorchLens. Browse, zoom and download.`,
@@ -105,9 +109,19 @@ const currentState = (href: string) => (pathname === href ? "page" : pathname.st
       <div class="shell header-row">
         <div class="brand-group">
           <a href="/" class="brand">
-            <span class="brand-prefix">TorchLens </span>Model Menagerie
+            {SITE_NAME}
           </a>
-          <a class="preview-tag" href="/about/#status" title="Preview release: what has been checked so far">preview</a>
+          {
+            launched ? (
+              version && (
+                <a class="preview-tag" href="/dataset/" title={`Dataset release ${version}`}>
+                  {version}
+                </a>
+              )
+            ) : (
+              <a class="preview-tag" href="/about/#status" title="Preview release: what has been checked so far">preview</a>
+            )
+          }
         </div>
         <nav class="site-nav" aria-label="Site">
           <ul>
@@ -145,7 +159,12 @@ const currentState = (href: string) => (pathname === href ? "page" : pathname.st
       </div>
     </header>
     <main id="main" tabindex="-1">
+      {/* Cloudflare's email obfuscation rewrites text shaped like an address (a metric such as PCK at 0.05
+          written with an at sign) into a broken /cdn-cgi/l/email-protection link; the markers turn it off.
+          set:html takes an expression here: a quoted string attribute is escaped and shows as page text. */}
+      <Fragment set:html={"<!--email_off-->"} />
       <slot />
+      <Fragment set:html={"<!--/email_off-->"} />
     </main>
     <footer class="shell site-footer border-t">
       <p>
@@ -154,10 +173,10 @@ const currentState = (href: string) => (pathname === href ? "page" : pathname.st
       </p>
       <ul class="footer-links">
         <li><a class="navlink" href="/about/#cite">Cite</a></li>
-        <li><a class="navlink" href="/legal/">Privacy and licences</a></li>
+        <li><a class="navlink" href="/legal/">Privacy and licenses</a></li>
         <li><a class="navlink" href="/changelog/">Changes</a></li>
-        <li><a class="navlink" href={TORCHLENS.pypi}>PyPI</a></li>
-        <li><a class="navlink" href={TORCHLENS.repo}>GitHub</a></li>
+        <li><a class="navlink" href={TORCHLENS.pypi}>TorchLens on PyPI</a></li>
+        <li><a class="navlink" href={TORCHLENS.repo}>TorchLens on GitHub</a></li>
       </ul>
     </footer>
     <script>
@@ -227,10 +246,6 @@ const currentState = (href: string) => (pathname === href ? "page" : pathname.st
     white-space: nowrap;
   }
 
-  .brand-prefix {
-    color: var(--secondary);
-  }
-
   .preview-tag {
     padding: 0.05rem 0.5rem;
     border: 1px solid var(--border);
@@ -294,6 +309,29 @@ const currentState = (href: string) => (pathname === href ? "page" : pathname.st
     list-style: none;
   }
 
+  /*
+   * Tablet: the name, links and theme switch fit one row but the search box does not, so it takes
+   * the whole second row instead of wrapping beside a stranded theme switch.
+   */
+  @media (min-width: 48rem) and (max-width: 63.99rem) {
+    .brand-group {
+      order: 1;
+    }
+
+    .site-nav {
+      order: 2;
+    }
+
+    .theme-toggle {
+      order: 3;
+    }
+
+    .header-row :global(.site-search) {
+      order: 4;
+      flex: 1 1 100%;
+    }
+  }
+
   /* Phone: name and theme switch on the first row; links and search share the second. */
   @media (max-width: 47.99rem) {
     .header-row {
@@ -312,15 +350,10 @@ const currentState = (href: string) => (pathname === href ? "page" : pathname.st
       order: 4;
     }
 
+    /* Its own row on phones: beside the nav it was too narrow for its placeholder ("e.g. ResNet-5"). */
     .header-row :global(.site-search) {
       order: 5;
-      flex: 1 1 8rem;
-    }
-  }
-
-  @media (max-width: 29.99rem) {
-    .brand-prefix {
-      display: none;
+      flex: 1 1 100%;
     }
   }
 </style>

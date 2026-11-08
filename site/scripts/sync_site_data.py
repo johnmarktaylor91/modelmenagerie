@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import sys
 from pathlib import Path
 
 
@@ -14,6 +15,12 @@ DATA_FILES = (
     "funnel.json",
     "export_manifest.json",
     "catalog.csv",
+)
+# Side lists newer exports carry (the roster index of models not yet shown as pages, and the
+# families); an older export without them still syncs, with a warning.
+OPTIONAL_FILES = (
+    "roster-index.jsonl",
+    "families.jsonl",
 )
 
 
@@ -43,6 +50,15 @@ def sync_site_data(export_dir: Path, site_data_dir: Path) -> list[Path]:
     copied: list[Path] = []
     for name in DATA_FILES:
         source = export_dir / name
+        target = site_data_dir / name
+        shutil.copy2(source, target)
+        copied.append(target)
+    for name in OPTIONAL_FILES:
+        source = export_dir / name
+        if not source.is_file():
+            print(f"warning: {name} is not in the export; site-data keeps its old copy, if any",
+                  file=sys.stderr)
+            continue
         target = site_data_dir / name
         shutil.copy2(source, target)
         copied.append(target)

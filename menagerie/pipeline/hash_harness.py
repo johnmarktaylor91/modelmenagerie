@@ -41,6 +41,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from menagerie import tl_compat
 from menagerie.pipeline import DataLayout, now, read_json
 
 # Thirty models that traced and passed at rung 1 and build in ``torch-main`` with no extras or
@@ -512,7 +513,7 @@ def _hash_subject(subject: Any, *, structure_only: bool = False) -> dict[str, An
 
     trace = worker._hash_capture(subject, structure_only=structure_only)
     family = trace_summary.hash_family(trace)
-    return {"hashes": {level: family[level] for level in LEVELS}, "n_ops": len(trace.layer_list),
+    return {"hashes": {level: family[level] for level in LEVELS}, "n_ops": len(tl_compat.layer_list(trace)),
             "payload": trace_summary.hash_payload(trace, with_module=False)}
 
 
