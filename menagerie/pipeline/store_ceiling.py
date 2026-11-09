@@ -49,9 +49,9 @@ GIB = 2**30
 # pause line for the day's growth (13 GiB on a heavy backlog day), and still holds about a week
 # of the newest trace saves locally for render, replay and rerender.
 TARGET_GIB = 20.0
-MIN_AGE_DAYS = 1.0  # a render waits minutes to hours behind its trace; queued and running renders are the
-# working set whatever their age (decision 2026-10-28: the store grows 5 to 16 GB a day, so three days kept it
-# above its ceiling)
+MIN_AGE_DAYS = 0.5  # a render waits minutes to hours behind its trace; queued and running renders are the
+# working set whatever their age (decision 2026-11-08: during the TorchLens re-trace a full day of young saves kept
+# free disk under the resume line after the daily trim)
 TRACE = store_trim.TLSPEC
 PDF = "application/pdf"
 

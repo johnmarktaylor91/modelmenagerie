@@ -1818,11 +1818,11 @@ def test_a_worker_listing_counts_the_ceilings_candidates_only() -> None:
         return StoreIndexLine(sha256=sha, bytes=1, mime=mime, fetched=fetched, license_class="derived")
 
     index = store_ceiling.Index({a: line(a, store_ceiling.TRACE), b: line(b, "image/png"),
-                                 c: line(c, store_ceiling.TRACE, "2026-10-29T00:00:00Z"),
+                                 c: line(c, store_ceiling.TRACE, "2026-10-29T06:00:00Z"),
                                  d: line(d, store_ceiling.TRACE)}, set())
     now = datetime(2026, 10, 29, 12, tzinfo=timezone.utc).timestamp()
     assert store_pressure.aged_gib(local, keep, index, now=now) == (2097152 + 8) * 512 / 2**30
-    # b is a view file, c is under a day old, d is in the working set
+    # b is a view file, c is six hours old, under the half-day working-set age, d is in the working set
 
 
 def test_store_pressure_waits_while_the_unit_runs_or_nothing_presses(work: Path) -> None:

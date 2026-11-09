@@ -151,15 +151,15 @@ def test_materialize_fetches_an_offloaded_blob_back_on_the_hub(world: World,
 
 
 
-def test_the_default_working_set_age_is_one_day(world: World) -> None:
+def test_the_default_working_set_age_is_half_a_day(world: World) -> None:
     old, young = world.tree("old"), world.tree("young")
     world.seal([old, young])
     def run(days: float, apply: bool) -> dict:
         return store_ceiling.main(store=world.store, data=world.data, catalog=world.catalog, host=HOST,
                                   ceiling=store_ceiling.Ceiling(0), links=[world.links], apply=apply,
                                   now=time.time() + days * 86400)
-    assert run(0.5, apply=False)["done"] == 0  # half a day old: still the working set
-    assert run(2, apply=True)["done"] == 2  # two days old: past the one-day working-set age
+    assert run(0.25, apply=False)["done"] == 0  # six hours old: still the working set
+    assert run(1, apply=True)["done"] == 2  # a day old: past the half-day working-set age
     assert not world.store.blob(old).exists() and not world.store.blob(young).exists()
 
 
