@@ -239,6 +239,23 @@ def test_a_refused_worker_job_installs_nothing(data: DataLayout, tmp_path: Path,
     assert not counts.installed().exists()
 
 
+def test_the_status_page_is_due_when_its_standing_counts_or_day_change(
+        data: DataLayout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    built, repo = _built(data, tmp_path), data.root.parents[1]
+    monkeypatch.setattr(counts, "installed", lambda name=counts.NEXT_STEPS: built.parent / name)
+    due = counts.status_page(repo)
+    assert due["path"] == "docs/status.md" and "crawl_roster.jsonl`: 2 rows" in due["text"]
+    page = repo / due["path"]
+    page.parent.mkdir()
+    page.write_text(due["text"], encoding="utf-8")
+    assert counts.status_page(repo) == {"skipped": "the standing counts and the day are unchanged"}
+    page.write_text(due["text"].replace("2 rows", "3 rows"), encoding="utf-8")
+    assert counts.status_page(repo)["text"] == due["text"]  # a roster row was typed since
+    page.write_text(due["text"].replace("As of ledger entry 2", "As of ledger entry 1"), encoding="utf-8")
+    assert "text" in counts.status_page(repo)  # the moving counts are a day old
+    assert counts.status_page(repo, max_age_s=-1) == {"skipped": "no fresh status counts"}
+
+
 def test_data_status_json_renders_the_same_markdown() -> None:
     spec = importlib.util.spec_from_file_location("data_status", REPO / "scripts" / "data_status.py")
     assert spec is not None and spec.loader is not None

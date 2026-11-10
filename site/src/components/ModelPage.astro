@@ -37,10 +37,14 @@ const pdfInSomeVariant = model.variants.some((candidate) => candidate.pdf !== nu
 const summaryHtml = renderSummaryMarkdown(model.summary_markdown);
 const tagline = isPresent(model.tagline) ? model.tagline : null;
 const keyContribution = isPresent(model.key_contribution) ? model.key_contribution : null;
+// A summary is written once per family and shown on every member's page. The member note is
+// the part about this model; the page says when the rest is about the family.
+const memberNoteHtml = renderSummaryMarkdown(model.member_note);
+const sharedSummary = Boolean(summaryHtml) && (model.summary_shared_with ?? 0) > 0;
 // Keywords deduplicated without regard to case ("CodeGen" and "codegen" show once), first spelling kept.
 const seenKeywords = new Set<string>();
 const keywords = (model.keywords ?? []).filter(isPresent).filter((k) => !seenKeywords.has(k.toLowerCase()) && Boolean(seenKeywords.add(k.toLowerCase())));
-const hasSummary = Boolean(summaryHtml || tagline || keyContribution);
+const hasSummary = Boolean(summaryHtml || tagline || keyContribution || memberNoteHtml);
 // BibTeX is shown as text in a copy box (escaped, never rendered as markup).
 // An entry with neither an author nor a year (`@misc{gpt, title = {...}}`) is not worth copying, so it is left out.
 const bibtex = isPresent(model.bibtex) && /\b(author|year)\s*=/i.test(model.bibtex) ? model.bibtex.trim() : null;
@@ -184,6 +188,8 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
       hasSummary && (
         <section class="model-about" aria-labelledby="model-about-title">
           <h2 id="model-about-title">What it is</h2>
+          {memberNoteHtml && <div class="model-prose model-member-note" data-quoted set:html={memberNoteHtml} />}
+          {sharedSummary && <p class="model-scope">About this model's family</p>}
           {summaryHtml && <div class="model-prose" data-quoted set:html={summaryHtml} />}
           {keyContribution && (
             <p class="model-key" data-quoted>
@@ -304,6 +310,7 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
   .model-neighbours p,
   .model-neighbours span,
   .model-ai-label,
+  .model-scope,
   .model-details-heading {
     color: var(--secondary);
   }
@@ -535,6 +542,13 @@ const lede = [category, model.n_ops !== null ? `${formatNumber(model.n_ops)} ope
 
   .model-key {
     margin: 0 0 0.75rem;
+  }
+
+  .model-scope {
+    margin: 0 0 0.35rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
   }
 
   .model-keywords {

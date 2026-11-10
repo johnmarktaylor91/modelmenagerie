@@ -164,7 +164,8 @@ HANDLERS: dict[str, Handler] = {
     "worker": lambda a: _mod("worker").main(a.attempt_dir),
     "publish export": lambda a: str(_mod("publish").export_site(
         data=DataLayout.from_env(), out_dir=a.out_dir, ids=a.ids or None, as_of=a.as_of,
-        accept_pins=a.accept_pins, no_citations=a.no_citations, shown_only=not a.all_records)),
+        accept_pins=a.accept_pins, no_citations=a.no_citations, shown_only=not a.all_records,
+        pin=a.pin)),
     "publish derive": lambda a: _mod("publish_assets").derive(
         a.export_dir, store=StoreLayout.from_env(), derived=a.derived, workers=a.workers,
         deadline_minutes=a.deadline_minutes, variants=a.variants, share=not a.no_share),
@@ -867,6 +868,8 @@ def _add_run_verbs(sub: Any) -> Any:
     p.add_argument("--as-of", help="measurement date for the published counts")
     p.add_argument("--accept-pins", nargs="+", default=[], metavar="VERSION",
                    help="earlier TorchLens pins whose deciding traces stand in, in this order")
+    p.add_argument("--pin", metavar="VERSION",
+                   help="export the catalog as this TorchLens pin saw it (default: the repository's pin)")
     p.add_argument("--no-citations", action="store_true",
                    help="export even when the data tree holds no citation counts")
     p.add_argument("--all-records", action="store_true",

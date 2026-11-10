@@ -145,6 +145,7 @@ function countChecks() {
     ["search index rows (pages)", indexRows, shown.length + structure.length],
     ...(structure.length ? [["dataset structure only", printed("dataset/index.html", "structure"), structure.length]] : []),
     ...(rosterRows ? [["dataset model names = listing total", printed("dataset/index.html", "roster"), listingTotal]] : []),
+    ...(rosterRows ? [["home model names = listing total", printed("index.html", "roster"), listingTotal]] : []),
   ];
   const mismatches = expect.filter(([, got, want]) => got !== want).map(([name, got, want]) => ({ name, printed: got, expected: want }));
   const funnelFile = path.join(root, "site-data", "funnel.json");

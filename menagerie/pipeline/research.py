@@ -166,7 +166,8 @@ def page_citation(paper: Source, title: str | None, ref: str, *,
     if not title or _norm(title) not in _norm(text):
         return None
     date = (tags.get("citation_date") or tags.get("citation_online_date") or [None])[0]
-    authors = tuple(", ".join(reversed(a.split(", ", 1))) if ", " in a else a
+    # Highwire tags give "Family, Given"; a citation holds names as "Given Family".
+    authors = tuple(" ".join(reversed(a.split(", ", 1))) if ", " in a else a
                     for a in tags.get("citation_author", []))
     return Citation(title=title, authors=authors,
                     first_public=date.replace("/", "-") if date else None,

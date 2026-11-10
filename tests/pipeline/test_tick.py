@@ -1084,6 +1084,27 @@ def test_the_trickle_output_is_committed_without_another_writers_lines(work: Pat
     assert tick.load_state()["pending_owned"] == {}
 
 
+def test_a_due_status_page_is_written_and_committed_alone(work: Path, checkout: DataLayout,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    from menagerie.pipeline import counts
+
+    repo = checkout.root.parents[1]
+    tick.save_state(_state_with_job())
+    due = {"path": "docs/status.md", "text": "# Where the project stands (generated)\n"}
+    monkeypatch.setattr(counts, "status_page", lambda repo: due)
+    assert tick.tick("full", dry_run=True, data=checkout, deps=_full_deps(World(added={}), repo),
+                     bound_s=None)["results"]["status_page"] == {"would_write": "docs/status.md"}
+    out = tick.tick("full", data=checkout, deps=_full_deps(World(added={}), repo), bound_s=None)
+    assert not out["errors"].get("status_page")
+    assert out["results"]["status_page"]["commit"]["paths"] == ["docs/status.md"]
+    shown = subprocess.run(["git", "-C", str(repo), "show", "HEAD:docs/status.md"],
+                           capture_output=True, text=True, check=True).stdout
+    assert shown == due["text"]
+    monkeypatch.setattr(counts, "status_page", lambda repo: {"skipped": "no fresh status counts"})
+    out = tick.tick("full", data=checkout, deps=_full_deps(World(added={}), repo), bound_s=None)
+    assert out["results"]["status_page"] == {"skipped": "no fresh status counts"}
+
+
 def test_a_failed_trickle_commit_is_kept_and_made_by_the_next_pass(work: Path,
                                                                   checkout: DataLayout) -> None:
     repo = checkout.root.parents[1]

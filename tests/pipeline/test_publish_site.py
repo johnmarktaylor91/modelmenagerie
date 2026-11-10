@@ -51,6 +51,13 @@ def _record(sid: str, svg: str, *, slug: str | None = None,
             "variants": [variant], "family_normalized": family}
 
 
+def test_a_summary_shown_on_several_pages_is_counted() -> None:
+    records: list[dict[str, Any]] = [{"summary_markdown": "A family."}, {"summary_markdown": None},
+                                     {"summary_markdown": "A family."}, {"summary_markdown": "B."}]
+    publish_index.mark_shared_summaries(records)
+    assert [r["summary_shared_with"] for r in records] == [1, 0, 1, 0]
+
+
 def test_own_diagram_is_set_and_shared_svgs_are_counted() -> None:
     records = [_record("m1", "a" * 64), _record("m2", "a" * 64), _record("m3", "a" * 64),
                _record("m4", "b" * 64)]
@@ -168,6 +175,21 @@ def test_an_accepted_earlier_pin_stands_in_when_the_pin_has_no_deciding_trace(
     assert manifest["counts"]["by_torchlens_version"] == {FIXTURE_TL: 1}
 
 
+def test_an_export_read_at_an_earlier_pin_keeps_that_pins_trace_and_version(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data = _data_root(tmp_path)
+    monkeypatch.setattr(publish, "torchlens_pin", lambda: "3.0.2")  # the pin moved; no row there yet
+    with pytest.raises(RecordError, match="m8839.*no current trace"):
+        publish.export_site(data=data, out_dir=tmp_path / "x", ids=["m8839"], as_of=AS_OF)
+    out = publish.export_site(data=data, out_dir=tmp_path / "viewed", ids=["m8839"], as_of=AS_OF,
+                              pin=FIXTURE_TL)
+    (record,) = [json.loads(line) for line in (out / "models.jsonl").read_text().splitlines()]
+    assert record["torchlens_version"] == FIXTURE_TL
+    manifest = json.loads((out / "export_manifest.json").read_text())
+    assert manifest["torchlens_version"] == FIXTURE_TL
+    assert manifest["counts"]["by_torchlens_version"] == {FIXTURE_TL: 1}
+
+
 def test_each_record_is_counted_once_in_the_manifest() -> None:
     base = {"variants": [], "monster_graph": False, "hashes": None, "graph_shape_hash": ""}
     records = [{**base, "forward_validated": True, "capture": "structure_only"},
@@ -272,6 +294,7 @@ def test_summary_basis_and_checked_come_from_the_describe_record(tmp_path: Path)
     record = _one_record(publish.export_site(data=data, out_dir=tmp_path / "grounded",
                                              ids=["m8839"], as_of=AS_OF))
     assert record["summary_checked"] is True and record["summary_basis"] is None
+    assert record["member_note"] == "The 18-layer configuration." and record["summary_shared_with"] == 0
     describe_path = data.describe("f-resnet")
     describe = json.loads(describe_path.read_text())
     describe.update(basis="abstract", grounding_state="unchecked")

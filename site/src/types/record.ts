@@ -125,6 +125,10 @@ export interface ModelRecord {
   /** True when the summary was checked against its sources after it was written; absent or false otherwise. */
   summary_checked?: boolean | null;
   key_contribution?: string | null;
+  /** What sets this model apart within its family, from the same describe pass as the summary. */
+  member_note?: string | null;
+  /** How many other models show the same summary text (a summary is written per family). */
+  summary_shared_with?: number | null;
   keywords?: string[];
 
   // Site plan additions (plan section 4, crawler asks 2, 4, 5 and 8).

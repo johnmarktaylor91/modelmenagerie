@@ -64,15 +64,24 @@ def _write(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _status(data: DataLayout) -> dict[str, Any]:
-    """``scripts/data_status.py --json``'s counts for the checkout holding ``data``."""
+def _status_module() -> Any:
+    """``scripts/data_status.py`` as a module, or ``None`` when it cannot be loaded."""
 
     script = Path(__file__).resolve().parents[2] / "scripts" / "data_status.py"
     spec = importlib.util.spec_from_file_location("data_status", script)
     if spec is None or spec.loader is None:
-        return {"error": f"cannot load {script.name}"}
+        return None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def _status(data: DataLayout) -> dict[str, Any]:
+    """``scripts/data_status.py --json``'s counts for the checkout holding ``data``."""
+
+    module = _status_module()
+    if module is None:
+        return {"error": "cannot load data_status.py"}
     try:
         return module.counts(Path(data.root).resolve().parents[1])
     except (OSError, KeyError, ValueError) as exc:
@@ -120,6 +129,28 @@ def _fresh(path: Path, max_age_s: float) -> dict[str, Any] | None:
     age = (datetime.now(timezone.utc) - built).total_seconds()
     ok = payload.get("schema") == SCHEMA and payload.get("commit") and 0 <= age <= max_age_s
     return payload if ok else None
+
+
+def status_page(repo: Path, *, max_age_s: float = MAX_AGE_S) -> dict[str, Any]:
+    """The generated status page (``docs/status.md``) from the installed status counts.
+
+    ``{"path", "text"}`` when the counts are fresh and the page is due: its standing block
+    differs from the counts, or its moving block is dated another day. Else ``{"skipped": why}``.
+    The page is rendered by ``scripts/data_status.py`` itself (``render_counts``), so it equals
+    what the script writes on the hub from the same files.
+    """
+
+    payload, module = _fresh(installed(STATUS), max_age_s), _status_module()
+    found = (payload or {}).get("counts") or {}
+    if module is None or not found or "error" in found:
+        return {"skipped": "no fresh status counts"}
+    text, page = module.render_counts(found), repo / module.OUT
+    current = page.read_text(encoding="utf-8") if page.is_file() else ""
+    day = re.compile(r"As of ledger entry (\d{4}-\d{2}-\d{2})")
+    if (module.standing_block(current) == module.standing_block(text)
+            and day.findall(current) == day.findall(text)):
+        return {"skipped": "the standing counts and the day are unchanged"}
+    return {"path": module.OUT.as_posix(), "text": text}
 
 
 def _members(text: str | None) -> set[str]:

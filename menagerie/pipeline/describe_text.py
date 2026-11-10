@@ -25,6 +25,12 @@ from menagerie.pipeline import store as store_mod
 from menagerie.pipeline.describe import _bib_abstract
 from menagerie.pipeline.records import LedgerRow, Packet, RecordError, to_dict
 
+# The prompt's reader-facing wording rules that a pattern can hold: promotional words, and this
+# pipeline's own words for a model ("member") where the page says "this model".
+PROMOTIONAL = re.compile(r"state[- ]of[- ]the[- ]art|\bSOTA\b|\bimpressive(ly)?\b|\bgracefully\b"
+                         r"|\bremarkabl[ey]\b", re.IGNORECASE)
+PIPELINE_WORDS = re.compile(r"\bmembers?\b|\btraced here\b|\bfamily folder\b", re.IGNORECASE)
+
 TEXT_ROLES = ("paper", "page")
 ABSTRACT_APIS = ("s2", "openalex")
 # What describe can read, by kind, and what each kind of saved text file is (``<sid>-<x>.txt``).

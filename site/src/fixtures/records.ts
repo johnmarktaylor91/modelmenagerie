@@ -126,6 +126,8 @@ function fullRecord(): ModelRecord {
     summary_markdown:
       "ResNet-18 stacks **residual blocks**: each block adds its input back to its output, so the network learns a correction to the identity.\n\n- Four stages of two blocks each\n- A global average pool before the classifier\n\nThe idea comes from [the ResNet paper](https://arxiv.org/abs/1512.03385).",
     key_contribution: "Skip connections let very deep networks train without degrading.",
+    member_note: "This is the 18-layer configuration, the smallest in the paper, built from basic two-convolution blocks.",
+    summary_shared_with: 4,
     keywords: ["residual", "image classification", "skip connections"],
     share_image: { ...variant.thumb, width: 1200, height: 630 },
     own_diagram: true,

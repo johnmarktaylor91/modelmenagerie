@@ -55,7 +55,6 @@ export const DISPLAY_NAMES: Readonly<Record<string, string>> = {
   "transformer-original": "Transformer",
   "monai-basicunet": "U-Net (MONAI BasicUNet)",
   "monai-unet": "Residual U-Net (MONAI)",
-  "gpt2-huggingface-transformers": "GPT-2 (Transformers build)",
   "gpt-sw3": "GPT-SW3",
   "rnn-lm-elman": "Elman RNN language model",
   "openai-whisper-tiny": "Whisper tiny",

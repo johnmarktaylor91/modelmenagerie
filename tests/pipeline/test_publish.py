@@ -19,6 +19,7 @@ from menagerie.pipeline import (
     ledger,
     month_of,
     publish,
+    publish_names,
     read_json,
     read_jsonl,
     render,
@@ -277,6 +278,31 @@ def test_a_shared_family_packet_gives_each_model_its_own_library_license() -> No
     assert pub._license(torchvision, packet) == "BSD-3-Clause"
     assert pub._license(transformers, packet) == "Apache-2.0"
     assert "torchvision" in (pub._source_url(torchvision, packet) or "")
+
+
+def test_a_typed_duplicate_gives_way_to_its_exported_target() -> None:
+    rows = {"m2": RosterRow(name="b", zoo="z", stable_id="m2", state="duplicate_of:m1"),
+            "m4": RosterRow(name="d", zoo="z", stable_id="m4", state="duplicate_of:m3")}
+    kept = publish._without_duplicates({"m1": 1, "m2": 2, "m4": 4, "m5": 5}, rows)
+    assert kept == {"m1": 1, "m4": 4, "m5": 5}  # m3 has no page, so m4 keeps its own
+
+
+def test_a_papers_license_is_never_the_source_license() -> None:
+    data = DataLayout(Path(__file__).parents[2] / "menagerie" / "data")
+    packet = read_json(Packet, data.packet("f-vit"))
+    model = read_json(ModelRecord, data.model("m10921"))
+    by_sid = {s.sid: s for s in packet.sources}
+    paper = next(s for s in packet.sources if s.role == "paper")
+    of_paper = tuple(replace(s, of=paper.sid) if s.role == "license" else s
+                     for s in packet.sources)
+    assert any(s.role == "license" and by_sid[s.of].role != "paper" for s in packet.sources)
+    assert publish._license(model, replace(packet, sources=of_paper)) == "unknown"
+
+
+def test_exported_authors_read_given_name_first() -> None:
+    names = publish_names.author_names(
+        ("Brock, Andrew", "Soham De", "StepFun", ":", "Chen, Donny Y.", "Sammy Davis, Jr."))
+    assert names == ["Andrew Brock", "Soham De", "StepFun", "Donny Y. Chen", "Sammy Davis, Jr."]
 
 
 def test_an_unsaved_structure_only_capture_exports_by_its_summary(tmp_path: Path) -> None:

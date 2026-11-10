@@ -55,6 +55,8 @@ FAMILY_NAMES = {
 _ZOO_NOTE = re.compile(r"\s*\([^()]*\)\s*$")
 _SEPARATORS = " -,;/|"
 _MIN_REPEAT = 8
+# A comma followed by one of these is a name suffix, not "Family, Given".
+_NAME_SUFFIXES = frozenset({"jr", "jr.", "sr", "sr.", "ii", "iii", "iv", "phd", "ph.d."})
 
 
 def model_name(slug: str, raw: str) -> str:
@@ -89,3 +91,17 @@ def collapse_repeat(value: str | None) -> str | None:
         if text.endswith(half) and not text[k:n - k].strip(_SEPARATORS):
             return half.strip(_SEPARATORS + " ") or value
     return value
+
+
+def author_names(authors: tuple[str, ...] | list[str]) -> list[str]:
+    """Authors as "Given Family": a "Family, Given" entry is turned round, and an entry with
+    no letter or digit in it (a stray ":" between a team name and its members) is dropped."""
+
+    return [_given_first(a.strip()) for a in authors if any(ch.isalnum() for ch in a)]
+
+
+def _given_first(name: str) -> str:
+    family, comma, given = name.partition(", ")
+    if not comma or not given or ", " in given or given.lower() in _NAME_SUFFIXES:
+        return name
+    return f"{given} {family}"

@@ -32,13 +32,21 @@ from menagerie import tl_compat
 from menagerie.pipeline import (
     DataLayout, StoreLayout, citecheck, hash_harness, now, read_json, read_jsonl,
 )
-from menagerie.pipeline import bib_harvest, paper_check, publish_names, standin, trace_metrics
+from menagerie.pipeline import (
+    bib_harvest,
+    describe_text,
+    paper_check,
+    publish_names,
+    standin,
+    trace_metrics,
+)
 from menagerie.pipeline.records import (
     Citation,
     CitationLine,
     DescribeRecord,
     LedgerLine,
     LedgerRow,
+    MemberDescribe,
     ModelRecord,
     Packet,
     RecordError,
@@ -120,7 +128,8 @@ class Current:
 
 def export_site(*, data: DataLayout, out_dir: Path, ids: Sequence[str] | None = None,
                 as_of: str | None = None, accept_pins: Sequence[str] = (),
-                no_citations: bool = False, shown_only: bool = False) -> Path:
+                no_citations: bool = False, shown_only: bool = False,
+                pin: str | None = None) -> Path:
     """Write the site export for ``ids`` (default: every publishable model); return its path.
 
     ``accept_pins`` names earlier TorchLens pins whose deciding traces stand in, in the order
@@ -129,12 +138,16 @@ def export_site(*, data: DataLayout, out_dir: Path, ids: Sequence[str] | None = 
     unless ``no_citations`` says that is intended. ``shown_only`` (the CLI's default, so the
     publish loop's) keeps only the records the site gives a page (``hidden_reason``) and counts
     the rest in ``counts.dropped_hidden``; without it every publishable record is written.
+    ``pin`` exports the catalog as an earlier TorchLens pin saw it (default: the repository's
+    pin): each model's deciding trace, state and the manifest's version are read at ``pin``, so
+    while a re-trace at a new pin is under way the site keeps one hash value family and every
+    page it had, with current text (decisions.md, 2026-11-09).
     """
 
     from menagerie.pipeline import ledger, publish_index, render, roster
 
     as_of = as_of or now()[:10]
-    tl, renderer = torchlens_pin(), render.renderer_rev()
+    tl, renderer = pin or torchlens_pin(), render.renderer_rev()
     models = {m.id: m for m in _model_records(data)}
     rows_by_id: dict[str, list[LedgerLine]] = defaultdict(list)
     for row in ledger.read_all(data=data):
@@ -160,8 +173,10 @@ def export_site(*, data: DataLayout, out_dir: Path, ids: Sequence[str] | None = 
         if data.packet(m.family).exists() and isinstance(found := current(m), Current)
         and (found.state == "publishable" or _structure_only(found.trace))
     }
-    context = _Context.load(data, models=models,
-                           roster={r.stable_id: r for r in roster_rows if r.stable_id})
+    by_stable_id = {r.stable_id: r for r in roster_rows if r.stable_id}
+    if not ids:
+        selected = _without_duplicates(selected, by_stable_id)
+    context = _Context.load(data, models=models, roster=by_stable_id)
     if not context.citations and not no_citations:
         raise RecordError(f"cannot export: {data.root / 'cite'} holds no citation shard "
                           "(pass --no-citations to export without citation counts)")
@@ -177,6 +192,7 @@ def export_site(*, data: DataLayout, out_dir: Path, ids: Sequence[str] | None = 
     # set; a hidden model's roster row is listed as a text entry instead.
     records, hidden = drop_hidden(records) if shown_only else (records, Counter())
     publish_index.mark_diagrams(records)
+    publish_index.mark_shared_summaries(records)
     selected = {r["stable_id"]: selected[r["stable_id"]] for r in records}
     listed = publish_index.roster_index(
         roster_rows, models=models, exported=set(selected), packets=context.packets,
@@ -655,6 +671,18 @@ def _trace_fields(model: ModelRecord, current: Current, context: _Context, *,
     }
 
 
+def _without_duplicates(selected: dict[str, Any], roster_rows: Mapping[str, RosterRow]
+                        ) -> dict[str, Any]:
+    """Leave out a model whose roster row research typed ``duplicate_of`` a model that is itself
+    exported: one model, one page. A typed duplicate whose target has no page keeps its own."""
+
+    def target(stable_id: str) -> str | None:
+        row = roster_rows.get(stable_id)
+        return row.state.split(":", 1)[1] if row and row.state.startswith("duplicate_of:") else None
+
+    return {i: found for i, found in selected.items() if target(i) not in selected}
+
+
 def _paper_fields(model: ModelRecord, packet: Packet | None,
                   context: _Context) -> dict[str, Any]:
     """The introducing paper's fields, from the packet's citation and the citation snapshot."""
@@ -668,7 +696,7 @@ def _paper_fields(model: ModelRecord, packet: Packet | None,
     return {
         "paper_title": citation.title,
         "year": citecheck.year_of(citation.first_public),
-        "authors": list(citation.authors),
+        "authors": publish_names.author_names(citation.authors),
         "venue": publish_names.collapse_repeat(citation.venue),
         "bibtex": _bibtex(model, packet, context),
         "citations": {"count": count, "as_of": cited.at[:10]} if cited and count is not None
@@ -708,11 +736,20 @@ def _describe_fields(model: ModelRecord, describe: DescribeRecord) -> dict[str, 
         "tagline": describe.tagline if prose else None,
         "summary_markdown": describe.summary_markdown if prose else None,
         "key_contribution": describe.key_contribution if prose else None,
+        "member_note": _member_note(member) if prose else None,
         "keywords": list(describe.keywords),
         "field": describe.field,
         "output_type": (member.output_type if member else None) or describe.output_type,
         "labs": list(describe.labs),
     }
+
+
+def _member_note(member: MemberDescribe | None) -> str | None:
+    """What sets this model apart within its family (the summary describes the family). A note
+    in this pipeline's words ("this member") waits for its record to be written again."""
+
+    note = member.delta_markdown if member else ""
+    return note if note and not describe_text.PIPELINE_WORDS.search(note) else None
 
 
 def _sources(packet: Packet | None) -> dict[str, Any]:
@@ -747,9 +784,13 @@ def _source_url(model: ModelRecord, packet: Packet | None) -> str | None:
 
 
 def _license(model: ModelRecord, packet: Packet | None) -> str:
-    """Return the SPDX of the model's first code source's license, else of any, else unknown."""
+    """Return the SPDX of the model's first code source's license, else of any other code or
+    library source, else unknown. A paper's license (the arXiv distribution license, an
+    open-access CC license) says nothing about the code, so it is never the source license."""
 
-    licenses = [s for s in _sources(packet).values() if s.role == "license" and s.spdx]
+    sources = _sources(packet)
+    licenses = [s for s in sources.values() if s.role == "license" and s.spdx
+                and (s.of not in sources or sources[s.of].role != "paper")]
     first_code = next(iter(_code_order(model, packet)), None)
     chosen = next((s for s in licenses if s.of == first_code), licenses[0] if licenses else None)
     return chosen.spdx if chosen else "unknown"

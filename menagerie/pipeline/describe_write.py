@@ -66,8 +66,10 @@ ABSTRACTS = "MENAGERIE_DESCRIBE_ABSTRACTS"
 BASIS = {"full": "full", "abstract": "abstract", "docs": "docs", "readme-only": "readme",
          "none": "none"}
 SUMMARY_CHARS = (250, 4000)
+LONG_SUMMARY = 2000  # the prompt asks for at most 1,500; an earlier prompt's longer summary is written again
 QUOTE_WORDS = (3, 80)  # a grounding quote: at least three words, at most eighty
 COVER = 0.7  # a grounding sentence may stand for a longer split sentence only past this share
+NO_DRAFT = "the lane wrote no draft"
 DRAFT_FIELDS = ("domain", "field", "subfield", "task", "tasks", "modality", "modalities",
                 "modality_output", "output_type", "paradigm", "arch_class", "arch_subclass",
                 "is_generative", "tags", "keywords", "labs", "lineage", "members", "tagline",
@@ -168,6 +170,25 @@ def _member_findings(record: DescribeRecord, grounding: Sequence[Mapping[str, st
     return found
 
 
+def wording_findings(record: Mapping[str, Any]) -> list[str]:
+    """Reader-facing text (summary, key contribution, tagline, member notes) that uses a
+    promotional word or one of this pipeline's words; ``record`` is a record or draft as JSON."""
+
+    fields = {name: record.get(name) or "" for name in ("summary_markdown", "key_contribution",
+                                                        "tagline")}
+    for member, item in (record.get("members") or {}).items():
+        fields[f"member {member} delta"] = (item or {}).get("delta_markdown") or ""
+    found = []
+    for name, text in fields.items():
+        for label, pattern in (("promotional wording", describe_text.PROMOTIONAL),
+                               ("pipeline wording", describe_text.PIPELINE_WORDS)):
+            hit = pattern.search(text)
+            if hit:
+                found.append(f"{label} in {name}: {hit.group(0)!r} (say it literally; "
+                             "a model on the page is \"this model\" or its name)")
+    return found
+
+
 def _vocab_findings(record: DescribeRecord) -> list[str]:
     return [f"{name} {getattr(record, name)!r} is outside its vocabulary"
             for name in describe_jev.VOCAB_FIELDS
@@ -184,7 +205,7 @@ def verify(record: DescribeRecord, texts: Mapping[str, str], *, mode: str,
     found += _member_findings(record, grounding, member_ids)
     found += [f"lineage target id {item.target_id} does not resolve"
               for item in record.lineage if item.target_id and not resolves(item.target_id)]
-    found += _vocab_findings(record)
+    found += _vocab_findings(record) + wording_findings(to_dict(record))
     found += [f"lab {lab!r} is not named in any saved text" for lab in record.labs
               if not any(_norm(lab) in t for t in norm.values())]
     return found
@@ -252,7 +273,7 @@ def _settle(family: str, folder: Path, lane: Mapping[str, Any], *, data: DataLay
         facts = {**facts, "jev": _json(trial_values).get(family, {})}
     out = folder / "out" / f"{family}.json"
     if not out.is_file():
-        return None, ["the lane wrote no draft"]
+        return None, [NO_DRAFT]
     try:
         record = _record(_json(out), facts, family=family, prompt=lane["prompt"], resolver=resolver)
     except (RecordError, TypeError, ValueError, KeyError) as exc:
@@ -357,6 +378,12 @@ def _collect(folder: Path, lane: Mapping[str, Any], *, data: DataLayout, resolve
         results += [{"family": f, "verdict": "returned", "run": run, "findings": fs}
                     for f, fs in failing.items()]
         return results
+    if len(failing) == len(lane["families"]) and all(fs == [NO_DRAFT] for fs in failing.values()):
+        # Not one draft from either lane: the lane failed (a usage limit, a lost worker), which
+        # says nothing about the families. They stay without a record and come due again.
+        if write:
+            _dump(folder / "done.json", {"families": lane["families"], "lane_failed": True})
+        return [{"family": f, "verdict": "lane_failed", "findings": fs} for f, fs in failing.items()]
     for family, findings in failing.items():
         facts = _json(folder / "families" / family / "facts.json")
         draft = folder / "out" / f"{family}.json"
@@ -394,17 +421,21 @@ def _trial() -> set[str]:
 
 def due(families: Sequence[str] | None, *, data: DataLayout, tl: str) -> list[str]:
     """The families to describe: the given ones, else every validated family with a packet and no
-    describe record (or one a stronger text has reached since, ``_undescribed``): records that read
-    a text retired since first (they stopped publishing), then an abstract trial's families, then
-    those validated at ``tl`` before those validated only at an earlier pin, each oldest packet
-    first."""
+    describe record (or one a stronger text has reached or the prompt has outgrown since,
+    ``_undescribed``): records that read a text retired since first (they stopped publishing),
+    then an abstract trial's families, then those validated at ``tl`` before those validated only
+    at an earlier pin, each oldest packet first; records that only need rewording come last."""
 
     valid = _pins(data, tl)
     if families:
         return list(dict.fromkeys(f for f in families if f in valid))
     todo = [f for f in valid if data.packet(f).is_file() and _undescribed(f, data)]
     trial, redo = _trial(), {f for f in todo if _read_retired(f, data)}
-    return sorted(todo, key=lambda f: (f not in redo, f not in trial, valid[f] != tl,
+    # A record that is only being reworded keeps publishing meanwhile, so it waits behind every
+    # family that has no summary yet.
+    reword = {f for f in todo if f not in redo and data.describe(f).exists()
+              and _rewrite_only(_json(data.describe(f)))}
+    return sorted(todo, key=lambda f: (f not in redo, f not in trial, f in reword, valid[f] != tl,
                                        _json(data.packet(f)).get("written") or "", f))
 
 
@@ -431,12 +462,33 @@ def _undescribed(family: str, data: DataLayout) -> bool:
     if _read_retired(family, data):
         return True  # It read a text since retired: written again without it.
     record, packet = _json(path), _json(data.packet(family))
+    if _reworded(record):
+        return True
     found = describe_text.candidates(packet, abstracts=abstracts_for(family))
     basis = _basis(record)
     if basis is None:
         return bool(found)
     read, rank = set(record.get("inputs") or ()), describe_text.RANK[basis]
     return any(describe_text.RANK[kind] > rank and sid not in read for sid, kind in found.items())
+
+
+def _reworded(record: Mapping[str, Any]) -> bool:
+    """A record from an earlier prompt that the prompt in force would write differently: one
+    typed ungrounded with no draft read (its lane died or skipped it; tried again once per
+    prompt version), or one whose reader-facing text breaks the wording rules or runs far over
+    the asked length."""
+
+    if record.get("prompt") == prompt_version():
+        return False
+    draftless = record.get("class") == "describe:ungrounded" and record.get("by") == "describe"
+    return draftless or _rewrite_only(record)
+
+
+def _rewrite_only(record: Mapping[str, Any]) -> bool:
+    """A record whose text stands but reads badly: it breaks the wording rules or its summary is
+    far over the length the prompt asks for. Such families are written again last."""
+
+    return bool(wording_findings(record)) or len(record.get("summary_markdown") or "") > LONG_SUMMARY
 
 
 def _read_retired(family: str, data: DataLayout) -> bool:

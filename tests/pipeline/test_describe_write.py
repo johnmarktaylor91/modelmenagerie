@@ -259,6 +259,36 @@ def test_a_lane_the_hub_never_admitted_starts_again_without_spending_the_return(
     assert row["verdict"] == "grounded" and len(world["launches"]) == 2
 
 
+def test_a_lane_that_wrote_no_draft_at_all_types_nothing(tmp_path, world):
+    data = _data(tmp_path)
+    describe_write.write(["f-resnet"], data=data, store=world["store"])
+    world["runs"]["run-1"]["state"] = "TERMINAL"
+    assert describe_write.write(["f-resnet"], data=data, store=world["store"])[0]["verdict"] == "returned"
+    world["runs"]["run-2"]["state"] = "TERMINAL"
+    [row] = describe_write.write(["f-resnet"], data=data, store=world["store"])
+    assert (row["verdict"], row["findings"]) == ("lane_failed", ["the lane wrote no draft"])
+    assert not data.describe("f-resnet").exists()
+    assert describe_write.due(None, data=data, tl=TL) == ["f-resnet"]  # it comes due again
+
+
+def test_the_wording_rules_are_checked_and_an_earlier_prompts_record_reopens(tmp_path, world):
+    draft = _draft(tagline="A state-of-the-art classifier.",
+                   members={"m8839": {"delta_markdown": "This member has 18 layers."}})
+    assert [f.split(":")[0] for f in describe_write.wording_findings(draft)] == [
+        "promotional wording in tagline", "pipeline wording in member m8839 delta"]
+    assert describe_write.wording_findings(_draft()) == []
+    now = describe_write.prompt_version()
+    assert describe_write._reworded({**draft, "prompt": "0" * 8})
+    assert not describe_write._reworded({**draft, "prompt": now})  # the check in force passed it
+    assert not describe_write._reworded({**_draft(), "prompt": "0" * 8})
+    overlong = {**_draft(), "summary_markdown": "A sentence. " * 200}
+    assert describe_write._reworded({**overlong, "prompt": "0" * 8})  # far over the asked length
+    assert not describe_write._reworded({**overlong, "prompt": now})
+    draftless = {"class": "describe:ungrounded", "by": "describe"}
+    assert describe_write._reworded({**draftless, "prompt": "0" * 8})
+    assert not describe_write._reworded({**draftless, "prompt": now})  # once per prompt version
+
+
 def test_a_second_failure_types_the_record_ungrounded(tmp_path, world):
     data = _data(tmp_path)
     describe_write.write(["f-resnet"], data=data, store=world["store"])

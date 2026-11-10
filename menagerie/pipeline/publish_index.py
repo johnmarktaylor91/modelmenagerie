@@ -82,6 +82,19 @@ def mark_diagrams(records: Sequence[dict[str, Any]]) -> None:
         record["diagram_shared_with"] = users[default_svg[record["stable_id"]]] - 1
 
 
+def mark_shared_summaries(records: Sequence[dict[str, Any]]) -> None:
+    """Set ``summary_shared_with`` on every record, in place: how many other exported models
+    carry the same summary text. A describe record is written per family, so its summary
+    shows on every member's page; the site says so when the count is above zero."""
+
+    users: dict[str, int] = defaultdict(int)
+    for record in records:
+        if record.get("summary_markdown"):
+            users[record["summary_markdown"]] += 1
+    for record in records:
+        record["summary_shared_with"] = max(users[record.get("summary_markdown") or ""] - 1, 0)
+
+
 def _default_svg(record: Mapping[str, Any]) -> str:
     return next(v["svg"]["sha256"] for v in record["variants"]
                 if v["key"] == record["default_variant"])

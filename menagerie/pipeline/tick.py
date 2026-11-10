@@ -807,6 +807,29 @@ def _step_lane_stall(p: Pass) -> dict[str, Any]:
     return {"last_start": start.isoformat() if start else None, "sent": bool(text)}
 
 
+def _step_status_page(p: Pass) -> dict[str, Any]:
+    """Rewrite the generated status page from the worker's status counts when its standing
+    counts or its day changed (``counts.status_page``), and commit exactly that file: a roster
+    row a lane typed is in the page agents read within a pass or two, with no hub recount."""
+
+    from menagerie.pipeline import counts
+
+    repo = p.deps.repo(p.data)
+    found = counts.status_page(repo)
+    if "text" not in found:
+        return found
+    if p.dry_run:
+        return {"would_write": found["path"]}
+    path, body = repo / found["path"], found["text"].encode("utf-8")
+    with _owning(p, repo, keep=lambda rel: rel == found["path"]):
+        prior = written.peek(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body)
+        written.rewrote(path, prior, body)
+    commit = _commit_owned(p, repo, "docs: tick regenerated the status page from the worker's counts")
+    return {"written": found["path"], **({"commit": commit} if commit else {})}
+
+
 def _step_lane_reap(p: Pass) -> dict[str, Any]:
     """Reap the run-on checkouts of 2b lanes whose outputs the hub has ingested, whose lane
     results the ``lanes`` step has committed and which run-on holds for its failed grace
@@ -903,6 +926,7 @@ STEPS: tuple[tuple[str, tuple[str, ...], Callable[[Pass], Any]], ...] = (
     ("lane_stall", ("full",), _step_lane_stall),
     ("lanes", MODES, _step_lanes),
     ("lane_reap", MODES, _step_lane_reap),
+    ("status_page", ("full",), _step_status_page),
     ("axon", MODES, _step_axon),
 )
 
