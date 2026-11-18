@@ -708,7 +708,7 @@ def test_tick_reserves_big_rows_without_touching_g_when_off(data: DataLayout, tm
     path.write_text("m8839\n")
     cfg = {"worklist": str(path), "queue_spool": "spool-B", "queue_depth": 40, "big_runner": False}
     monkeypatch.setattr(drive, "next_steps", lambda ids, data: [{"id": sid, "step": "trace"} for sid in ids])
-    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: list(ids))
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: list(ids))
     seen = []
     monkeypatch.setattr(tick_full, "_waiting", lambda spool: seen.append(spool) or 0)
     _measured(data, "m8839", forward_mb=1024, trace_mb=32 * 1024)
@@ -739,7 +739,7 @@ def test_by_day_b_takes_one_big_row_while_its_queue_is_short(data: DataLayout, t
     cfg = {"worklist": str(path), "queue_spool": "spool-B", "queue_depth": 40, "big_runner": True,
            "big_on_b": {"rows": 1, "max_gib": 28}}
     monkeypatch.setattr(drive, "next_steps", lambda ids, data: [{"id": sid, "step": "trace"} for sid in ids])
-    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: list(ids))
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: list(ids))
     waiting = {"spool-B": 0}
     monkeypatch.setattr(tick_full, "_waiting", lambda spool: waiting.get(spool, 0))
     on_b: list[str] = []
@@ -808,7 +808,7 @@ def test_g_spool_failure_keeps_normal_queue_result(data: DataLayout, tmp_path: P
     path.write_text("m8839\n")
     cfg = {"worklist": str(path), "queue_spool": "spool-B", "queue_depth": 40, "big_runner": True}
     monkeypatch.setattr(drive, "next_steps", lambda ids, data: [{"id": sid, "step": "trace"} for sid in ids])
-    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: list(ids))
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: list(ids))
     monkeypatch.setattr(runner_job, "night_open", lambda: True)
     def waiting(spool: str) -> int:
         if spool.endswith("spool-G"):
@@ -827,7 +827,7 @@ def test_corrupt_g_metadata_keeps_regular_work_available(data: DataLayout, tmp_p
     path.write_text("m8839\n")
     cfg = {"worklist": str(path), "queue_spool": "spool-B", "queue_depth": 40, "big_runner": True}
     monkeypatch.setattr(drive, "next_steps", lambda ids, data: [{"id": sid, "step": "trace"} for sid in ids])
-    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: list(ids))
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: list(ids))
     monkeypatch.setattr(tick_full, "_waiting", lambda spool: 0)
     def corrupt() -> set[tuple[str, str]]:
         raise ValueError("corrupt request")

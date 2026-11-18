@@ -34,7 +34,7 @@ def data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> DataLayout:
     monkeypatch.setattr(drive, "next_steps", lambda ids, data: [
         {"id": i, "step": "render" if i == "m5" else "trace", "why": ""} for i in ids])
     monkeypatch.setattr(big_deferred, "_sizer", lambda data: lambda record: NEED[record.id])
-    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: [i for i in ids if i != "m4"])
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: [i for i in ids if i != "m4"])
     monkeypatch.setattr(big_deferred, "_axon_ids", lambda: {"m2"})
     monkeypatch.setattr(big_deferred, "_lane_held",
                         lambda ids, data: {i for i in ids if i == "m7"})
@@ -91,7 +91,7 @@ def test_g_room_is_free_spool_g_room_less_rows_still_waiting_for_g(
     monkeypatch.setattr(tick_full, "_steps", lambda ids, data, cfg: {"m1": "trace"})
     monkeypatch.setattr(tick_full, "_big_candidates",
                         lambda data, want, cfg=None: list(waiting["reserved"]))
-    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: list(ids))
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: list(ids))
     monkeypatch.setattr(tick_full, "_waiting", lambda spool: waiting["spool"])
     assert big_deferred.g_room(data, CFG) == 6
     waiting["reserved"] = ["a"] * 20

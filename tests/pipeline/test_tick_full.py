@@ -254,6 +254,8 @@ def test_rows_traced_at_their_revision_never_take_the_queue_s_room(
     monkeypatch.setattr(stage3, "_pending", lambda model_id, rev, open_: (
         "sent" if model_id == "m3" and open_ == ["m3-r1-1"] else None))
     assert tick_full._not_pending(["m1", "m2", "m3", "m4"], data) == ["m2"]
+    # G's queue re-runs traced rows (structure-only retries), so ``again`` keeps m1
+    assert tick_full._not_pending(["m1", "m2", "m3", "m4"], data, again=True) == ["m1", "m2"]
 
 
 def _bridge_heartbeat(
@@ -559,7 +561,7 @@ def test_stopped_cohort_is_not_newly_queued_for_forward_or_trace(work: Path,
     monkeypatch.setattr(drive, "next_steps", lambda ids, data: [
         {"id": i, "step": "trace"} for i in ids])
     monkeypatch.setattr(tick_full, "_waiting", lambda spool: 0)
-    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: list(ids))
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: list(ids))
     cfg = {**tick.DEFAULTS, "stopped_cohorts": ["r4-github"]}
     out = tick_full.stage3_queue(DataLayout(work / "data"), cfg, dry_run=True)
     assert out["would_queue"] == ["m1"] and out["eligible"] == 1
@@ -572,7 +574,7 @@ def test_a_row_a_live_lane_holds_waits_and_the_rest_still_queue(work: Path,
     monkeypatch.setattr(drive, "next_steps", lambda ids, data: [
         {"id": i, "step": "trace"} for i in ids])
     monkeypatch.setattr(tick_full, "_waiting", lambda spool: 0)
-    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: list(ids))
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: list(ids))
     monkeypatch.setattr(stage3, "lane_holds", lambda ids, data: {"m2": "run-1"})
     out = tick_full.stage3_queue(DataLayout(work / "data"), {**tick.DEFAULTS}, dry_run=True)
     assert out["would_queue"] == ["m1", "m3"] and out["held_by_lane"] == {"m2": "run-1"}
@@ -584,7 +586,7 @@ def test_rows_in_the_axon_batch_in_flight_stay_out_of_every_spool(work: Path,
     monkeypatch.setattr(drive, "next_steps", lambda ids, data: [
         {"id": i, "step": "trace"} for i in ids])
     monkeypatch.setattr(tick_full, "_waiting", lambda spool: 0)
-    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: list(ids))
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: list(ids))
     monkeypatch.setattr(tick_full, "_big_candidates", lambda data, want, cfg=None: ["m2", "m3"])
     monkeypatch.setattr(tick_full, "_big_dispatch", lambda data, cfg, big, dry_run: big)
     cfg = {**tick.DEFAULTS, "big_runner": True, "axon_holds": ["m2"]}

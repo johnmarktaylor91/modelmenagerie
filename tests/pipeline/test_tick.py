@@ -1239,7 +1239,7 @@ def test_stage3_queue_fills_the_spool_to_its_depth(work: Path, monkeypatch: pyte
     monkeypatch.setattr(drive, "next_steps", lambda ids, data: [
         {"id": i, "step": "forward" if int(i[1:]) % 2 else "2b"} for i in ids])
     monkeypatch.setattr(tick_full, "_waiting", lambda spool: 37)
-    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: [i for i in ids if i != "m1"])
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: [i for i in ids if i != "m1"])
     queued: list[list[str]] = []
     monkeypatch.setattr(stage3, "queue", lambda lane, data, ids, spool: queued.append(list(ids)) or ids)
     cfg = {**tick.DEFAULTS}
@@ -1733,7 +1733,7 @@ def test_axon_takes_open_g_rows_of_its_cohorts_and_its_batch_is_held_from_spools
 
     monkeypatch.setattr(tick_full, "_cohorts", lambda cfg: {"m1": "r4-github", "m2": "r3",
                                                             "m3": "r4-github"})
-    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data: [i for i in ids if i != "m3"])
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: [i for i in ids if i != "m3"])
     p = SimpleNamespace(cfg={}, data=None, state={},
                         results={"stage3_queue": {"big": {"reserved": ["m1", "m2", "m3"]}}})
     assert tick._axon_big(p, {"big_cohorts": ["r4-github"]}) == ["m1"]

@@ -208,14 +208,15 @@ def _repair_families(families: Sequence[str], data: DataLayout) -> list[str]:
             and implement.fabrications(read_json_cached(Packet, data.packet(f)), data, rows=rows)]
 
 
-def _not_pending(ids: Sequence[str], data: DataLayout) -> list[str]:
+def _not_pending(ids: Sequence[str], data: DataLayout, *, again: bool = False) -> list[str]:
     """The ids ``stage3.queue`` would take: a recipe, no job sent at its revision, and no eval
     trace at its revision and the TorchLens pin. Filtering the traced ones here keeps them from
-    filling the queue's room every pass only to be skipped there."""
+    filling the queue's room every pass only to be skipped there. ``again`` matches
+    ``stage3.queue(again=True)``, which re-runs traced rows: G's retry of structure-only rows."""
 
     from menagerie.pipeline import stage3
 
-    traced, open_ = stage3._traced(data), stage3.open_jobs()
+    traced, open_ = set() if again else stage3._traced(data), stage3.open_jobs()
     out = []
     for model_id in ids:
         path = data.model(model_id)
@@ -411,7 +412,7 @@ def _big_queue(data: DataLayout, cfg: Mapping[str, Any], want: Sequence[str], *,
     waiting = _waiting(spool)  # by day too: last night's unclaimed jobs still count as G's work
     if not runner_job.night_open():
         return {"reserved": reserved, "waiting": waiting, "skipped": "outside night window"}
-    chosen = _not_pending(reserved, data)[:max(0, int(cfg["queue_depth"]) - waiting)]
+    chosen = _not_pending(reserved, data, again=True)[:max(0, int(cfg["queue_depth"]) - waiting)]
     result = {"reserved": reserved, "waiting": waiting, "would_queue": chosen}
     if not dry_run and chosen:
         result["queued"] = stage3.queue(None, data=data, ids=chosen, spool=spool, again=True)
