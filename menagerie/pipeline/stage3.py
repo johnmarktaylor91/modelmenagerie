@@ -318,6 +318,75 @@ def _skip(record: ModelRecord, data: DataLayout, traced: set[tuple[str, str]]) -
     return f"already queued as {pending}" if pending else None
 
 
+# A worker defect (``infra:worker``: an exception escaped ``worker.run_request``) writes no ledger
+# row, so the member stays untraced and the tick would queue it again every pass, however
+# deterministic the defect (m18739, Nov 2026). After this many in a row at one recipe revision the
+# tick holds the member, retrying once per ``INFRA_RETRY_S``; a new revision releases it at once.
+INFRA_REPEATS = 3
+INFRA_RETRY_S = 24 * 3600
+
+
+def _worker_defect(done: Mapping[str, Any]) -> bool:
+    classes = str((done.get("table") or {}).get("trace_class") or "").split(";")
+    return not done.get("ledger") and "infra:worker" in classes
+
+
+def _ended(done: Mapping[str, Any]) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(done["ended"]).replace("Z", "+00:00"))
+    except (KeyError, ValueError):
+        return None
+
+
+def _defect_run(sid: str, rev: str, names: Sequence[str]) -> list[dict[str, Any]] | None:
+    """The last ``INFRA_REPEATS`` collected done files of ``sid`` at ``rev`` when all are worker
+    defects, else None."""
+
+    last = sorted((n for n in names if n.startswith(f"{sid}-{rev}-")),
+                  key=lambda n: n.split("-")[2])[-INFRA_REPEATS:]
+    if len(last) < INFRA_REPEATS:
+        return None
+    dones = [json.loads((_local("collected") / n).read_text(encoding="utf-8")) for n in last]
+    return dones if all(_worker_defect(d) for d in dones) else None
+
+
+def _hold_reason(sid: str, names: Sequence[str], data: DataLayout, at: datetime) -> str | None:
+    """Why the tick holds ``sid`` (its collected done files ``names``), else None."""
+
+    record = read_json(ModelRecord, data.model(sid))
+    if record.recipe is None:
+        return None
+    rev = record.recipe.rev
+    dones = _defect_run(sid, rev, names)
+    if dones is None:
+        return None
+    ended = _ended(dones[-1])
+    if ended is not None and (at - ended).total_seconds() >= INFRA_RETRY_S:
+        return None  # the daily retry
+    msg = str((dones[-1].get("table") or {}).get("msg") or "")[:120]
+    return (f"{INFRA_REPEATS} worker defects in a row at recipe {rev}, "
+            f"last {dones[-1].get('ended')}: {msg}")
+
+
+def infra_looping(ids: Sequence[str], data: DataLayout, *,
+                  at: datetime | None = None) -> dict[str, str]:
+    """The members of ``ids`` the tick should not queue this pass, each with why: their last
+    ``INFRA_REPEATS`` collected results (``work_dir("stage3")/collected``) at the record's current
+    recipe revision were all worker defects with no ledger row, the newest under
+    ``INFRA_RETRY_S`` ago. One listing of the collected folder; records and done files are read
+    only for members with that many collected results."""
+
+    wanted, runs = set(ids), {}
+    for entry in os.scandir(_local("collected")):
+        sid = entry.name.split("-", 1)[0]
+        if sid in wanted and entry.name.endswith(".json"):
+            runs.setdefault(sid, []).append(entry.name)
+    at = at or datetime.now(timezone.utc)
+    reasons = {sid: _hold_reason(sid, names, data, at) for sid, names in runs.items()
+               if len(names) >= INFRA_REPEATS}
+    return {sid: why for sid, why in reasons.items() if why}
+
+
 # A trace peak measured at an older TorchLens pin sizes a trace at the current pin at this
 # factor, when the row has no peak measured at the pin (Lead, decisions.md 2026-11-07: 3.0.2
 # peaked at a median 0.55x of 2.x on 41 rows run under both). The memory_cap ladder is the backstop.

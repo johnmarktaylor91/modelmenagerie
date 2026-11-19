@@ -452,6 +452,41 @@ def test_queue_skips_a_member_traced_at_its_revision_unless_again(
     assert len(stage3.queue(None, data=data, ids=["m8839"], spool=spool, again=True)) == 1
 
 
+def _collected(sid: str, rev: str, stamp: str, *, trace_class: str = "infra:worker",
+               ledger: tuple[str, ...] = (), ended: str = "2026-11-19T02:50:36Z") -> None:
+    name = f"{sid}-{rev}-{stamp}-abcd"
+    done = {"schema": stage3.DONE_SCHEMA, "name": name, "id": sid, "rev": rev, "outcome": "done",
+            "ended": ended, "ledger": list(ledger),
+            "table": {"trace": "trace:infra", "trace_class": trace_class,
+                      "msg": "ModuleNotFoundError: No module named 'scipy'"}}
+    (stage3._local("collected") / f"{name}.json").write_text(json.dumps(done), encoding="utf-8")
+
+
+def test_three_worker_defects_in_a_row_at_a_revision_hold_the_member_for_a_day(
+        data: DataLayout) -> None:
+    from datetime import datetime, timezone
+
+    rev = read_json(ModelRecord, data.model("m8839")).recipe.rev
+    at = datetime(2026, 11, 19, 3, 0, tzinfo=timezone.utc)
+    _collected("m8839", rev, "20261119t023021z")
+    _collected("m8839", rev, "20261119t024021z")
+    assert stage3.infra_looping(["m8839", "m9001"], data, at=at) == {}  # two are not a loop
+    _collected("m8839", "0" * 12, "20261119t024521z")  # another revision never counts
+    _collected("m8839", rev, "20261119t025026z")
+    held = stage3.infra_looping(["m8839", "m9001"], data, at=at)
+    assert list(held) == ["m8839"] and "scipy" in held["m8839"] and rev in held["m8839"]
+    # a day after the newest defect it is tried once more
+    assert stage3.infra_looping(["m8839"], data,
+                                at=datetime(2026, 11, 20, 3, 0, tzinfo=timezone.utc)) == {}
+    # a result that wrote a row, or any other class, ends the run of defects
+    _collected("m8839", rev, "20261119t025526z", trace_class="infra:timeout")
+    assert stage3.infra_looping(["m8839"], data, at=at) == {}
+    _collected("m8839", rev, "20261119t025926z")
+    _collected("m8839", rev, "20261119t030026z", ledger=('{"id": "m8839"}',))
+    _collected("m8839", rev, "20261119t030126z")
+    assert stage3.infra_looping(["m8839"], data, at=at) == {}
+
+
 # --- serve (worker) and collect (hub) ---------------------------------------------------------
 
 

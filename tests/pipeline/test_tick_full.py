@@ -580,6 +580,19 @@ def test_a_row_a_live_lane_holds_waits_and_the_rest_still_queue(work: Path,
     assert out["would_queue"] == ["m1", "m3"] and out["held_by_lane"] == {"m2": "run-1"}
 
 
+def test_a_row_looping_on_worker_defects_is_held_and_named(work: Path,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    from menagerie.pipeline import stage3
+    (work / "worklist.txt").write_text("m1 r3\nm2 r3\n")
+    monkeypatch.setattr(drive, "next_steps", lambda ids, data: [
+        {"id": i, "step": "trace"} for i in ids])
+    monkeypatch.setattr(tick_full, "_waiting", lambda spool: 0)
+    monkeypatch.setattr(tick_full, "_not_pending", lambda ids, data, again=False: list(ids))
+    monkeypatch.setattr(stage3, "infra_looping", lambda ids, data: {"m2": "3 worker defects"})
+    out = tick_full.stage3_queue(DataLayout(work / "data"), {**tick.DEFAULTS}, dry_run=True)
+    assert out["would_queue"] == ["m1"] and out["infra_held"] == {"m2": "3 worker defects"}
+
+
 def test_rows_in_the_axon_batch_in_flight_stay_out_of_every_spool(work: Path,
                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
     (work / "worklist.txt").write_text("m1 r3\nm2 r4-github\nm3 r3\n")

@@ -262,8 +262,11 @@ def stage3_queue(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> 
     # A row a live lane still holds (a mini lane waiting for its relay ingest) would make
     # stage3.queue refuse the whole batch; it waits for a later pass instead.
     held = stage3.lane_holds(candidates, data) if candidates else {}
-    chosen = [i for i in candidates if i not in held][:room]
+    # A row whose worker keeps failing with a defect at its revision is held, not queued forever.
+    looping = stage3.infra_looping(candidates, data) if candidates else {}
+    chosen = [i for i in candidates if i not in held and i not in looping][:room]
     result = {"eligible": len(want), "waiting": waiting, **({"held_by_lane": held} if held else {}),
+              **({"infra_held": looping} if looping else {}),
               **({"big_on_b": lent} if lent else {})}
     if dry_run or not chosen:
         result = {**result, "would_queue": chosen}
