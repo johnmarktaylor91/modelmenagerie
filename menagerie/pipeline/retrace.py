@@ -4,7 +4,8 @@ into runner B's spool while it has nothing else to do.
 The rows are listed one id per line in ``todo.txt`` under the feed's folder (default the work
 root's ``retrace/``). A full tick pass feeds the next ``batch`` (default 8) through ``stage3
 queue --again`` only when runner B's step ended ``ok`` this pass, that pass's ``stage3_queue``
-queued no live rows and was not held, B's spool has nothing waiting, and no worker pause is set
+queued no live rows and was not held, B's spool has nothing it can claim now waiting (a GPU-only
+job held for the GPU window does not count), and no worker pause is set
 (``hold``). Fed ids leave ``todo.txt`` and are appended to ``queued.txt`` (``<id>\\tqueued`` or
 ``skipped`` when ``stage3 queue`` took none of its jobs); ids a live lane holds wait for a later
 batch. The tick config's ``retrace`` (``{"enabled": true, "batch": 8, "folder": <path>}``)
@@ -90,7 +91,7 @@ def feed(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool,
         return {"left": 0}
     which = {"list": PIN_LIST} if todo_path.name == PIN_LIST else {}
     spool = cfg.get("queue_spool") or SPOOL
-    queued_now = (waiting or tick_full._waiting)(spool)
+    queued_now = (waiting or tick_full._claimable)(spool)
     if queued_now:
         return {"held": f"spool B has {queued_now} waiting", "left": len(todo), **which}
     head = todo[:conf["batch"] * LOOKAHEAD]

@@ -236,6 +236,25 @@ def _waiting(spool: str) -> int:
     return sum(1 for n in listing.decode().split() if n.endswith(".json"))
 
 
+def _claimable(spool: str) -> int:
+    """Jobs in a spool's ``new/`` its runner can claim now.
+
+    A GPU-only job (``"part": "gpu"``) waits unclaimed while the GPU window is shut
+    (``stage3._held``), so outside the window it is not counted: the re-trace feed would
+    otherwise hold all day behind it.
+    """
+
+    from menagerie.pipeline import stage3
+    from menagerie.pipeline.worker import in_gpu_window
+
+    if in_gpu_window():
+        return _waiting(spool)
+    source = stage3.Spool.named(spool)
+    listing = source._sh(f"cd {source._dir('new')} 2>/dev/null && "
+                         "grep -L '\"part\": \"gpu\"' -- *.json 2>/dev/null || true")
+    return sum(1 for n in listing.decode().split() if n.endswith(".json"))
+
+
 def stage3_queue(data: DataLayout, cfg: Mapping[str, Any], *, dry_run: bool) -> dict[str, Any]:
     """Queue worklist rows whose next step is a forward pass or trace, up to the spool's depth."""
 

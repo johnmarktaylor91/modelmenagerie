@@ -755,3 +755,18 @@ def test_a_family_whose_last_lane_left_its_2b_rows_untouched_is_not_relaunched(
     (lane / "deferred.json").unlink()
     os.utime(lane / "BRIEF.result.md", (1_500, 1_500))  # a result from an earlier lane
     assert tick_full.top_up(data, cfg, dry_run=True)["2b"] == ["f-m0", "f-m1"]
+
+
+def test_claimable_skips_gpu_jobs_while_the_window_is_shut(tmp_path: Path, monkeypatch) -> None:
+    from menagerie.pipeline import worker
+
+    new = tmp_path / "spool" / "stage3" / "new"
+    new.mkdir(parents=True)
+    (new / "a.json").write_text(json.dumps({"part": "gpu"}, sort_keys=True))
+    (new / "b.json").write_text(json.dumps({"part": "all"}, sort_keys=True))
+    monkeypatch.delenv("MENAGERIE_RUNNER_HOST", raising=False)
+    monkeypatch.setattr(worker, "in_gpu_window", lambda at=None: False)
+    assert tick_full._claimable(str(tmp_path / "spool")) == 1
+    monkeypatch.setattr(worker, "in_gpu_window", lambda at=None: True)
+    assert tick_full._claimable(str(tmp_path / "spool")) == 2
+    assert tick_full._claimable(str(tmp_path / "none")) == 0
