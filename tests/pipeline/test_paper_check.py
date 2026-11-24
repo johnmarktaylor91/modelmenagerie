@@ -194,3 +194,16 @@ def test_a_paper_find_whose_paper_names_another_family_is_undone(roots, monkeypa
     assert paper_check.retired(packet) >= {"p-cited", "bib-openalex-1"}
     monkeypatch.setattr(paper_texts, "_textless", lambda family, data: True)
     assert paper_texts._unidentified(None, data, {}) == []
+
+
+@pytest.mark.parametrize("family, text", [
+    ("hep-jet-transformer", "LorentzNet [hep-ph] 2201.08187 An efficient Lorentz group equivariant network"),
+    ("surface_normal_uncertainty", "Methane emissions from super-emitting coal mines: surface flux uncertainty"),
+])
+def test_subject_classes_and_common_words_never_name_a_family(family, text):
+    assert not paper_check.matches(paper_check.tokens([family]), text)
+
+
+def test_a_joined_name_still_matches_its_paper():
+    text = "Estimating and exploiting the aleatoric uncertainty in surface normal estimation"
+    assert paper_check.matches(paper_check.tokens(["surface_normal_uncertainty"]), text)

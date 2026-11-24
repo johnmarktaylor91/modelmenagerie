@@ -244,27 +244,53 @@ def _texts(packet: Mapping[str, Any], folder: Path, store: StoreLayout, *,
     return texts
 
 
+def _title_key(title: str) -> str:
+    return "".join(re.sub(r"[^a-z0-9]+", " ", title.lower()).split())
+
+
+def _same_title(cited: str, other: str) -> bool:
+    """The cited title and a record's, compared on letters and digits only; a subtitle one side
+    lacks still matches when the shared start runs 20 characters or more."""
+
+    a, b = _title_key(cited), _title_key(other)
+    return bool(a and b) and (a == b or (min(len(a), len(b)) >= 20 and (a.startswith(b) or b.startswith(a))))
+
+
 def institutions(packet: Mapping[str, Any], folder: Path, store: StoreLayout
                  ) -> tuple[list[str], str | None]:
-    """Institutions named by the saved OpenAlex record's authorships, in order, and its sid."""
+    """Institutions named by the authorships of the saved OpenAlex record whose title is the
+    packet's cited title, in order, and its sid. A packet often holds records of papers it
+    rejected or that merely cite the family, so the first OpenAlex record is never assumed; a
+    retired source (``paper_check.retired``) is never read, and no cited title gives nothing."""
 
-    bib = next((s for s in packet.get("sources", []) if s.get("role") == "bib"
-                and s.get("api") == "openalex" and s.get("blob") and readable_sid(s["sid"])), None)
-    if bib is None:
+    cited = str((packet.get("citation") or {}).get("title") or "")
+    if not cited:
         return [], None
-    try:
-        path = store_mod.materialize(bib["blob"], folder / "source" / f"{bib['sid']}.json",
-                                     store=store)
-        record = _read_json(path)
-    except Exception:  # noqa: BLE001  (an unreadable record adds nothing)
-        return [], None
+    gone = paper_check.retired_raw(packet)
+    for bib in packet.get("sources", []):
+        if not (bib.get("role") == "bib" and bib.get("api") == "openalex" and bib.get("blob")
+                and readable_sid(bib["sid"]) and bib["sid"] not in gone):
+            continue
+        try:
+            path = store_mod.materialize(bib["blob"], folder / "source" / f"{bib['sid']}.json",
+                                         store=store)
+            record = _read_json(path)
+        except Exception:  # noqa: BLE001  (an unreadable record adds nothing)
+            continue
+        if not _same_title(cited, str(record.get("title") or record.get("display_name") or "")):
+            continue
+        return _institution_names(record), bib["sid"]
+    return [], None
+
+
+def _institution_names(record: Mapping[str, Any]) -> list[str]:
     names: list[str] = []
     for authorship in record.get("authorships") or []:
         for inst in authorship.get("institutions") or []:
             name = inst.get("display_name")
             if name and name not in names:
                 names.append(name)
-    return names, bib["sid"]
+    return names
 
 
 def _era(packet: Mapping[str, Any], members: Sequence[Mapping[str, Any]]) -> str | None:

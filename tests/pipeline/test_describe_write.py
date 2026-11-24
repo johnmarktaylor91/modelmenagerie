@@ -38,7 +38,7 @@ PAPER = ("Deep Residual Learning for Image Recognition. We present a residual le
          "layer inputs. On the ImageNet dataset we evaluate residual nets with a depth of up to 152 "
          "layers. This work was done at the Visual Computing Group. It builds on the VGG nets and "
          "on BEiT in spirit.")
-OPENALEX = {"authorships": [{"author": {"display_name": "Kaiming He"},
+OPENALEX = {"title": "Deep Residual Learning for Image Recognition", "authorships": [{"author": {"display_name": "Kaiming He"},
                              "institutions": [{"display_name": "Microsoft Research"}]},
                             {"author": {"display_name": "Jian Sun"},
                              "institutions": [{"display_name": "Microsoft Research"}]}]}
@@ -806,3 +806,24 @@ def test_a_worker_lane_whose_agent_never_started_starts_again_without_the_return
     [row] = describe_write.write(None, data=data, store=world["store"])
     assert (row["verdict"], row["run"]) == ("relaunched", "wrun-2")
     assert started[1]["brief"].name == "BRIEF.md" and not (started[1]["brief"].parent / "BRIEF-r2.md").exists()
+
+
+def test_institutions_come_from_the_record_of_the_cited_paper(tmp_path, monkeypatch):
+    from menagerie.pipeline import describe_text
+
+    records = {"a" * 64: {"title": "A Hamming-Like Bound for Degenerate Stabilizer Codes",
+                          "authorships": [{"institutions": [{"display_name": "Duke University"}]}]},
+               "b" * 64: {"display_name": "Solving high-dimensional PDEs with latent spectral models",
+                          "authorships": [{"institutions": [{"display_name": "Tsinghua University"}]}]}}
+
+    def materialize(sha, dest, *, store):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(records[sha]))
+        return dest
+
+    monkeypatch.setattr(describe_text.store_mod, "materialize", materialize)
+    packet = {"citation": {"title": "Solving High-Dimensional PDEs with Latent Spectral Models"},
+              "sources": [{"sid": "bib-openalex-1", "role": "bib", "api": "openalex", "blob": "a" * 64},
+                          {"sid": "bib-openalex-2", "role": "bib", "api": "openalex", "blob": "b" * 64}]}
+    assert describe_text.institutions(packet, tmp_path, None) == (["Tsinghua University"], "bib-openalex-2")
+    assert describe_text.institutions({**packet, "citation": None}, tmp_path, None) == ([], None)

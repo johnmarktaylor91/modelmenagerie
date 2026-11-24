@@ -50,6 +50,9 @@ GENERIC = frozenset({
     "wongkinyiu", "facebook", "google", "microsoft", "nvidia", "openai", "huggingface",
     "encoder", "decoder", "head", "backbone", "block", "layer", "module", "classifier", "generator",
     "discriminator", "pretrained", "giant", "huge", "benchmark", "reference", "driven", "sphere",
+    "surface",
+    # arXiv subject-class words: a text's opening carries its class ("[hep-ph]"), never a name.
+    "hep", "astro", "cond", "math", "stat", "physics", "nlin", "nucl", "eess", "econ", "quant",
 })
 VARIANT = re.compile(r"(?:v\d+|x\d+|\d+[a-z]?)$")
 
