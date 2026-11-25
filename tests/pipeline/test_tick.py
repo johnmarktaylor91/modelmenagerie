@@ -71,6 +71,15 @@ def test_hysteresis_holds_between_pause_and_resume_then_resumes_at_72_without_a_
     assert states[-1].fact_sent_since is None
 
 
+def test_a_disk_hovering_at_the_pause_line_sends_one_paused_fact_a_day() -> None:
+    states, sent = _run([_gib(61.9), _gib(72.5), _gib(61.5), _gib(73), _gib(61.8)],
+                        step=timedelta(hours=1))
+    assert [s.state for s in states] == ["paused", "ok", "paused", "ok", "paused"]
+    assert [len(m) for m in sent] == [1, 0, 0, 0, 0]
+    next_day, msgs = decide(states[-2], _gib(61), now=T0 + timedelta(days=1), cfg=Config())
+    assert next_day.state == "paused" and len(msgs) == 1
+
+
 def test_critical_holds_the_drain_and_escalates_once_a_day() -> None:
     states, sent = _run([_gib(49), _gib(48), _gib(48)], step=timedelta(hours=2))
     assert all(s.state == "critical" and s.held("drain") for s in states)

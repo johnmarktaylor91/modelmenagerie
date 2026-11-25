@@ -105,6 +105,7 @@ class State:
     read_at: str | None = None
     fact_sent_since: str | None = None
     escalated_on: str | None = None  # the date of the last critical escalation
+    paused_fact_on: str | None = None  # the date of the last paused FACT (one a day)
     reader_failures: int = 0
 
     @classmethod
@@ -166,8 +167,9 @@ def _read(prev: State, reading: Reading, now: datetime, cfg: Config) -> State:
 
 
 def _facts(prev: State, new: State, today: str, cfg: Config) -> tuple[State, list[str]]:
-    """One FACT per entry to a held state (none when easing from critical to paused), and one
-    escalation a day while critical."""
+    """One FACT per entry to a held state, but at most one paused FACT a day (free disk that
+    hovers at the pause line re-enters it several times a day) and none when easing from
+    critical to paused; and one escalation a day while critical."""
 
     if new.state == "ok":
         return replace(new, fact_sent_since=None), []
@@ -179,6 +181,10 @@ def _facts(prev: State, new: State, today: str, cfg: Config) -> tuple[State, lis
     new = replace(new, fact_sent_since=new.since)
     if new.state == "critical":
         new = replace(new, escalated_on=today)
+    elif new.state == "paused":
+        if new.paused_fact_on == today:
+            return new, []
+        new = replace(new, paused_fact_on=today)
     return new, [_message(new, cfg)]
 
 
