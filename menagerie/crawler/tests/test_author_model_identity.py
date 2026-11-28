@@ -18,9 +18,9 @@ These tests pin the repaired contract:
    flags the disagreement; artifacts without an attestation (history, cache
    rehydration) keep the stamped self-report unrewritten;
 3. the frozen tier bindings agree everywhere they are spelled: the tier map,
-   the partitioner specs, and the driver default all name ``claude-fable-5-1``
-   for c1-mech (standing directive, 2026-08-11; ``claude-opus-5`` is the
-   designated fallback tier);
+   the partitioner specs, and the driver default all name ``claude-opus-5-5``
+   for c1-mech (JMT 2026-11-27, d-82ab1ba7: Opus 5.5 is the fleet default;
+   ``claude-fable-5-1`` held the binding from 2026-09-01);
 4. the author prompt's identity line is model-neutral, so the prompt can never
    again prime a self-report that contradicts the launch configuration.
 """
@@ -39,7 +39,10 @@ import pytest
 # import order, so this module is runnable on its own.
 from menagerie.crawler import driver as _driver  # noqa: F401
 from menagerie.crawler.author_executor import RECEIPT_VERSION, main
-from menagerie.crawler.constants import TIER_CAMPAIGN_AUTHOR_MODELS
+from menagerie.crawler.constants import (
+    TIER_CAMPAIGN_AUTHOR_MODEL_HISTORY,
+    TIER_CAMPAIGN_AUTHOR_MODELS,
+)
 from menagerie.crawler.driver_contracts import DriverConfig, WorkItem
 from menagerie.crawler.driver_models import (
     AUTHOR_MODEL_MISMATCH_FLAG,
@@ -307,19 +310,19 @@ def test_both_record_assemblers_share_the_one_provenance_resolver() -> None:
 
 
 @pytest.mark.smoke
-def test_the_frozen_tier_bindings_name_fable_for_c1_mech() -> None:
-    """Standing directive (JMT 2026-08-11): smartest Claudes for the crawl.
+def test_the_frozen_tier_bindings_name_opus_5_5_for_c1_mech() -> None:
+    """JMT 2026-11-27 (d-82ab1ba7): Opus 5.5 is the default across the fleet.
 
-    c1-mech is bound to ``claude-fable-5-1``; ``claude-opus-5`` remains the
-    c3-classics tier and the designated fallback if Fable throughput binds
-    (MASTER_DOCKET Appendix 1, call 1). The closed-set semantics are untouched:
-    exactly these four campaigns, each frozen to exactly one model.
+    c1-mech is bound to ``claude-opus-5-5`` (``claude-fable-5-1`` from
+    2026-09-01, kept in the author history); ``claude-opus-5`` remains the
+    c3-classics tier. The closed-set semantics are untouched: exactly these
+    four campaigns, each frozen to exactly one model.
     """
 
     from menagerie.crawler.partitioner import CAMPAIGN_SPECS
 
     assert TIER_CAMPAIGN_AUTHOR_MODELS == {
-        "c1-mech": "claude-fable-5-1",
+        "c1-mech": "claude-opus-5-5",
         "c2-disco": "claude-sonnet",
         "c3-classics": "claude-opus-5",
         "c4-native": "claude-sonnet",
@@ -327,7 +330,11 @@ def test_the_frozen_tier_bindings_name_fable_for_c1_mech() -> None:
     assert TIER_CAMPAIGN_AUTHOR_MODELS == {
         spec.campaign_id: spec.author_model for spec in CAMPAIGN_SPECS
     }
-    assert DriverConfig().author_model == "claude-fable-5-1"
+    assert DriverConfig().author_model == "claude-opus-5-5"
+    assert TIER_CAMPAIGN_AUTHOR_MODEL_HISTORY["c1-mech"][-2:] == (
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+    )
 
 
 @pytest.mark.smoke

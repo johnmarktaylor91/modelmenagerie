@@ -4535,7 +4535,7 @@ class CommandCheckerLane:
         """Declare the cross-model K=2 CONFIRMATION identity for this kind.
 
         Seat swap (2026-09-01): the confirmation seat is the OTHER provider
-        (``gpt-5.6-sol`` under ``openai`` against the Fable primary), so the
+        (``gpt-5.6-sol`` under ``openai`` against the Anthropic primary), so the
         two blind sessions of a K=2 pair never share a model. The conflict
         ledger's pairing rule re-derives this from the seat table on every
         row; this declaration is what the lane BUYS, the rule is what the

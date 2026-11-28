@@ -114,8 +114,8 @@ CAMPAIGN_SPECS: tuple[CampaignSpec, ...] = (
         # and the most common answer, not a property every member satisfies.
         workload_class="library-first-residual",
         phase="pytorch",
-        author_model="claude-fable-5-1",
-        checker_model="claude-fable-5-1",
+        author_model="claude-opus-5-5",
+        checker_model="claude-opus-5-5",
         review_checkpoint_at=REVIEW_COHORT_SIZE,
     ),
     CampaignSpec(
@@ -123,7 +123,7 @@ CAMPAIGN_SPECS: tuple[CampaignSpec, ...] = (
         workload_class="discovered-pytorch",
         phase="pytorch",
         author_model="claude-sonnet",
-        checker_model="claude-fable-5-1",
+        checker_model="claude-opus-5-5",
         review_checkpoint_at=0,
     ),
     CampaignSpec(
@@ -131,7 +131,7 @@ CAMPAIGN_SPECS: tuple[CampaignSpec, ...] = (
         workload_class="unregistered-classics-and-family-companions",
         phase="pytorch",
         author_model="claude-opus-5",
-        checker_model="claude-fable-5-1",
+        checker_model="claude-opus-5-5",
         review_checkpoint_at=0,
     ),
     CampaignSpec(
@@ -139,7 +139,7 @@ CAMPAIGN_SPECS: tuple[CampaignSpec, ...] = (
         workload_class="discovered-tensorflow-jax-keras",
         phase="native-tail",
         author_model="claude-sonnet",
-        checker_model="claude-fable-5-1",
+        checker_model="claude-opus-5-5",
         review_checkpoint_at=0,
     ),
 )

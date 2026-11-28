@@ -177,16 +177,17 @@ def test_campaign_manifest_binds_models_partitions_and_intakes() -> None:
     manifest_path = _RECORDS_ROOT / "campaigns.json"
     bindings = load_campaign_bindings(manifest_path)
     expected_models = {
-        # Seat swap (SEAT_RULING.md 2026-09-01): claude-fable-5-1 is the primary
-        # checker seat on every campaign; gpt-5.6-sol stays the K=2 confirmation
-        # seat and the DriverConfig default (same-identity test lanes).
-        "c1-mech": ("claude-fable-5-1", "claude-fable-5-1"),
-        "c2-disco": ("claude-sonnet", "claude-fable-5-1"),
-        "c3-classics": ("claude-opus-5", "claude-fable-5-1"),
-        "c4-native": ("claude-sonnet", "claude-fable-5-1"),
+        # Seat move (JMT 2026-11-27, d-82ab1ba7): claude-opus-5-5 is the primary
+        # checker seat on every campaign and the c1-mech author (claude-fable-5-1
+        # from 2026-09-01); gpt-5.6-sol stays the K=2 confirmation seat and the
+        # DriverConfig default (same-identity test lanes).
+        "c1-mech": ("claude-opus-5-5", "claude-opus-5-5"),
+        "c2-disco": ("claude-sonnet", "claude-opus-5-5"),
+        "c3-classics": ("claude-opus-5", "claude-opus-5-5"),
+        "c4-native": ("claude-sonnet", "claude-opus-5-5"),
     }
 
-    assert DriverConfig().author_model == "claude-fable-5-1"
+    assert DriverConfig().author_model == "claude-opus-5-5"
     assert DriverConfig().checker_model == "gpt-5.6-sol"
     assert {
         binding.spec.campaign_id: (
@@ -251,7 +252,7 @@ def test_refresh_campaign_manifest_reprojects_specs_and_preserves_bindings(
     )
     assert c1.projection_drift == ("author_model", "checker_model", "phase")
     assert dict(c1.recorded_projection)["checker_model"] == "gpt-5.6-terra"
-    assert c1.spec.checker_model == "claude-fable-5-1"
+    assert c1.spec.checker_model == "claude-opus-5-5"
     with pytest.raises(CampaignPartitionError, match="projections have drifted"):
         load_campaign_bindings(manifest_path, require_current_projection=True)
 
@@ -293,8 +294,8 @@ def test_refresh_campaign_manifest_reprojects_specs_and_preserves_bindings(
         for row in json.loads(manifest_path.read_text(encoding="utf-8"))["campaigns"]
         if row["campaign_id"] == "c1-mech"
     )
-    assert rotated_c1["author_model"] == "claude-fable-5-1"
-    assert rotated_c1["checker_model"] == "claude-fable-5-1"
+    assert rotated_c1["author_model"] == "claude-opus-5-5"
+    assert rotated_c1["checker_model"] == "claude-opus-5-5"
     # The committed manifest already carries its own truthful supersession
     # history (the 2026-09-01 fable -> fable-5.1 rotation); the injected stale
     # bindings append AFTER it, never overwrite it.

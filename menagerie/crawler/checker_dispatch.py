@@ -1309,7 +1309,7 @@ class CheckerBackoffSignal:
     provider:
         Closed usage-limit provider vocabulary member owning the pause: the
         provider of the seated checker model the paused session ran under
-        (``anthropic`` for the Fable primary seat, ``openai`` for the sol
+        (``anthropic`` for the Anthropic primary seat, ``openai`` for the sol
         confirmation seat). Explicit rather than assumed by the scheduler; the
         default is the pre-swap era value.
     """
@@ -3150,7 +3150,7 @@ def _build_envelope(
             # DERIVED from the seated model (seat swap, 2026-09-01): the
             # provider is never a caller declaration. `openai` for the sol
             # confirmation seat and every pre-swap label, `anthropic` for the
-            # Fable primary; the wrapper re-derives and refuses a mismatch.
+            # Anthropic primary; the wrapper re-derives and refuses a mismatch.
             "provider": checker_provider_for_model(checker_model),
             "model": checker_model,
             "version": checker_version,

@@ -5,8 +5,9 @@ Codex wrapper: ``checker.provider`` was the literal ``"openai"`` at envelope
 build, refused otherwise at wrapper preflight, and the argv, the failure
 classifier, the token accounting, and the final-message transport were all
 Codex-shaped. The 2026-09-01 seat ruling (``SEAT_RULING.md``, tl-checkerbench)
-seats ``claude-fable-5-1`` as the PRIMARY checker on every gate kind with
-``gpt-5.6-sol`` as the cross-model K=2 confirmation seat, so the wrapper now
+seated ``claude-fable-5-1`` as the PRIMARY checker on every gate kind with
+``gpt-5.6-sol`` as the cross-model K=2 confirmation seat (the primary moved to
+``claude-opus-5-5`` on 2026-11-27, JMT d-82ab1ba7), so the wrapper now
 selects ONE adapter per session from the provider the envelope's seated model
 DERIVES (:func:`menagerie.crawler.constants.checker_provider_for_model`).
 

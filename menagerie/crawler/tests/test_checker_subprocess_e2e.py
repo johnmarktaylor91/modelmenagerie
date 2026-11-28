@@ -22,12 +22,17 @@ from pathlib import Path
 
 import pytest
 
+from menagerie.crawler.checker_calibration import (
+    CHECKER_ACTIVATION_ENV,
+    CHECKER_ACTIVATION_SCHEMA,
+    live_checker_prompt_identity,
+)
 from menagerie.crawler.checker_dispatch import (
     CheckerDispatchError,
     compute_result_envelope_sha256,
     validate_checker_result,
 )
-from menagerie.crawler.constants import GATE_SCHEMA_VERSION_V3
+from menagerie.crawler.constants import GATE_SCHEMA_VERSION_V3, GateKind
 from menagerie.crawler.driver_admission import CommandCheckerLane
 from menagerie.crawler.driver_contracts import DriverConfig
 from menagerie.crawler.operator_checker import required_checker_model
@@ -58,6 +63,41 @@ pytestmark = [pytest.mark.smoke]
 
 SUBPROCESS_SCRIPT = Path(__file__).with_name("scripted_checker_subprocess.py")
 CONFIG = DriverConfig(run_id="run-test", machine_id="machine-test")
+
+
+@pytest.fixture
+def activated_primary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Stage a TEST-ONLY activation matrix for the seated primary.
+
+    The committed matrix covers only the 2026-09-01 Fable seat; the Opus 5.5
+    primary seated on 2026-11-27 has none yet, so the real calibration door
+    refuses these rigs before any child process runs (pinned in
+    ``test_checker_seat_swap``). These tests exercise the subprocess plumbing,
+    not the door, so they point ``MENAGERIE_CHECKER_ACTIVATION`` at a staged
+    matrix the way test rigs do; nothing here is calibration evidence.
+    """
+
+    rows = [
+        {
+            "activated_at": "test-rig",
+            "checker_model": required_checker_model(kind.value),
+            "checker_prompt_identity": live_checker_prompt_identity(),
+            "draws": 6,
+            "gate_kind": kind.value,
+            "model_witnessed": 6,
+            "sessions_ok": 6,
+            "source": "test_checker_subprocess_e2e staged matrix (not evidence)",
+        }
+        for kind in GateKind
+    ]
+    path = tmp_path / "_activation" / "checker-activation.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"schema_version": CHECKER_ACTIVATION_SCHEMA, "activations": rows}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(CHECKER_ACTIVATION_ENV, str(path))
+    return path
 
 
 def _lane() -> CommandCheckerLane:
@@ -136,12 +176,12 @@ def test_fabricating_subprocess_is_refused_by_the_dispatching_lane(
 
 
 def test_driver_completes_through_a_real_checker_subprocess(
-    tmp_path: Path, calibrated_checker: dict
+    tmp_path: Path, calibrated_checker: dict, activated_primary: Path
 ) -> None:
     """One full driver run buys its metadata gates from a real child process."""
 
     snapshot = _snapshot(tmp_path, count=1)
-    # The REAL command lane seals the seated primary (claude-fable-5-1) on its
+    # The REAL command lane seals the seated primary (claude-opus-5-5) on its
     # sessions, so the campaign binding this rig runs under must name the same
     # model -- exactly what the CLI does from the live CampaignSpec. The rig
     # default (the unseated pre-swap label) is for in-process fakes that stamp
@@ -164,7 +204,7 @@ def test_driver_completes_through_a_real_checker_subprocess(
 
 
 def test_terminal_recommendation_through_a_real_checker_subprocess(
-    tmp_path: Path, calibrated_checker: dict
+    tmp_path: Path, calibrated_checker: dict, activated_primary: Path
 ) -> None:
     """A terminal advisory rides the subprocess lane and terminalizes cleanly."""
 

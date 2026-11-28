@@ -80,7 +80,8 @@ WRAPPER_VERSION = "menagerie-checker-operator 2.0.0"
 
 #: The seated PRIMARY per gate kind (constants.CHECKER_SEATS). These names are
 #: kept for their many readers; the seat table is the authority and the swap
-#: (sol -> claude-fable-5-1, 2026-09-01) lands there, not here.
+#: (sol -> claude-fable-5-1, 2026-09-01; claude-fable-5-1 -> claude-opus-5-5,
+#: 2026-11-27) lands there, not here.
 METADATA_CHECKER_MODEL = checker_seat(GateKind.METADATA_BATCH, CheckerSeatRole.PRIMARY).model
 FIDELITY_CHECKER_MODEL = checker_seat(GateKind.FIDELITY, CheckerSeatRole.PRIMARY).model
 TERMINAL_CHECKER_MODEL = checker_seat(GateKind.TERMINAL_DISPOSITION, CheckerSeatRole.PRIMARY).model
@@ -120,7 +121,7 @@ def required_checker_model(
     gate_kind:
         Metadata, fidelity, or terminal-disposition gate.
     role:
-        ``primary`` (the adjudicating seat, ``claude-fable-5-1``) or
+        ``primary`` (the adjudicating seat, ``claude-opus-5-5``) or
         ``confirmation`` (the cross-model K=2 seat, ``gpt-5.6-sol``).
 
     Returns

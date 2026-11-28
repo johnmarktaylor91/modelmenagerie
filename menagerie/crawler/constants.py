@@ -92,6 +92,9 @@ CODEX_CLI_VERSION = "0.144.5"
 # two lanes bump independently: `claude-fable-5-1` needs >= 2.1.251 (the exact
 # author pin 2.1.239 exits 78 on it), and the bench that seated Fable ran on
 # 2.1.257. Same re-attestation discipline as the other two pins.
+# claude-opus-5-5 (seated as author and primary checker 2026-11-27) rides the
+# same pins; no leg has run it on them yet, so the per-leg version probe and
+# the checker's modelUsage witness are its first check.
 CHECKER_CLAUDE_CLI_VERSION = "2.1.257"
 
 # OFFLINE-PINNING (step-100 triage row 9, m10759): the CLOSED list of known
@@ -512,7 +515,10 @@ CHECKER_PROVIDER_OPENAI = "openai"
 #: `openai`, so `openai` stays the derivation for every label outside this
 #: set: no historical identity moves, and an unseated label still cannot buy
 #: a session (the wrapper refuses any model not seated for its gate kind).
-ANTHROPIC_CHECKER_MODELS = frozenset({"claude-fable-5-1"})
+#: Append-only like the histories below: `claude-fable-5-1` stays because
+#: records adjudicated under it keep deriving `anthropic`; `claude-opus-5-5`
+#: joined with the 2026-11-27 seat move (JMT, d-82ab1ba7).
+ANTHROPIC_CHECKER_MODELS = frozenset({"claude-fable-5-1", "claude-opus-5-5"})
 
 
 def checker_provider_for_model(model: str) -> str:
@@ -554,14 +560,13 @@ SCHEDULED_RECHECK_PROVIDERS = frozenset({*USAGE_LIMIT_PROVIDERS, "research-tools
 # `menagerie.crawler.partitioner.CAMPAIGN_SPECS` carries the same binding for the
 # partitioner's own purposes; the two are asserted to agree in the test suite.
 #
-# c1-mech is bound to claude-fable-5-1 per the standing directive (JMT 2026-08-11:
-# smartest Claudes for the whole crawl, through ~2026-12; JMT 2026-09-01: every
-# crawler-role fable-5 pin moves to 5.1 on release, CLI 2.1.251+). claude-opus-5 is the
-# DESIGNATED FALLBACK TIER if Fable throughput/529 weather binds on long legs
-# (MASTER_DOCKET Appendix 1, call 1); switching a campaign to it is a frozen-
-# identity change and warms on a fresh rung, never mid-run.
+# c1-mech is bound to claude-opus-5-5, the fleet default (JMT 2026-11-27,
+# d-82ab1ba7: "set opus 5.5 to the default across the board"; this replaces the
+# 2026-08-11 smartest-Claudes directive and its 2026-09-01 fable-5.1 pin, see
+# decisions.md 2026-11-27). A tier binding change is a frozen-identity change and
+# warms on a fresh rung, never mid-run.
 TIER_CAMPAIGN_AUTHOR_MODELS: dict[str, str] = {
-    "c1-mech": "claude-fable-5-1",
+    "c1-mech": "claude-opus-5-5",
     "c2-disco": "claude-sonnet",
     "c3-classics": "claude-opus-5",
     "c4-native": "claude-sonnet",
@@ -571,13 +576,14 @@ TIER_CAMPAIGN_IDS = frozenset(TIER_CAMPAIGN_AUTHOR_MODELS)
 # Closed per-campaign author-model HISTORY, oldest binding first: every model
 # that has ever been a campaign's frozen author binding. Historical records are
 # append-only and stay unrewritten, so a directed mid-campaign switch (c1-mech
-# sonnet -> fable, 2026-08-11; fable -> fable-5.1, 2026-09-01) leaves rows whose
+# sonnet -> fable, 2026-08-11; fable -> fable-5.1, 2026-09-01; fable-5.1 ->
+# opus-5.5, 2026-11-27) leaves rows whose
 # provenance truthfully names the
 # PRIOR binding; validators that check record labels accept exactly this closed
 # set -- never one model, never an open vocabulary -- and the census interprets
 # which rows predate the switch. The current binding is always the last entry.
 TIER_CAMPAIGN_AUTHOR_MODEL_HISTORY: dict[str, tuple[str, ...]] = {
-    "c1-mech": ("claude-sonnet", "claude-fable-5", "claude-fable-5-1"),
+    "c1-mech": ("claude-sonnet", "claude-fable-5", "claude-fable-5-1", "claude-opus-5-5"),
     "c2-disco": ("claude-sonnet",),
     "c3-classics": ("claude-opus-5",),
     "c4-native": ("claude-sonnet",),
@@ -607,11 +613,15 @@ TIER_CAMPAIGN_AUTHOR_MODEL_HISTORY: dict[str, tuple[str, ...]] = {
 # recorded identity; the row appended here is what lets a sol-labelled record
 # keep validating. sol stays seated as the cross-model K=2 CONFIRMATION seat
 # (`CHECKER_SEATS`), so it is a live identity, not a retired one.
+#
+# Seat move (JMT 2026-11-27, d-82ab1ba7): the PRIMARY rotates from
+# `claude-fable-5-1` to `claude-opus-5-5` on every campaign, appended the same
+# era-honest way, so every Fable-adjudicated record keeps validating.
 TIER_CAMPAIGN_CHECKER_MODEL_HISTORY: dict[str, tuple[str, ...]] = {
-    "c1-mech": ("gpt-5.6-terra", "gpt-5.6-sol", "claude-fable-5-1"),
-    "c2-disco": ("gpt-5.6-terra", "gpt-5.6-sol", "claude-fable-5-1"),
-    "c3-classics": ("gpt-5.6-sol", "claude-fable-5-1"),
-    "c4-native": ("gpt-5.6-terra", "gpt-5.6-sol", "claude-fable-5-1"),
+    "c1-mech": ("gpt-5.6-terra", "gpt-5.6-sol", "claude-fable-5-1", "claude-opus-5-5"),
+    "c2-disco": ("gpt-5.6-terra", "gpt-5.6-sol", "claude-fable-5-1", "claude-opus-5-5"),
+    "c3-classics": ("gpt-5.6-sol", "claude-fable-5-1", "claude-opus-5-5"),
+    "c4-native": ("gpt-5.6-terra", "gpt-5.6-sol", "claude-fable-5-1", "claude-opus-5-5"),
 }
 
 # The campaign manifest has two KINDS of field and conflating them is what BL-3
@@ -824,22 +834,27 @@ class CheckerSeat:
 #: label-difference rate the bench saw on refusals (SEAT_RULING.md).
 TERMINAL_CONFIRMATION_SAMPLE_RATE = 0.10
 
-_FABLE_PRIMARY = CheckerSeat("claude-fable-5-1", checker_provider_for_model("claude-fable-5-1"))
+_OPUS_PRIMARY = CheckerSeat("claude-opus-5-5", checker_provider_for_model("claude-opus-5-5"))
 _SOL_CONFIRMATION = CheckerSeat("gpt-5.6-sol", checker_provider_for_model("gpt-5.6-sol"))
 
 #: The seat table -- item 32's per-(kind, role) seats, the ONE owner of which
-#: model adjudicates which gate kind in which role. Fable 5.1 is the PRIMARY on
-#: all three kinds while MAX-POWER lasts; gpt-5.6-sol is the cross-model K=2
+#: model adjudicates which gate kind in which role. Opus 5.5 is the PRIMARY on
+#: all three kinds (JMT 2026-11-27, d-82ab1ba7; Fable 5.1 held it from
+#: 2026-09-01). Its activation matrix is still owed: until a
+#: ``checker-activation.json`` row covers (kind, claude-opus-5-5) at the live
+#: prompt epoch, the calibration door refuses every verdict-rendering session
+#: outside the sanctioned calibration run (``checker_calibration``,
+#: ``procedures/CALIBRATION.md``). gpt-5.6-sol is the cross-model K=2
 #: CONFIRMATION seat on metadata and fidelity accepts (every accept) and on a
 #: 10 percent sample of terminal dispositions. Closed and exhaustive over
 #: ``GateKind x CheckerSeatRole``; the wrapper refuses any envelope whose model
 #: is seated in neither role for its kind.
 CHECKER_SEATS: dict[tuple[GateKind, CheckerSeatRole], CheckerSeat] = {
-    (GateKind.METADATA_BATCH, CheckerSeatRole.PRIMARY): _FABLE_PRIMARY,
+    (GateKind.METADATA_BATCH, CheckerSeatRole.PRIMARY): _OPUS_PRIMARY,
     (GateKind.METADATA_BATCH, CheckerSeatRole.CONFIRMATION): _SOL_CONFIRMATION,
-    (GateKind.FIDELITY, CheckerSeatRole.PRIMARY): _FABLE_PRIMARY,
+    (GateKind.FIDELITY, CheckerSeatRole.PRIMARY): _OPUS_PRIMARY,
     (GateKind.FIDELITY, CheckerSeatRole.CONFIRMATION): _SOL_CONFIRMATION,
-    (GateKind.TERMINAL_DISPOSITION, CheckerSeatRole.PRIMARY): _FABLE_PRIMARY,
+    (GateKind.TERMINAL_DISPOSITION, CheckerSeatRole.PRIMARY): _OPUS_PRIMARY,
     (GateKind.TERMINAL_DISPOSITION, CheckerSeatRole.CONFIRMATION): CheckerSeat(
         _SOL_CONFIRMATION.model,
         _SOL_CONFIRMATION.provider,

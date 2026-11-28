@@ -5559,7 +5559,7 @@ class CrawlerDriver(AdmissionEnvironmentMixin, ReceiptDriverMixin):
         )
         try:
             # Seat swap: bought on the CONFIRMATION seat (cross-model against
-            # the Fable primary); the ledger's pairing rule is the authority.
+            # the Anthropic primary); the ledger's pairing rule is the authority.
             outcome = self._retry_infrastructure_call(
                 lambda: buy_confirmation_session(
                     self.dependencies.checker,
@@ -5622,7 +5622,7 @@ class CrawlerDriver(AdmissionEnvironmentMixin, ReceiptDriverMixin):
             confirmation_verdict = terminal_gate_verdict(confirmation)
             # Same question (item + content), lawful seat pairing (same identity
             # for an unseated primary, the seated cross-model partner at the
-            # same prompt epoch for a Fable primary); refuses typed otherwise.
+            # same prompt epoch for an Anthropic primary); refuses typed otherwise.
             require_confirmation_pairing(gate, confirmation)
             row = build_duplicate_accept_row(
                 first_identity=adjudication_identity_fields(gate),

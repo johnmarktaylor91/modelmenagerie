@@ -4,8 +4,8 @@
   "codex_cli_version": "0.144.5",
   "fuse_tables": {
     "c1-mech": {
-      "author_model": "claude-fable-5-1",
-      "digest": "sha256:5c92e975b04ce18e37319b2221bfad76084d40ccaed75c8f64db68522b94ea9a",
+      "author_model": "claude-opus-5-5",
+      "digest": "sha256:b1dff1553f4b6d9005170db7179233728ff8b693467e8545ce2eecb11f1ac6cd",
       "distinct_models": 5,
       "wall_seconds": 1800.0,
       "window_seconds": 5400.0
@@ -34,5 +34,5 @@
   },
   "harness_envelope_fixture": "v2.1.257.json",
   "schema_version": "menagerie.crawler.toolchain-attestation.v1",
-  "toolchain_identity": "sha256:331668ebd81f401354bed4ef03f569d5838fcbce863416fa8d1db1cc4f464fd0"
+  "toolchain_identity": "sha256:5e8cab17669750cb55aa32b77bae39765151a88d1456e409055797764c8abd8a"
 }

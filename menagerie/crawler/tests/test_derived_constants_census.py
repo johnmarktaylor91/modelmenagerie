@@ -48,9 +48,10 @@ _DERIVED_CONSTANTS: dict[str, frozenset[str]] = {
     "CHECKER_LANE_PARK_STREAK_LIMIT": frozenset({"METADATA_BATCH_MAX"}),
     # Seat swap (SEAT_RULING.md 2026-09-01, item 32): the per-(gate kind, role)
     # checker seat table is derived from the two seat constants and the terminal
-    # confirmation sample rate. Registered at the checker-bench merge closeout.
+    # confirmation sample rate. Registered at the checker-bench merge closeout;
+    # the primary seat constant renamed with the 2026-11-27 Opus 5.5 seat move.
     "CHECKER_SEATS": frozenset(
-        {"_FABLE_PRIMARY", "_SOL_CONFIRMATION", "TERMINAL_CONFIRMATION_SAMPLE_RATE"}
+        {"_OPUS_PRIMARY", "_SOL_CONFIRMATION", "TERMINAL_CONFIRMATION_SAMPLE_RATE"}
     ),
     "SCHEDULED_RECHECK_PROVIDERS": frozenset({"USAGE_LIMIT_PROVIDERS"}),
     "TIER_CAMPAIGN_IDS": frozenset({"TIER_CAMPAIGN_AUTHOR_MODELS"}),

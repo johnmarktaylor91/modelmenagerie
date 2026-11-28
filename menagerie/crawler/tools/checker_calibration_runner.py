@@ -332,11 +332,12 @@ class CalibrationEngine:
 
         # Campaign provenance: the checker serves the c1-mech tier; the run id
         # names the rung so every money row and gate row is self-identifying.
+        from menagerie.crawler.constants import TIER_CAMPAIGN_AUTHOR_MODELS
         from menagerie.crawler.operator_checker import METADATA_CHECKER_MODEL
 
         self.config = DriverConfig(
             review_checkpoint_at=10**9,
-            author_model="claude-fable-5-1",
+            author_model=TIER_CAMPAIGN_AUTHOR_MODELS["c1-mech"],
             # The seated PRIMARY (seat swap 2026-09-01): the command lane
             # refuses a campaign binding that disagrees with the seat it seals.
             checker_model=METADATA_CHECKER_MODEL,
@@ -379,7 +380,7 @@ class CalibrationEngine:
         from menagerie.crawler.toolchain_pins import checker_toolchain_lane
 
         # The pin of the seat this engine's identity runs under (the Claude CLI
-        # for the Fable primary, codex for the openai seat).
+        # for the Anthropic primary, codex for the openai seat).
         identity = self.lane.adjudication_identity(GateKind.METADATA_BATCH.value, self.config)
         require_verified_toolchain(
             checker_toolchain_lane(identity.provider),

@@ -234,9 +234,10 @@ def _status(request_path: Path) -> dict[str, Any]:
 
 
 def test_locked_model_tiering_uses_full_identifiers() -> None:
-    """Every gate lane's PRIMARY is Fable 5.1; sol is the confirmation seat.
+    """Every gate lane's PRIMARY is Opus 5.5; sol is the confirmation seat.
 
-    Seat swap (SEAT_RULING.md, 2026-09-01): the per-kind constants are the
+    Seat swap (SEAT_RULING.md, 2026-09-01; primary Fable 5.1 until the
+    2026-11-27 move to Opus 5.5, JMT d-82ab1ba7): the per-kind constants are the
     seat table's primaries, and the confirmation seat is the other provider on
     every kind (cross-model K=2).
     """
@@ -244,9 +245,9 @@ def test_locked_model_tiering_uses_full_identifiers() -> None:
     assert required_checker_model(GateKind.METADATA_BATCH) == METADATA_CHECKER_MODEL
     assert required_checker_model(GateKind.FIDELITY) == FIDELITY_CHECKER_MODEL
     assert required_checker_model(GateKind.TERMINAL_DISPOSITION) == TERMINAL_CHECKER_MODEL
-    assert METADATA_CHECKER_MODEL == "claude-fable-5-1"
-    assert FIDELITY_CHECKER_MODEL == "claude-fable-5-1"
-    assert TERMINAL_CHECKER_MODEL == "claude-fable-5-1"
+    assert METADATA_CHECKER_MODEL == "claude-opus-5-5"
+    assert FIDELITY_CHECKER_MODEL == "claude-opus-5-5"
+    assert TERMINAL_CHECKER_MODEL == "claude-opus-5-5"
     for kind in GateKind:
         assert required_checker_model(kind, CheckerSeatRole.CONFIRMATION) == "gpt-5.6-sol"
 

@@ -99,3 +99,19 @@ non-re-derivable receipt refuses at mint or verify, never activates.
 6. **Land receipt + re-recorded goldens in the SAME reviewed change**, with
    any timing-constant re-derivation the receipt demanded. Unset the
    calibration flag; the next launch passes the XOR arm on the receipt side.
+
+## Seating a new checker model
+
+A new (checker model, gate kind) pair activates through a committed row in
+`menagerie/crawler/assets/checker-activation.json` (overhaul RULING B.2), not
+through the receipt above: at least `CHECKER_ACTIVATION_MIN_SESSIONS`
+model-witnessed sessions over the golden packs at the live checker prompt
+epoch, measured by a bench and never hand-written. Without that row, and with
+a receipt that measures another model, every verdict-rendering leg refuses
+(`CheckerCalibrationMissingError`); only the calibration-mode run above may buy
+sessions for the seat.
+
+Pending now: the primary seat moved to `claude-opus-5-5` on 2026-11-27 (JMT,
+decision d-82ab1ba7; `decisions.md` 2026-11-27). The committed matrix covers
+only `claude-fable-5-1`, so the crawler's checker lane stays closed until an
+Opus 5.5 matrix lands for all three gate kinds.

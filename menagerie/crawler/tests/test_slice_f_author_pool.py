@@ -483,7 +483,7 @@ def test_every_campaign_has_a_bound_prompt_and_tier(tmp_path: Path, tier_campaig
     assert tier_campaign_id in brief
     assert str(job.required_output_path) in brief
     pool = AuthorPool(tmp_path / "queue", owner="s")
-    expected = {"c1-mech": "fable", "c3-classics": "opus"}.get(tier_campaign_id, "sonnet")
+    expected = {"c1-mech": "opus", "c3-classics": "opus"}.get(tier_campaign_id, "sonnet")
     assert pool.subagent_model(job) == expected
 
 
@@ -526,7 +526,7 @@ def test_the_frozen_tier_author_models_are_the_partitioner_bindings() -> None:
     from menagerie.crawler.partitioner import CAMPAIGN_SPECS
 
     assert CAMPAIGN_AUTHOR_MODELS == {
-        "c1-mech": "claude-fable-5-1",
+        "c1-mech": "claude-opus-5-5",
         "c2-disco": "claude-sonnet",
         "c3-classics": "claude-opus-5",
         "c4-native": "claude-sonnet",
@@ -592,7 +592,7 @@ def test_a_per_item_repair_scope_is_serviceable_under_a_configured_tier(
     pool = AuthorPool(queue_root, owner="s", tier_campaign_id="c1-mech")
     claimed = pool.claim(job.job_id)
     assert pool.tier_campaign(job) == "c1-mech"
-    assert pool.subagent_model(job) == "fable"
+    assert pool.subagent_model(job) == "opus"
     brief = pool.brief(job, claimed=claimed)
     assert "c1-mech" in brief
     assert "campaign-m1706" in brief
@@ -1101,7 +1101,7 @@ def test_author_wrapper_enqueues_and_reports_the_pool_answer(tmp_path: Path) -> 
     # per-item repair scope. Overwriting one with the other is the collision this fixes.
     assert answered["repair_campaign_id"] == "campaign-m1"
     assert answered["tier_campaign_id"] == "c1-mech"
-    assert answered["subagent_model"] == "fable"
+    assert answered["subagent_model"] == "opus"
 
 
 def test_author_wrapper_refuses_an_unknown_tier_campaign(tmp_path: Path) -> None:

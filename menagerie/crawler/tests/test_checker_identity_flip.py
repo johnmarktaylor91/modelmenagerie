@@ -255,9 +255,9 @@ def test_checker_model_flip_does_not_brick_catalog_entry_points(tmp_path: Path) 
     # destroyed, and the only durable answer to "who adjudicated step 100?".
     c1 = next(binding for binding in bindings if binding.spec.campaign_id == "c1-mech")
     assert dict(c1.recorded_projection)["checker_model"] == _PRIOR_CHECKER
-    # ...while the LIVE spec is what a new leg runs under (the Fable primary
-    # since the 2026-09-01 seat swap).
-    assert c1.spec.checker_model == "claude-fable-5-1"
+    # ...while the LIVE spec is what a new leg runs under (the Opus 5.5 primary
+    # since the 2026-11-27 seat move; Fable 5.1 held it from 2026-09-01).
+    assert c1.spec.checker_model == "claude-opus-5-5"
 
     snapshot = load_intake_snapshot(records_root / c1.intake_path)
     assert find_campaign_binding(manifest_path, snapshot) == c1
@@ -267,7 +267,7 @@ def test_checker_model_flip_does_not_brick_catalog_entry_points(tmp_path: Path) 
     # The OPS-04 stack: `status` is a read-only command and must not be a
     # casualty of a rename. It resolves the CURRENT checker, not the echo.
     config = _snapshot_driver_config(repo_root, snapshot)
-    assert config.checker_model == "claude-fable-5-1"
+    assert config.checker_model == "claude-opus-5-5"
     assert config.author_model == c1.spec.author_model
 
 
@@ -664,6 +664,7 @@ def test_identity_epoch_census_discloses_prior_epochs_and_refuses_undeclared(
             _model_row("m5273", checker_model=_PRIOR_CHECKER, author_model="claude-sonnet"),
             _model_row("m9999", checker_model="gpt-5.6-sol", author_model="claude-fable-5"),
             _model_row("m9998", checker_model="claude-fable-5-1", author_model="claude-fable-5"),
+            _model_row("m9997", checker_model="claude-opus-5-5", author_model="claude-opus-5-5"),
         ],
     )
 
@@ -682,9 +683,15 @@ def test_identity_epoch_census_discloses_prior_epochs_and_refuses_undeclared(
     assert classifications[("claude-fable-5", "gpt-5.6-sol")]["checker_model"] == (
         "declared-prior"
     )
+    # The 2026-11-27 seat move did the same to Fable 5.1: its rows stay declared.
     assert classifications[("claude-fable-5", "claude-fable-5-1")]["checker_model"] == (
-        "declared-current"
+        "declared-prior"
     )
+    assert classifications[("claude-opus-5-5", "claude-opus-5-5")] == {
+        **classifications[("claude-opus-5-5", "claude-opus-5-5")],
+        "author_model": "declared-current",
+        "checker_model": "declared-current",
+    }
     assert classifications[("claude-sonnet", _PRIOR_CHECKER)]["author_model"] == "declared-prior"
     # The unpinned version components are disclosed, never silently pinned.
     unpinned = {row["axis"] for row in census["member_reasons"]["unpinned_identity_component"]}

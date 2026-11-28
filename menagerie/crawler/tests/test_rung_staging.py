@@ -424,7 +424,7 @@ def test_registered_mini_rung_binds_correct_models(
 
     config = cli_module._snapshot_driver_config(campaign_repo, loaded)
     assert config.author_model == "claude-opus-5"
-    assert config.checker_model == "claude-fable-5-1"
+    assert config.checker_model == "claude-opus-5-5"
     assert config.review_checkpoint_at == 0
     assert (config.author_model, config.checker_model) != (
         DriverConfig().author_model,
@@ -652,7 +652,7 @@ def test_register_adopts_existing_snapshot_without_carve_out(
     assert adopted.registration.derived_from_snapshot_id == root_binding.intake_snapshot_id
 
     config = cli_module._snapshot_driver_config(campaign_repo, durable)
-    assert config.author_model == "claude-fable-5-1"
+    assert config.author_model == "claude-opus-5-5"
     assert config.review_checkpoint_at == root_binding.spec.review_checkpoint_at
 
 

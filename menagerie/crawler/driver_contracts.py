@@ -694,14 +694,14 @@ class DriverConfig:
     review_checkpoint_at: Optional[int] = DEFAULT_REVIEW_CHECKPOINT_AT
     progress_milestones: tuple[int, ...] = DEFAULT_PROGRESS_MILESTONES
     notify_command: Optional[str] = DEFAULT_NOTIFY_COMMAND
-    author_model: str = "claude-fable-5-1"
+    author_model: str = "claude-opus-5-5"
     author_version: str = "current"
     claude_cli_version: str = CLAUDE_CLI_VERSION
     #: The campaign's declared checker binding. Every production config is
-    #: built by the CLI from the live ``CampaignSpec`` projection (the Fable
-    #: primary since the 2026-09-01 seat swap; a tripwire test pins spec ==
-    #: seat table). The default is the pre-swap label so a lane constructed
-    #: WITHOUT a campaign binding (the in-process test rigs, which stamp this
+    #: built by the CLI from the live ``CampaignSpec`` projection (the Opus 5.5
+    #: primary since the 2026-11-27 seat move, Fable 5.1 from 2026-09-01; a
+    #: tripwire test pins spec == seat table). The default is the pre-swap label
+    #: so a lane constructed WITHOUT a campaign binding (the in-process test rigs, which stamp this
     #: value on their fake gates) is an UNSEATED primary under the conflict
     #: ledger's pairing rule and keeps the historical same-identity K=2;
     #: production sessions never read this field for their model -- the

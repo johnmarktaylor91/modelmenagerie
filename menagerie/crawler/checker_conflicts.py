@@ -77,7 +77,7 @@ CHECKER_VERDICT_CONFLICT_SCHEMA_VERSION_V2 = "menagerie.crawler.checker-verdict-
 #: Seat swap (2026-09-01, SEAT_RULING.md / item 32): the v3 row family records
 #: a CROSS-MODEL duplicate-accept confirmation -- the primary seat's identity
 #: (``first_identity``) AND the confirmation seat's, on every gate kind. The
-#: two identities lawfully differ (Fable primary, sol confirmation at the same
+#: two identities lawfully differ (Anthropic primary, sol confirmation at the same
 #: frozen prompt epoch), so the v1/v2 rule "one adjudication identity per
 #: question" is replaced by the seat-table pairing rule
 #: (:func:`confirmation_pairing`), re-derived on every read from code, never
